@@ -20,6 +20,7 @@ This folder is a personal knowledge base (a "second brain"). Plain Markdown file
 - One file = one topic. File names are lowercase with hyphens (`tax-policy.md`, never `note-12.md`).
 - A hard claim carries a quote line: `> "exact text" - raw/<file>`. Link pages with `[[page-name]]`.
 - New page: add it to `wiki/index.md` (or run `python3 tools/brain.py index`); log the change in `wiki/log.md`.
+  Then `python3 tools/brain.py map` redraws the mind map (`maps/brain.*`: generated, never edit by hand).
 - Templates for each note type are in `templates/`.
 
 ## Saving knowledge
