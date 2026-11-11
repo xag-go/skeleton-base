@@ -2,6 +2,27 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.3 - 2026-11-11
+- Pointer file: `connect` (and auto-connect) writes `~/.config/skeleton-base/base` (one line, the base folder),
+  recorded in `.kits.json` like the systemd units; `disconnect` removes it, or gives back the bytes another base
+  wrote there, with its folders: the home is byte-identical. Frugal-Bridge (from 53c4c39) reads it, so it finds the
+  base even when no tool rules file carries the pointer block (only Hermes without `SOUL.md`): no second user file.
+- `disconnect` / `uninstall` with Frugal-Bridge at user level: pointer blocks, systemd units and the pointer file
+  are removed first, then Frugal-Bridge is told to forget the base (`--no-base` when its setup takes it, else the
+  `base` entry in its `global.json`, which it now looks at first, is dropped; a `FRUGAL_BASE` naming this base is
+  kept out of its environment) and its `install --global` is re-run. It really goes back to its own `USER.md`: no
+  more "still points at this base".
+- `connect` passes `--base <this base>` to Frugal-Bridge's `install --global` when its setup takes that flag.
+- Frugal-Bridge capabilities are read from its setup script (`frugal_caps`: quoted `Path:`, pointer file, systemd
+  units, `--base`, `--no-base`, recorded base), not from its version or its messages. The space-path note only
+  shows for a Frugal-Bridge that can find such a base in none of these ways.
+- Tests: the 4 Frugal-Bridge tests that broke with its new base discovery now check the new behaviour (no second
+  user file, block order, export back, Frugal-Bridge on its own file after disconnect, re-runs byte-identical); they
+  read which user file Frugal-Bridge's block names from the paths in it, not its wording. 5 new tests (91 in
+  total): disconnect with watch units + pointer file, a home with only Hermes (no `SOUL.md`) found through the
+  pointer file, `frugal_caps`, `--base`/`--no-base` passed to a Frugal setup that takes them, and a pointer file of
+  another base given back. Test runs drop `FRUGAL_HOME`, `FRUGAL_BASE`, `HERMES_AGENT` from the environment.
+
 ## v1.3.2 - 2026-11-11
 - Base paths with spaces: the pointer block's `Path:` line keeps its format for a plain path; a path with a space,
   quote, backslash, backtick or `$` is wrapped in the first of `"` `'` `` ` `` it does not contain, no escaping

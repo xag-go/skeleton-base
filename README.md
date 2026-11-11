@@ -145,6 +145,10 @@ For the current user, `connect`:
   after boot, `Persistent=true`) and prints the command to enable it:
   `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
 - with `--watch`: the watch service as well (next section); with `--kick`: a Claude Code `PostToolUse` hook.
+- writes the base's pointer file `~/.config/skeleton-base/base`: one line, the base folder (no quoting). Other
+  kits read it to find the base when no tool rules file carries the pointer block (a home whose only tool is Hermes
+  without a `SOUL.md`, for example). If another base wrote it before, its bytes are backed up and given back on
+  `disconnect`.
 
 Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
 remove exactly that and give the previous text back, including an older pointer block it replaced.
@@ -170,8 +174,9 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
   and what was imported is recorded in `.kits.json` (`kits.base-folder.frugal_user`): a re-run imports nothing
   new, a line you add to `USER.md` later is merged on the next connect. Then it runs Frugal-Bridge's own
   `kit/setup.py install --global` (found in `~/frugal-bridge`, or set `FRUGAL_BRIDGE_KIT`; skipped with a note if not
-  found), which finds the base through the `Path:` line of the pointer block and uses the base from then on. The
-  old `USER.md` is left in place.
+  found; with `--base <this base>` when its setup takes that flag). Frugal-Bridge finds the base from `--base`,
+  the `Path:` line of the pointer block, the pointer file or the base's systemd units, and uses the base from then
+  on. The old `USER.md` is left in place.
 - **Base first, Frugal later.** Frugal-Bridge's setup sees the base and makes no `USER.md` of its own.
 - **A tool installed later** (its folder appears after both kits are in place): the watcher's auto-connect writes
   the base block, then runs Frugal-Bridge's `install --global --hosts TOOL` for that tool alone, when Frugal-Bridge
@@ -185,8 +190,12 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
 - **Block order** in every user-level file: the base block first, Frugal-Bridge's block after it. When Frugal's
   block is already there, the base block is inserted in front of it; Frugal's bytes are never changed by the base.
 - **`disconnect` / `uninstall`** while Frugal-Bridge uses the base: the user slot is written back to its `USER.md`
-  (the old one is backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`), then its `install --global` is re-run so
-  it works on its own file again.
+  (the old one is backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`). Everything Frugal-Bridge could find the
+  base from goes first (pointer blocks, systemd units, the pointer file); then it is told to forget the base
+  (`--no-base` when its setup takes it, otherwise the `base` entry it recorded in its `global.json` is dropped, since
+  it looks there first) and its `install --global` is re-run, so it works on its own file again.
+- Which of these a Frugal-Bridge build supports is read from its setup script (`frugal_caps` in `tools/brain.py`:
+  quoted `Path:`, pointer file, systemd units, `--base`, `--no-base`), never from its version or its messages.
 
 ## Instant and zero-touch
 

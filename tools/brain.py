@@ -36,12 +36,13 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                Claude Code SessionEnd/PreCompact hooks running collect; --timer writes a
                                daily systemd user timer; --watch writes the watch service (+ the timer);
                                --kick adds a Claude PostToolUse hook that pokes the watcher;
-                               --print only prints the pointer block (for tools you set up by hand).
+                               --print only prints the pointer block (for tools you set up by hand);
+                               ~/.config/skeleton-base/base names the base (other kits read it).
                                Frugal-Bridge installed for the user: merges its USER.md into wiki/me/
                                (never overwrites; review card for duplicates/conflicts), then re-runs its
                                install --global so it uses the base; the base block goes before its block
   disconnect [--base DIR]      remove exactly what connect (and auto-connect) wrote; Frugal-Bridge gets the
-                               user slot back in its USER.md and is re-run
+                               user slot back in its USER.md, forgets the base and is re-run
 
 Instant and zero-touch
   watch [--base DIR] [--poll] [--quiet-s 2] [--max-s 10] [--no-commit] [--no-connect]
@@ -71,7 +72,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.3.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.3.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -1678,6 +1679,8 @@ HOOK_EVENTS = ("SessionEnd", "PreCompact")
 FRUGAL_HOSTS = {".claude/CLAUDE.md": "claude-code", ".codex/AGENTS.md": "codex", ".gemini/GEMINI.md": "gemini",
                 ".config/opencode/AGENTS.md": "opencode", ".hermes/SOUL.md": "hermes"}   # our file -> its host name
 UNIT = "skeleton-base-collect"
+POINTER_FILE = ".config/skeleton-base/base"   # one line: the connected base's folder (other kits read it to find
+                                              # the base when no tool rules file carries our block)
 
 
 def needs_quotes(s):
@@ -1851,6 +1854,29 @@ def frugal_kit(home=None, reg=None):
             if f.name == "setup.py" and f.is_file():
                 return f
     return None
+
+
+def frugal_caps(kit):
+    """What this Frugal-Bridge setup can do, read from its own source (no version numbers, no message text):
+    quoted  - reads a quoted `Path:` value (base paths with spaces)
+    pointer - finds the base from POINTER_FILE;  units - from our systemd units (`--base DIR` in ExecStart=)
+    base    - takes `--base DIR`;  no_base - takes `--no-base` (forget a base it used before)
+    recall  - remembers the base it used (global.json `base`) and looks there first."""
+    t = (read(kit) or "") if kit else ""
+    caps = set()
+    if "parse_base_path" in t:
+        caps.add("quoted")
+    if re.search(r'"skeleton-base"\s*,\s*"base"', t) or "skeleton-base/base" in t:
+        caps.add("pointer")
+    if re.search(r'startswith\("skeleton-base', t):
+        caps.add("units")
+    if re.search(r'"--base"\s+in\s+argv', t):
+        caps.add("base")
+    if re.search(r'"--no-base"\s+in\s+argv', t):
+        caps.add("no_base")
+    if re.search(r'r\.get\("base"\)', t):
+        caps.add("recall")
+    return caps
 
 
 def frugal_user_lines(text):
@@ -2031,7 +2057,8 @@ class Connector:
                              "run disconnect as that user first")
         rec = {"home": str(self.home), "connected": prev.get("connected") or today(),
                "blocks": dict(prev.get("blocks", {})), "hooks": dict(prev.get("hooks", {})),
-               "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {}))}
+               "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {})),
+               "pointer": dict(prev.get("pointer", {}))}
 
         never = [x.removeprefix("~/") for x in watch_cfg(self.base).get("never", []) if isinstance(x, str)]
         skip = lambda r: any(fnmatch.fnmatchcase(r, g) or r.startswith(g.rstrip("/") + "/") for g in never)
@@ -2077,6 +2104,8 @@ class Connector:
             self.log[-1] = ("watch service + daily timer (safety net) written; enable with:\n"
                             f"  systemctl --user daemon-reload && systemctl --user enable --now "
                             f"{WATCH_UNIT}.service {UNIT}.timer")
+        if "\n" not in str(self.base):                 # the base's own pointer file: any kit finds the base there
+            self.units(rec["pointer"], {POINTER_FILE: f"{self.base}\n"})
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.save_kits(k)
         before = set(prev.get("blocks") or {})
@@ -2132,18 +2161,34 @@ class Connector:
     def slot_page(self, slot, page):
         return slot + page if slot.endswith("/") else slot
 
-    def run_frugal(self, reg, hosts=None):
+    def run_frugal(self, reg, hosts=None, leave=False):
         """Re-run Frugal-Bridge's own `install --global` for the tools it already has (or only `hosts`).
-        True when it ran."""
+        Connecting: `--base THIS` when its setup takes it. leave=True (disconnect): make it forget this base first
+        (`--no-base` when its setup takes it, else the `base` it recorded in global.json is dropped, because it
+        looks there first) and keep FRUGAL_BASE=THIS out of its environment. True when it ran."""
         kit = frugal_kit(self.home, reg)
         if not kit:
             self.log.append("Frugal-Bridge: its kit was not found (~/frugal-bridge, or set FRUGAL_BRIDGE_KIT); run "
                             "`python3 <frugal-bridge>/kit/setup.py install --global` yourself so it picks this up")
             return False
+        caps = frugal_caps(kit)
         hosts = sorted(hosts if hosts is not None else (reg.get("tools") or {}))
         cmd = [sys.executable, str(kit), "install", "--global"] + (["--hosts", ",".join(hosts)] if hosts else [])
+        env = dict(os.environ)
+        if leave:
+            if same_dir(env.get("FRUGAL_BASE"), self.base):
+                env.pop("FRUGAL_BASE")
+            if "no_base" in caps:
+                cmd.append("--no-base")
+            else:
+                cur = frugal_reg(self.home)
+                if cur is not None and same_dir(cur.get("base"), self.base):
+                    del cur["base"]
+                    write(frugal_home(self.home) / "global.json", json.dumps(cur, indent=2) + "\n")
+        elif "base" in caps:
+            cmd += ["--base", str(self.base)]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
         except (OSError, subprocess.SubprocessError) as e:
             self.log.append(f"Frugal-Bridge: install --global did not run: {e}")
             return False
@@ -2164,10 +2209,13 @@ class Connector:
             return
         self.run_frugal(reg)
         if not frugal_points_here(self.base, self.home):
-            if needs_quotes(str(self.base)):
+            caps = frugal_caps(frugal_kit(self.home, reg))
+            if needs_quotes(str(self.base)) and not caps & {"quoted", "pointer", "base"}:
                 self.log.append(f"Frugal-Bridge: it cannot follow a base path with spaces or quotes yet (it reads "
                                 f"the `Path:` line only up to the first space), so it keeps its own {user}. "
                                 "Use a base path without spaces to share one user file.")
+            elif frugal_kit(self.home, reg):
+                self.log.append(f"Frugal-Bridge: it did not switch to this base and keeps its own {user}")
             return
         self.log.append(f"Frugal-Bridge: now uses this base for the user files (slot {self.user_slot()}); "
                         f"{user} left in place")
@@ -2341,7 +2389,7 @@ class Connector:
             rec.update({"file": str(user), "sha": sha(text), "exported": today()})
             me["frugal_user"] = rec
             self.save_kits(k)
-        self.run_frugal(reg)
+        self.run_frugal(reg, leave=True)
         if frugal_points_here(self.base, self.home):
             self.log.append("Frugal-Bridge still points at this base: re-run its `install --global` by hand")
         else:
@@ -2375,7 +2423,10 @@ class Connector:
         h = rec.get("hooks")
         if h:
             self.unmerge_hooks(h)
-        for r, t in list(rec.get("timer", {}).items()) + list(rec.get("watch", {}).items()):
+        # everything Frugal-Bridge could find this base from goes first (blocks, units, pointer file), then it is
+        # re-run (frugal_give_back below), so it really goes back to its own user file
+        for r, t in (list(rec.get("timer", {}).items()) + list(rec.get("watch", {}).items())
+                     + list(rec.get("pointer", {}).items())):
             p = self.home / r
             dirs |= set(t.get("dirs", []))
             if p.is_file() and sha(p.read_bytes()) == t.get("sha"):
