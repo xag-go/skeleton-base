@@ -149,6 +149,29 @@ For the current user, `connect`:
 Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
 remove exactly that and give the previous text back, including an older pointer block it replaced.
 
+### With Frugal-Bridge installed for the whole user (`install --global`)
+
+Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file (`~/.frugal-bridge/USER.md`, or
+`$FRUGAL_HOME/USER.md`) and a registry (`global.json`). The two work in any order:
+
+- **Frugal first, base later.** `connect` (also the watcher's auto-connect) merges the filled lines of that
+  `USER.md` into the base user slot (`wiki/me/`: language, answer style, what you decide alone and the main
+  agent's name -> `how-to-talk-to-me.md`; your name and other lines -> `who-i-am.md`). It only fills empty fields or
+  adds lines under `## From Frugal-Bridge USER.md`; it never overwrites. A line the base already has (duplicate) or
+  says differently (conflict, the base keeps its line) goes on a board card
+  `board/DATE-review-frugal-user-import.md`. The pages are backed up to `.brain/backups/frugal-import-TIME/` first,
+  and what was imported is recorded in `.kits.json` (`kits.base-folder.frugal_user`): a re-run imports nothing
+  new, a line you add to `USER.md` later is merged on the next connect. Then it runs Frugal-Bridge's own
+  `kit/setup.py install --global` (found in `~/frugal-bridge`, or set `FRUGAL_BRIDGE_KIT`; skipped with a note if not
+  found), which finds the base through the `Path:` line of the pointer block and uses the base from then on. The
+  old `USER.md` is left in place.
+- **Base first, Frugal later.** Frugal-Bridge's setup sees the base and makes no `USER.md` of its own.
+- **Block order** in every user-level file: the base block first, Frugal-Bridge's block after it. When Frugal's
+  block is already there, the base block is inserted in front of it; Frugal's bytes are never changed by the base.
+- **`disconnect` / `uninstall`** while Frugal-Bridge uses the base: the user slot is written back to its `USER.md`
+  (the old one is backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`), then its `install --global` is re-run so
+  it works on its own file again.
+
 ## Instant and zero-touch
 
 `collect` on hooks and a daily timer is good; `watch` makes it instant. It is a small foreground daemon (standard

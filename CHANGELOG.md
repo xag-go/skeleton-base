@@ -2,6 +2,23 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.1 - 2026-11-11
+- Frugal first, base later, at user level: when Frugal-Bridge is installed with `install --global`, `connect` and
+  the watcher's auto-connect merge the filled lines of `~/.frugal-bridge/USER.md` (or `$FRUGAL_HOME/USER.md`) into
+  the base user slot (`wiki/me/who-i-am.md`, `wiki/me/how-to-talk-to-me.md`). Empty fields are filled, other lines
+  added under `## From Frugal-Bridge USER.md`; nothing is overwritten. Duplicates and conflicts go on a board card
+  (`board/DATE-review-frugal-user-import.md`). Backup in `.brain/backups/frugal-import-TIME/`, record in
+  `.kits.json` (`kits.base-folder.frugal_user`, kept by `init`): a re-run imports nothing new.
+- Then `connect` runs Frugal-Bridge's own `kit/setup.py install --global` (from `~/frugal-bridge` or
+  `FRUGAL_BRIDGE_KIT`; skipped with a note when not found) for the tools it already has, so it switches to the
+  base. Its old `USER.md` stays where it is.
+- Block order in user-level files: the base block is inserted in front of an existing Frugal-Bridge block, whose
+  bytes are never changed; an older base block found after it is moved in front.
+- `disconnect` and `uninstall`: while Frugal-Bridge uses the base, the user slot is exported back to its
+  `USER.md` (old one backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`) and its `install --global` re-run, so
+  it uses its own file again.
+- 6 new tests with the real Frugal-Bridge setup in a temp HOME and FRUGAL_HOME (81 in total).
+
 ## v1.3.0 - 2026-11-11
 - `brain.py watch`: instant collect. Foreground daemon, standard library only: inotify through `ctypes`, polling
   every 5 s where inotify is not available (`--poll`). Debounce 2 s quiet / 10 s max (`--quiet-s`, `--max-s`).
