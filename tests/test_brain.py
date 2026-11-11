@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -71,6 +73,231 @@ class Base(unittest.TestCase):
 
 
 PAGE = "---\ntitle: {t}\nsources: [{s}]\nupdated: 2026-11-11\nscope: private\n---\n\n# {t}\n\n{b}\n"
+
+
+def canvas_problems(d):
+    """Validate maps/brain.canvas against JSON Canvas 1.0; return (data, list of problems)."""
+    d = pathlib.Path(d)
+    data = json.loads((d / "maps/brain.canvas").read_text())
+    probs, ids = [], set()
+    for n in data["nodes"]:
+        for k in ("id", "type", "x", "y", "width", "height"):
+            if k not in n:
+                probs.append(f"node lacks {k}: {n}")
+        if n["id"] in ids:
+            probs.append(f"duplicate id {n['id']}")
+        ids.add(n["id"])
+        if n["type"] not in ("text", "file", "link", "group"):
+            probs.append(f"bad type {n['type']}")
+        if n["type"] == "file" and not (d / n["file"]).is_file():
+            probs.append(f"missing file {n['file']}")
+        if n["type"] == "text" and "text" not in n:
+            probs.append(f"text node without text {n['id']}")
+    for e in data["edges"]:
+        if e["id"] in ids:
+            probs.append(f"duplicate id {e['id']}")
+        ids.add(e["id"])
+        if e["fromNode"] not in ids and e["fromNode"] not in {n["id"] for n in data["nodes"]}:
+            probs.append(f"edge {e['id']} from missing node")
+        if e["toNode"] not in {n["id"] for n in data["nodes"]}:
+            probs.append(f"edge {e['id']} to missing node")
+        if e["fromNode"] == e["toNode"]:
+            probs.append(f"self edge {e['id']}")
+        for side in ("fromSide", "toSide"):
+            if side in e and e[side] not in ("top", "right", "bottom", "left"):
+                probs.append(f"bad {side}")
+    for kind in (lambda n: n["type"] == "group", lambda n: n["type"] != "group"):
+        boxes = sorted((n["x"], n["y"], n["x"] + n["width"], n["y"] + n["height"], n["id"])
+                       for n in data["nodes"] if kind(n))
+        for i, a in enumerate(boxes):           # sweep on x: only boxes that start before a ends can overlap
+            for b in boxes[i + 1:]:
+                if b[0] >= a[2]:
+                    break
+                if b[1] < a[3] and a[1] < b[3]:
+                    probs.append(f"overlap {a[4]} / {b[4]}")
+    return data, probs
+
+
+def all_pages(d):
+    d = pathlib.Path(d)
+    out = [p for p in (d / "wiki").rglob("*.md")] + [p for p in (d / "board").glob("*.md") if p.name != "README.md"]
+    out += list((d / "agents").glob("*.md")) + [d / "hot.md"]
+    return sorted(p.relative_to(d).as_posix() for p in out)
+
+
+def html_data(d):
+    h = (pathlib.Path(d) / "maps/brain.html").read_text()
+    m = re.search(r'<script type="application/json" id="brain-data">(.*?)</script>', h, re.S)
+    return h, json.loads(m.group(1))
+
+
+class MapTests(Base):
+    def edges_by_file(self, data):
+        files = {n["id"]: n["file"] for n in data["nodes"] if n["type"] == "file"}
+        return {frozenset((files[e["fromNode"]], files[e["toNode"]])): e for e in data["edges"]}
+
+    def test_fresh_init_writes_a_valid_map(self):
+        d = self.fresh()
+        data, probs = canvas_problems(d)
+        self.assertEqual(probs, [])
+        files = sorted(n["file"] for n in data["nodes"] if n["type"] == "file")
+        self.assertEqual(files, all_pages(d))
+        groups = [n["label"].split(" (")[0] for n in data["nodes"] if n["type"] == "group"]
+        self.assertEqual(groups, ["me", "projects", "clients", "people", "decisions", "concepts", "sops", "daily",
+                                  "wiki", "board", "agents"])
+        me = next(n for n in data["nodes"] if n["id"] == "g-me")
+        self.assertLess(abs(me["x"] + me["width"] / 2), 2)          # 'me' is the centre of the mind map
+        self.assertLess(abs(me["y"] + me["height"] / 2), 2)
+        self.assertIn(frozenset(("hot.md", "wiki/me/who-i-am.md")), self.edges_by_file(data))
+        h, js_data = html_data(d)
+        self.assertEqual(sorted(n["p"] for n in js_data["nodes"]), all_pages(d))
+        r = self.brain(d, "lint")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("brain.canvas", r.stderr)
+
+    def test_links_become_deduped_edges_without_self_links(self):
+        d = self.fresh()
+        self.write(d, "wiki/projects/alpha.md", PAGE.format(t="Alpha", s="interview",
+                   b="See [[beta]], again [[beta|Beta]] and [[beta#Notes]], me [[alpha]], [[who-i-am]]."))
+        self.write(d, "wiki/concepts/beta.md", PAGE.format(t="Beta", s="interview", b="Back to [[alpha]]."))
+        self.write(d, "wiki/people/gamma.md", PAGE.format(t="Gamma", s="interview", b="No links."))
+        self.write(d, "board/2026-11-11-ship-alpha.md", "---\ntitle: Ship alpha\nstatus: todo\nowner: assistant\n"
+                   "project: alpha\nupdated: 2026-11-11\nscope: private\n---\n\nShip it, ask [[gamma]].\n")
+        r = self.brain(d, "map")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("map:", r.stdout)
+        data, probs = canvas_problems(d)
+        self.assertEqual(probs, [])
+        self.assertEqual(sorted(n["file"] for n in data["nodes"] if n["type"] == "file"), all_pages(d))
+        ed = self.edges_by_file(data)
+        ab = [e for e in data["edges"] if {e["fromNode"], e["toNode"]} == {
+            next(n["id"] for n in data["nodes"] if n.get("file") == "wiki/projects/alpha.md"),
+            next(n["id"] for n in data["nodes"] if n.get("file") == "wiki/concepts/beta.md")}]
+        self.assertEqual(len(ab), 1)                                 # three links + one back link = one edge
+        self.assertEqual(ab[0].get("fromEnd"), "arrow")              # both ways
+        self.assertIn(frozenset(("wiki/projects/alpha.md", "wiki/me/who-i-am.md")), ed)
+        card = "board/2026-11-11-ship-alpha.md"
+        self.assertEqual(ed[frozenset((card, "wiki/projects/alpha.md"))].get("label"), "project")
+        self.assertEqual(ed[frozenset((card, "agents/assistant.md"))].get("label"), "owner")
+        self.assertIn(frozenset((card, "wiki/people/gamma.md")), ed)
+        self.assertFalse(any(len(k) == 1 for k in ed))
+        self.assertFalse(any("wiki/index.md" in k for k in ed))      # the auto index is not a hub
+        # group colours: every file node has its group's colour
+        colour = {n["id"][2:]: n["color"] for n in data["nodes"] if n["type"] == "group"}
+        for n in data["nodes"]:
+            if n["type"] == "file":
+                g = n["file"].split("/")[1] if n["file"].startswith("wiki/") and n["file"].count("/") > 1 else \
+                    ("wiki" if n["file"].startswith("wiki/") else "me" if n["file"] == "hot.md" else n["file"].split("/")[0])
+                self.assertEqual(n["color"], colour[g], n["file"])
+        _, js_data = html_data(d)
+        idx = {n["p"]: i for i, n in enumerate(js_data["nodes"])}
+        pairs = {frozenset((a, b)) for a, b, _ in js_data["edges"]}
+        self.assertIn(frozenset((idx["wiki/projects/alpha.md"], idx["wiki/concepts/beta.md"])), pairs)
+        self.assertEqual(len(pairs), len(js_data["edges"]))
+        self.assertEqual(len(js_data["edges"]), len(data["edges"]))
+
+    def test_html_is_offline_and_escapes_page_text(self):
+        d = self.fresh()
+        evil = ('<script>alert("pwned")</script> </script><img src=x onerror=alert(1)> & \u2028 '
+                '<!-- --> https://tracker.invalid/x')
+        self.write(d, "wiki/concepts/evil.md", PAGE.format(t="</script><b>Evil</b>", s="interview", b=evil)
+                   + "\nSee [[who-i-am]].\n")
+        self.assertEqual(self.brain(d, "map").returncode, 0)
+        h, js_data = html_data(d)
+        self.assertIsNone(re.search(r"https?://", h), "no URL may appear in the html")
+        self.assertEqual(h.count("<script"), 2)                       # only our own two script blocks
+        self.assertEqual(h.count("</script>"), 2)
+        self.assertNotIn("<img", h)
+        self.assertNotIn("<b>Evil", h)
+        self.assertNotIn("<!-- -->", h)
+        self.assertNotIn("\u2028", h)
+        self.assertIn("\\u003cscript\\u003e", h)
+        code = re.sub(r'(id="brain-data">).*?(</script>)', r"\1\2", h, flags=re.S)   # our own markup + JS
+        self.assertNotRegex(code, r"<(link|iframe|img|object|embed)\b")
+        self.assertNotRegex(code, r"\b(src|href)\s*=")                 # nothing is ever loaded
+        self.assertNotIn("innerHTML", code)
+        node = next(n for n in js_data["nodes"] if n["p"] == "wiki/concepts/evil.md")
+        self.assertEqual(node["t"], "</script><b>Evil</b>")               # the data round-trips intact
+        self.assertIn('<script>alert("pwned")</script>', node["x"])
+        self.assertEqual(node["g"], [g["name"] for g in js_data["groups"]].index("concepts"))
+        self.assertEqual(node["u"], "2026-11-11")
+        self.assertIn("Generated by brain.py map", h)
+
+    def test_map_is_deterministic(self):
+        d = self.fresh()
+        self.write(d, "wiki/people/ann.md", PAGE.format(t="Ann", s="interview", b="Works with [[who-i-am]]."))
+        self.brain(d, "map")
+        first = {r: (d / r).read_bytes() for r in ("maps/brain.canvas", "maps/brain.html")}
+        self.brain(d, "map")
+        self.assertEqual(first, {r: (d / r).read_bytes() for r in first})
+        d2 = self.tmp / "copy"
+        shutil.copytree(d, d2)
+        (d2 / "maps/brain.canvas").unlink(); (d2 / "maps/brain.html").unlink()
+        self.brain(d2, "map")
+        self.assertEqual(first, {r: (d2 / r).read_bytes() for r in first})   # same pages, other folder
+
+    def test_300_pages_valid_complete_and_fast(self):
+        d = self.fresh()
+        folders = ["projects", "clients", "people", "decisions", "concepts", "sops", "daily"]
+        names = [(folders[i % 7], f"{folders[i % 7]}-{i:03d}") for i in range(300)]
+        want = set()
+        path = {m: f"wiki/{g}/{m}.md" for g, m in names}
+        path["who-i-am"] = "wiki/me/who-i-am.md"
+        for i, (f, n) in enumerate(names):
+            targets = [names[(i * 7 + k * 13) % 300][1] for k in range(1 + i % 4)] + ["who-i-am"]
+            self.write(d, f"wiki/{f}/{n}.md", PAGE.format(t=f"Page {i}", s="interview",
+                       b=" ".join(f"[[{t}]]" for t in targets)))
+            for t in targets:
+                if t != n:
+                    want.add(frozenset((f"wiki/{f}/{n}.md", path[t])))
+        t0 = time.monotonic()
+        r = self.brain(d, "map")
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(took, 2.0, f"map took {took:.2f}s")
+        data, probs = canvas_problems(d)
+        self.assertEqual(probs, [])
+        self.assertEqual(sorted(n["file"] for n in data["nodes"] if n["type"] == "file"), all_pages(d))
+        got = set(self.edges_by_file(data))
+        self.assertTrue(want <= got, sorted(map(sorted, want - got))[:3])
+        _, js_data = html_data(d)
+        self.assertEqual(len(js_data["nodes"]), len(all_pages(d)))
+        self.assertIn("pages", r.stdout)
+
+    def test_lint_ignores_generated_map_and_map_keeps_foreign_files(self):
+        d = self.fresh()
+        self.write(d, "wiki/people/ann.md", PAGE.format(t="Ann", s="interview", b="Works with [[who-i-am]]."))
+        self.write(d, "wiki/me/who-i-am.md", (d / "wiki/me/who-i-am.md").read_text() + "\nFriend: [[ann]]\n")
+        self.brain(d, "map")
+        (d / "wiki/people/ann.md").unlink()
+        self.write(d, "wiki/me/who-i-am.md", (d / "wiki/me/who-i-am.md").read_text().replace("[[ann]]", "Ann"))
+        r = self.brain(d, "lint")
+        self.assertEqual(r.returncode, 0, r.stderr)                  # stale generated map: a hint, not an error
+        self.assertIn("maps/brain.canvas: out of date", r.stderr)
+        self.brain(d, "map")
+        r = self.brain(d, "lint")
+        self.assertNotIn("brain.canvas", r.stderr)
+        # a hand-made maps/brain.canvas is never overwritten without --force
+        own = '{"nodes": [], "edges": []}\n'
+        (d / "maps/brain.canvas").write_text(own)
+        r = self.brain(d, "map")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not made by map", r.stderr)
+        self.assertEqual((d / "maps/brain.canvas").read_text(), own)
+        self.assertEqual(self.brain(d, "map", "--force").returncode, 0)
+        self.assertEqual(canvas_problems(d)[1], [])
+
+    def test_hot_md_is_the_centre_when_wiki_me_is_empty(self):
+        d = self.fresh()
+        for p in (d / "wiki/me").glob("*.md"):
+            p.unlink()
+        self.write(d, "hot.md", "# hot\n- now: [[glossary]]\n")
+        self.assertEqual(self.brain(d, "map").returncode, 0)
+        data, probs = canvas_problems(d)
+        self.assertEqual(probs, [])
+        me = [n for n in data["nodes"] if n["type"] == "file" and n["color"] == next(
+            g["color"] for g in data["nodes"] if g["id"] == "g-me")]
+        self.assertEqual([n["file"] for n in me], ["hot.md"])
 
 
 class ReinstallRespectsDeletes(Base):
