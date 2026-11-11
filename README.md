@@ -55,9 +55,38 @@ python3 skeleton-base-kit/tools/brain.py init ~/my-base
 - If Frugal-Bridge is already installed there, its USER / PROGRESS / DECISIONS / MAP files and `sources/` are
   imported into the base (originals kept in `raw/exports/frugal-DATE/`, one-line stubs left behind).
 - Then ask your AI tool: "interview me and fill wiki/me/, one question at a time".
-- Remove: `python3 skeleton-base-kit/tools/brain.py uninstall ~/my-base` removes only what init added and you
-  did not change. If Frugal-Bridge is installed, your profile, now, decisions and map are exported back to its
-  plain files first.
+- Remove: `python3 skeleton-base-kit/tools/brain.py uninstall ~/my-base` (see below: it keeps your data).
+
+## Uninstall keeps your data
+
+Removing Skeleton Base never deletes anything of yours.
+
+1. **A full backup comes first.** `uninstall` writes the whole base (every file, dotfiles, `.git`) to
+   `~/skeleton-base-backups/NAME-YYYYmmdd-HHMMSS.tar.gz` (mode 600, folder 700), outside the base, reads it
+   back to check it, and prints its path plus a one-line restore command
+   (`mkdir -p PARENT && tar -xzf ARCHIVE -C PARENT`). If the backup cannot be written, nothing is uninstalled.
+   `--backup-dir DIR` picks another folder (never inside the base); `--no-backup` skips it, only when you say so.
+2. **Only unmodified kit files go.** A file init copied is removed only when it is still byte-identical to what
+   init wrote. Everything else stays where it is: your wiki pages, `raw/` (also `raw/inbox/collected/`),
+   board cards, agents, `hot.md`, `progress/agents.log`, templates and maps you edited, `.brain/` (collector
+   state, `manifest.json`, `watch.json`, backups), the git repository with its history, and any file of a type
+   the kit does not know.
+3. **Shared files lose only our marked block.** `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.gitignore`: your text
+   outside the block stays byte for byte; if you wrote inside our block, a copy of the file is kept in
+   `.base-folder/backup/`. `.claude/settings.json` and `.gemini/settings.json` lose only the keys init added;
+   when that leaves your original settings, your original bytes (layout too) are put back.
+4. **Generated maps.** `maps/brain.canvas` / `maps/brain.html` are removed only when they are exactly what `map`
+   last wrote (recorded in `.brain/map.json`). A map you changed (e.g. nodes moved in Obsidian) is yours: `map`
+   and `init` leave it alone too, and `map --force` keeps a copy in `.brain/backups/` before replacing it.
+5. **Only run-time files of the kit are deleted:** `.brain/search.db` (rebuilt from your files by `search`),
+   lock files, `.brain/kick`, `.brain/pycache/`.
+6. **At the end it prints what was kept and where** (per folder, with the number of git commits), and that the
+   folder is plain Markdown: any AI tool can open it as it is, and `init` on it again adopts your files (never
+   overwrites them, no duplicates: collected items are not collected twice, your edited map is left alone).
+
+If Frugal-Bridge is installed, your profile, now, decisions and map are exported back to its plain files first.
+`disconnect` only touches files in your home folder (its own pointer blocks, hooks, units, pointer file); in the
+base it only updates its record in `.kits.json`.
 
 ## Daily commands (run inside the base)
 

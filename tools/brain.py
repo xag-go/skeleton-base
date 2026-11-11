@@ -4,8 +4,12 @@
 Setup
   init DIR [--frugal=yes|no]   install the full skeleton into DIR (new or existing; idempotent; never
                                overwrites your files; imports Frugal-Bridge files if it is installed there)
-  uninstall DIR                remove what init added and you did not change (exports slots back to
-                               Frugal-Bridge files if Frugal-Bridge is installed)
+  uninstall DIR [--no-backup] [--backup-dir DIR]
+                               first writes a full backup of DIR (.git and dotfiles too) to
+                               ~/skeleton-base-backups/NAME-TIME.tar.gz (mode 600) and prints how to restore
+                               it; then removes only what init added and you did not change. Your pages,
+                               raw/, board, agents, edited maps and templates, .brain/ and git history stay
+                               (exports slots back to Frugal-Bridge files if Frugal-Bridge is installed)
 
 Daily use (run inside a base, or pass --root DIR)
   status                       NEW / CHANGED / DELETED files in raw/ since the last ingest
@@ -72,7 +76,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.3.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.3.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -231,6 +235,7 @@ class Installer:
         self.d = pathlib.Path(target).resolve()
         self.log = []
         self.backup_dir = None
+        self.kept = []
 
     def p(self, rel):
         return self.d / rel
@@ -450,9 +455,13 @@ class Installer:
             if slot in ("user", "decisions"):
                 page = (f"---\ntitle: {titles[slot]}\nsources: [{src_ref}]\nupdated: {day}\nscope: private\n---\n\n"
                         + text.rstrip() + "\n")
+                if self.p(dest[slot]).exists() and read(self.p(dest[slot])) != page:
+                    self.backup(dest[slot])                  # a page of yours there already: a copy is kept
                 write(self.p(dest[slot]), page); rec["pages"][slot] = dest[slot]
                 target = dest[slot]
             elif slot == "now":
+                if self.p(dest["now"]).exists() and read(self.p(dest["now"])) != text:
+                    self.backup(dest["now"])
                 write(self.p(dest["now"]), text); rec["pages"]["now"] = dest["now"]
                 lines = [l for l in body_of(text).splitlines() if is_fact_line(l)][:10]
                 hot = read(self.p("hot.md")) or ""
@@ -537,8 +546,15 @@ class Installer:
             if not had:
                 continue
             if rel in created and not new.strip():
+                if SRC == self.d or self.block_edited(t, rel, sr, en):
+                    self.backup(rel)                         # text you added INSIDE our block: a copy is kept
+                    kept.append(f"{rel} (you edited inside the kit block: a copy is in "
+                                f"{self.backup_dir.relative_to(self.d).as_posix()}/{rel})")
                 self.p(rel).unlink(); self.log.append(f"removed {rel}")
             else:
+                if SRC == self.d or self.block_edited(t, rel, sr, en):
+                    kept.append(f"{rel} (your text outside the kit block stays; you edited inside it too: a copy "
+                                f"of the whole file is in .base-folder/backup/)")
                 self.change(rel, new)
 
         rel = CLAUDE_SETTINGS
@@ -559,7 +575,7 @@ class Installer:
                 if self.p(".claude").is_dir() and not any(self.p(".claude").iterdir()):
                     self.p(".claude").rmdir()
             else:
-                self.change(rel, dump_json(data))
+                self.put_json_back(rel, data)
 
         rel = ".gemini/settings.json"
         if self.p(rel).exists() and not frugal:
@@ -579,10 +595,24 @@ class Installer:
                 if self.p(".gemini").is_dir() and not any(self.p(".gemini").iterdir()):
                     self.p(".gemini").rmdir()
             else:
-                self.change(rel, dump_json(data))
+                self.put_json_back(rel, data)
         elif self.p(rel).exists():
             kept.append(rel + " (Frugal-Bridge hosts use it)")
 
+        rec = map_record(self.d)
+        for rel_ in GENERATED:
+            f = self.p(rel_)
+            if not f.is_file():
+                rec.pop(rel_, None)
+                continue
+            b = f.read_bytes()
+            if MAP_MARK not in b.decode("utf-8", "replace"):
+                continue                                   # not made by map: yours
+            if (rec.get(rel_) == sha(b)) if rel_ in rec else self.map_is_current(rel_, b):
+                f.unlink(); rec.pop(rel_, None)
+            else:
+                kept.append(f"{rel_} (you changed this map)")
+        save_map_record(self.d, rec)
         for rel, h in sorted(created.items()):
             if rel.endswith("/") or h in ("block", "json") or rel in ("CLAUDE.md", "GEMINI.md"):
                 continue
@@ -593,20 +623,17 @@ class Installer:
                 f.unlink()
             else:
                 kept.append(rel)
-        for rel_ in GENERATED:
-            f = self.p(rel_)
-            if f.is_file() and MAP_MARK in f.read_text(encoding="utf-8", errors="replace"):
-                f.unlink()
         for d in sorted({str(pathlib.Path(r).parent) for r in created if not r.endswith("/")}
                         | {r.rstrip("/") for r in created if r.endswith("/")}, key=lambda x: -x.count("/")):
             self._rmdir_up(d)
         shutil.rmtree(self.p(".brain/pycache"), ignore_errors=True)       # the watcher's bytecode cache
-        for extra in (".brain/search.db", ".brain/watch.lock", ".brain/kick", ".brain"):
+        # run-time markers and the search index (rebuilt from your files by `search`); nothing of yours
+        for extra in (".brain/watch.lock", ".brain/kick", ".brain/collector.lock", ".brain/search.db"):
             p = self.p(extra)
             if p.is_file():
                 p.unlink()
-            elif p.is_dir() and not any(p.iterdir()):
-                p.rmdir()
+        if self.p(".brain").is_dir() and not any(self.p(".brain").iterdir()):
+            self.p(".brain").rmdir()
 
         del kits["base-folder"]
         if frugal:
@@ -620,9 +647,52 @@ class Installer:
             self.p(".kits.json").unlink()
         else:
             write(self.p(".kits.json"), dump_json(k))
+        self.kept = kept
         if kept:
             self.log.append("kept (has your content): " + ", ".join(kept))
         return self.log
+
+    def map_is_current(self, r, data):
+        """No record of what `map` wrote (older install): ours only when it is exactly what map writes now."""
+        try:
+            groups, colors, items, edges = map_model(self.d)
+            text = canvas_text(groups, colors, items, edges) if r.endswith(".canvas") else \
+                html_text(groups, colors, items, edges)
+        except Exception:                    # an unreadable base: keep the file
+            return False
+        return sha(text) == sha(data)
+
+    def put_json_back(self, rel, data):
+        """Write DATA to rel; when one of init's backups of rel holds the same settings, put its exact bytes back
+        (your own layout, byte for byte), else write it in the kit's layout."""
+        root = self.p(".base-folder/backup")
+        for b in sorted(root.glob("*/" + rel)) if root.is_dir() else []:
+            try:
+                same = json.loads(b.read_text(encoding="utf-8")) == data
+            except (OSError, ValueError):
+                same = False
+            if same:
+                if self.p(rel).read_bytes() != b.read_bytes():
+                    shutil.copy2(b, self.p(rel)); self.log.append(f"restored {rel} (your original layout)")
+                return
+        self.change(rel, dump_json(data))
+
+    @staticmethod
+    def block_edited(text, rel, start_re=START_RE, end=END):
+        """True when the kit block in TEXT is not exactly what this kit writes (you added text inside it)."""
+        r = find_block(text, start_re, end)
+        if not r:
+            return False
+        inner = text[r[0]:r[1]]
+        inner = inner[inner.find("\n") + 1:] if "\n" in inner else ""
+        inner = inner[:len(inner) - len(end)] if inner.endswith(end) else inner
+        kit = POINTER if rel in ("CLAUDE.md", "GEMINI.md") else None
+        if kit is None:
+            try:
+                kit = block_body(rel, start_re, end)
+            except SystemExit:
+                return True
+        return inner.strip("\n") != kit.strip("\n")
 
     def _rmdir_up(self, rel):
         p = self.p(rel)
@@ -677,6 +747,102 @@ class Installer:
         else:
             slots["sources"] = "raw/"
         return slots
+
+
+# ---------------------------------------------------------------- full backup before uninstall
+BACKUPS_DIR = "skeleton-base-backups"     # under HOME: ~/skeleton-base-backups/BASENAME-YYYYmmdd-HHMMSS.tar.gz
+
+
+def shq(s):
+    s = str(s)
+    return s if re.fullmatch(r"[A-Za-z0-9_./:@%+=,-]+", s) else "'" + s.replace("'", "'\\''") + "'"
+
+
+def archive_base(base, dest=None):
+    """Write the WHOLE base (dotfiles, .git, everything) to DEST/BASENAME-TIME.tar.gz (mode 600, folder 700),
+    outside the base; read it back to prove it is complete. Returns (archive path, files in it)."""
+    import tarfile, io
+    base = pathlib.Path(base).resolve()
+    dest = pathlib.Path(dest).expanduser().resolve() if dest else (home_dir() / BACKUPS_DIR).resolve()
+    if dest == base or base in dest.parents:
+        raise SystemExit(f"backup: {dest} is inside the base {base}; pass --backup-dir DIR outside it")
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest, 0o700)
+    except OSError:
+        pass
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out, n = dest / f"{base.name}-{stamp}.tar.gz", 2
+    while out.exists():
+        out, n = dest / f"{base.name}-{stamp}-{n}.tar.gz", n + 1
+    tmp = out.with_name("." + out.name + ".part")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    names = []
+    try:
+        with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
+            for cur, dirs, files in os.walk(base):
+                dirs.sort(); files.sort()
+                for name in [""] + dirs + files if cur == str(base) else dirs + files:
+                    p = pathlib.Path(cur) / name if name else base
+                    arc = base.name + ("/" + p.relative_to(base).as_posix() if p != base else "")
+                    ti = tar.gettarinfo(str(p), arcname=arc)
+                    if ti is None:                # a socket: nothing to keep
+                        continue
+                    if ti.isreg():
+                        data = p.read_bytes()     # read once: a file that grows while we read stays consistent
+                        ti.size = len(data)
+                        tar.addfile(ti, io.BytesIO(data))
+                        names.append(arc)
+                    else:
+                        tar.addfile(ti)
+                for d in list(dirs):              # walk into real folders only (symlinks are stored as links)
+                    if (pathlib.Path(cur) / d).is_symlink():
+                        dirs.remove(d)
+            fh.flush(); os.fsync(fh.fileno())
+        with tarfile.open(tmp, "r:gz") as tar:   # read back: every file is there and the gzip CRC checks out
+            got = [m.name for m in tar if m.isreg()]
+        if sorted(got) != sorted(names):
+            raise OSError("archive check failed (files differ)")
+        os.replace(tmp, out)
+        os.chmod(out, 0o600)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    return out, len(names)
+
+
+def restore_line(archive, base):
+    base = pathlib.Path(base).resolve()
+    return f"mkdir -p {shq(base.parent)} && tar -xzf {shq(archive)} -C {shq(base.parent)}"
+
+
+def kept_report(base, kit_kept=()):
+    """What is still in the base after uninstall, by top-level entry (exact counts)."""
+    base = pathlib.Path(base)
+    if not base.is_dir():
+        return [f"{base} is gone"]
+    lines = [f"Your data is kept in {base}:"]
+    for p in sorted(base.iterdir(), key=lambda x: x.name):
+        if p.name == ".git":
+            r = subprocess.run(["git", "-C", str(base), "rev-list", "--count", "--all"], capture_output=True,
+                               text=True) if shutil.which("git") else None
+            n = r.stdout.strip() if r is not None and r.returncode == 0 else "?"
+            lines.append(f"  .git/  git repository and history ({n} commits), untouched")
+        elif p.is_dir() and not p.is_symlink():
+            files = [f for f in p.rglob("*") if f.is_file() or f.is_symlink()]
+            lines.append(f"  {p.name}/  {len(files)} file(s)")
+        else:
+            lines.append(f"  {p.name}")
+    if kit_kept:
+        lines.append("Kit files kept because you changed them: " + ", ".join(kit_kept))
+    return lines
+
+
+def reopen_lines(base, tool=None):
+    tool = tool or "python3 <skeleton-base>/tools/brain.py"
+    return [f"{base} is a plain folder of Markdown files: open it with any AI tool or editor as it is.",
+            f"To install Skeleton Base again: {tool} init {shq(base)}  (your files are adopted, never overwritten)"]
 
 
 # ---------------------------------------------------------------- base commands
@@ -1219,20 +1385,69 @@ def html_text(groups, colors, items, edges):
     return MAP_HTML.replace("/*MARK*/", MAP_MARK).replace("/*DATA*/", js)
 
 
+MAP_RECORD = ".brain/map.json"        # sha256 of what `map` last wrote: a changed map is yours and kept
+
+
+def map_record(root):
+    try:
+        d = json.loads((pathlib.Path(root) / MAP_RECORD).read_text(encoding="utf-8"))
+        return {k: v for k, v in d.items() if k in GENERATED and isinstance(v, str)} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_map_record(root, rec):
+    p = pathlib.Path(root) / MAP_RECORD
+    if not rec:
+        if p.is_file():
+            p.unlink()
+        return
+    new = json.dumps(dict(sorted(rec.items())), indent=1) + "\n"
+    if read(p) != new:
+        write(p, new)
+
+
+def keep_copy(root, r, why):
+    """Copy ROOT/r into ROOT/.brain/backups/WHY-TIME/r before it is replaced; return the copy's path."""
+    src = pathlib.Path(root) / r
+    if not src.is_file():
+        return None
+    dst = pathlib.Path(root) / ".brain" / "backups" / f"{why}-{dt.datetime.now():%Y%m%d-%H%M%S-%f}" / r
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
 def build_map(root, quiet=False, force=False):
     """Write maps/brain.canvas and maps/brain.html. Never overwrites a file of the same name that map did not make."""
     groups, colors, items, edges = map_model(root)
     out = {"maps/brain.canvas": canvas_text(groups, colors, items, edges),
            "maps/brain.html": html_text(groups, colors, items, edges)}
-    wrote, skipped = [], []
+    wrote, skipped, edited = [], [], []
+    rec = map_record(root)
     for r, text in out.items():
-        cur = read(root / r)
-        if cur is not None and MAP_MARK not in cur and not force:
-            skipped.append(r); continue
+        cur_b = (root / r).read_bytes() if (root / r).is_file() else None
+        cur = cur_b.decode("utf-8", "replace") if cur_b is not None else None
+        if cur is not None and MAP_MARK not in cur:
+            if not force:
+                skipped.append(r); continue
+            keep_copy(root, r, "map")           # --force over a file of yours: a copy is kept first
+        elif cur is not None and r in rec and sha(cur_b) != rec[r] and cur != text:
+            if not force:                       # you edited the generated map (e.g. moved nodes): yours, not ours
+                skipped.append(r); edited.append(r); continue
+            keep_copy(root, r, "map")           # --force: your edited map is kept as a copy first
+        elif cur is not None and r not in rec and cur != text:
+            keep_copy(root, r, "map")           # older install, no record of what map wrote: keep a copy once
         if cur != text:
             write(root / r, text); wrote.append(r)
+        rec[r] = sha(text)
+    save_map_record(root, rec)
     if not quiet:
         for r in skipped:
+            if r in edited:
+                print(f"map: {r} was changed by you since map wrote it; left alone (use --force to replace it; "
+                      "your version is then kept in .brain/backups/)", file=sys.stderr)
+                continue
             print(f"map: {r} exists and was not made by map; left alone (use --force to replace it)",
                   file=sys.stderr)
         sizes = ", ".join(f"{r} ({(root / r).stat().st_size // 1024 + 1} KB)" for r in out if r not in skipped)
@@ -3327,9 +3542,34 @@ def main(argv):
         print(f"Skeleton Base v{VERSION} installed in {inst.d}")
         return rc
     if cmd == "uninstall":
-        if not args:
-            print("usage: uninstall DIR"); return 1
-        print("\n".join(Installer(args[0]).uninstall()) or "nothing to change")
+        no_backup = "--no-backup" in args
+        args = [a for a in args if a != "--no-backup"]
+        bdir = None
+        if "--backup-dir" in args:
+            i = args.index("--backup-dir")
+            if i + 1 >= len(args):
+                print("usage: uninstall DIR [--no-backup] [--backup-dir DIR]"); return 1
+            bdir = args[i + 1]; del args[i:i + 2]
+        if len(args) != 1:
+            print("usage: uninstall DIR [--no-backup] [--backup-dir DIR]"); return 1
+        inst = Installer(args[0])
+        if "base-folder" not in load_json(inst.p(".kits.json"), ".kits.json").get("kits", {}):
+            print("base-folder is not installed here (nothing changed)"); return 0
+        archive = None
+        if no_backup:
+            print("backup: skipped (--no-backup)")
+        else:
+            try:
+                archive, n = archive_base(inst.d, bdir)
+            except OSError as e:
+                print(f"backup failed, nothing was uninstalled: {e}"); return 1
+            print(f"backup: {archive} ({n} files, mode 600, includes .git and dotfiles)")
+            print(f"  restore: {restore_line(archive, inst.d)}")
+        print("\n".join(inst.uninstall()) or "nothing to change")
+        print("\n".join(kept_report(inst.d, [k for k in inst.kept])))
+        if archive:
+            print(f"Full backup from before the uninstall: {archive}")
+        print("\n".join(reopen_lines(inst.d, f"python3 {shq(SRC / 'tools' / 'brain.py')}")))
         return 0
     if cmd == "check-public":
         wf = None

@@ -12,6 +12,7 @@ secrets/
 .brain/collector.lock
 .brain/watch.lock
 .brain/kick
+.brain/map.json
 .brain/*.tmp
 .brain/pycache/
 .base-folder/

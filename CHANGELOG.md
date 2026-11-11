@@ -2,6 +2,34 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.4 - 2026-11-11
+- Uninstall keeps your data (owner rule: removing Skeleton Base never loses anything of the user's).
+  - `uninstall` first writes a full backup of the base (`.git` and dotfiles included) to
+    `~/skeleton-base-backups/NAME-YYYYmmdd-HHMMSS.tar.gz` (mode 600, folder 700, outside the base, read back and
+    checked), prints its path and a one-line restore command; a failed backup stops the uninstall with nothing
+    changed. `--backup-dir DIR` (refused inside the base), `--no-backup` only when given.
+  - After uninstall it prints what was kept and where (per folder, git commit count) and how to re-open or
+    reinstall (`init` adopts the files).
+  - Generated maps: `.brain/map.json` records what `map` wrote. A map you changed is no longer deleted by
+    uninstall nor overwritten by `map`/`init` (before: any file with the map marker was deleted/overwritten);
+    `map --force` keeps a copy in `.brain/backups/map-TIME/` first, also over a file map did not make.
+  - Text you wrote inside our block of `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`/`.gitignore` is copied to
+    `.base-folder/backup/` before the block (or a block-only file) is removed.
+  - `.claude/settings.json` / `.gemini/settings.json`: when removing our keys leaves your original settings, your
+    original bytes are put back (layout too), from init's backup.
+  - `.brain/collector.lock` is removed with the other run-time files; `.brain/search.db` is still removed (an
+    index rebuilt from your files); everything else in `.brain/` stays.
+  - Importing Frugal-Bridge files never overwrites an existing `wiki/me/frugal-user.md`,
+    `wiki/decisions/frugal-decisions.md` or `progress/frugal-progress.md` without a copy in `.base-folder/backup/`.
+  - `.gitignore` block also ignores `.brain/map.json`.
+- Tests: every test command runs with an isolated temporary HOME (before, a few ran with the real one). 7 new
+  tests (98 in total): a rich base (pages, raw incl. collected and sqlite-sourced items, cards, edited template
+  and agent, `hot.md`, `progress/agents.log`, user text in `AGENTS.md` outside the block, 3 git commits, `.brain`
+  state and backups, unknown files, a symlink, an edited map) is uninstalled with every user file byte-identical
+  and the git log intact, the archive (mode 600) restores the exact tree; reinstall adopts without loss or
+  duplication; edits inside the kit block copied; backup dir inside the base or unwritable refuses and changes
+  nothing; map edits survive `map` and `init`; your own `.claude/settings.json` layout comes back byte-identical; `disconnect` changes nothing in the base but `.kits.json`.
+
 ## v1.3.3 - 2026-11-11
 - Pointer file: `connect` (and auto-connect) writes `~/.config/skeleton-base/base` (one line, the base folder),
   recorded in `.kits.json` like the systemd units; `disconnect` removes it, or gives back the bytes another base

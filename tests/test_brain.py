@@ -24,9 +24,13 @@ BASE_SLOTS = {"user": "wiki/me/", "now": "hot.md", "decisions": "wiki/decisions/
               "map": "wiki/index.md", "sources": "raw/"}
 
 
+_ISOLATED_HOME = tempfile.TemporaryDirectory(prefix="skb-home-")    # a test never sees the real home
+
+
 def run(*args, cwd=None, env=None, inp=None):
-    e = dict(os.environ, BRAIN_TODAY="2026-11-11")
-    for v in ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT"):   # never the real user's kits
+    e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=_ISOLATED_HOME.name)
+    for v in ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
+              "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):   # never the real user's kits or tools
         e.pop(v, None)
     e.update(env or {})
     return subprocess.run([sys.executable, *map(str, args)], capture_output=True, text=True, cwd=cwd, env=e,
@@ -1046,7 +1050,8 @@ class ConnectTests(HomeBase):
         self.assertIn("connect", json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"])
         r = run(BRAIN, "uninstall", self.base, env={"HOME": str(self.home)})
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertEqual(home0, tree(self.home))
+        self.assertEqual(len(list((self.home / "skeleton-base-backups").glob("base-*.tar.gz"))), 1)  # the safety net
+        self.assertEqual(home0, tree(self.home, skip=("skeleton-base-backups",)))
 
 
 class ClaudePermissionTests(Base):
@@ -1432,6 +1437,222 @@ class WatchCollectTests(HomeBase):
         self.ok("collect")
         self.assertTrue(any(f.startswith("notes/") for f in self.collected()), self.collected())
         self.assertIn("notes", self.ok("collect", "--only", "notes").stdout + "notes")
+
+
+def full_tree(d):
+    """rel -> (kind, sha256 or link target, mode) for everything under d, .git and dotfiles included."""
+    out, d = {}, pathlib.Path(d)
+    for root, dirs, files in os.walk(d):
+        for name in dirs + files:
+            p = pathlib.Path(root) / name
+            r = p.relative_to(d).as_posix()
+            if p.is_symlink():
+                out[r] = ("link", os.readlink(p), None)
+            elif p.is_dir():
+                out[r] = ("dir", None, None)
+            else:
+                out[r] = ("file", hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mode & 0o777)
+    return out
+
+
+def git(d, *a):
+    r = subprocess.run(["git", "-C", str(d), "-c", "user.name=Test", "-c", "user.email=test@example.com", *a],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout
+
+
+USER_RULES = "# My own rules for this folder\n\nAlways cite the page you used.\n\n"
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class UninstallKeepsDataTests(HomeBase):
+    """Owner rule: removing Skeleton Base never loses the user's data. A rich base, then uninstall."""
+
+    def rich_base(self):
+        b = self.base
+        self.make_stores()
+        self.ok("collect")                                       # raw/inbox/collected incl. sqlite-sourced items
+        self.assertTrue(any("codex" in f for f in self.collected()) and
+                        any("hermes-facts" in f for f in self.collected()), self.collected())
+        git(b, "init", "-q", "-b", "main")
+        git(b, "add", "-A"); git(b, "commit", "-q", "-m", "first: fresh base")
+        self.write(b, "wiki/projects/garden.md", PAGE.format(t="Garden", s="talk", b="Plant beans in May."))
+        self.write(b, "wiki/people/kim-example.md", PAGE.format(t="Kim Example", s="talk", b="Neighbour."))
+        self.write(b, "raw/docs/contract.txt", "signed copy\n")
+        self.write(b, "raw/inbox/clip.md", "a note to ingest\n")
+        self.write(b, "board/2026-11-11-fix-the-fence.md", "---\ntitle: Fix the fence\nstatus: todo\n---\n")
+        self.write(b, "agents/gardener.md", "# Gardener\nengine: any\n")
+        (b / "agents/twin.md").write_text((b / "agents/twin.md").read_text() + "\nMy twin speaks softly.\n")
+        (b / "templates/person.md").write_text((b / "templates/person.md").read_text() + "\n## Birthday\n")
+        (b / "hot.md").write_text((b / "hot.md").read_text() + "- planting season\n")
+        with open(b / "progress/agents.log", "a") as f:
+            f.write("2026-11-11 assistant: watered the plants\n")
+        git(b, "add", "-A"); git(b, "commit", "-q", "-m", "second: my pages")
+        self.ok("index"); self.ok("map")
+        cv = json.loads((b / "maps/brain.canvas").read_text())
+        cv["nodes"][0]["x"] += 500                               # moved a node in Obsidian
+        (b / "maps/brain.canvas").write_text(json.dumps(cv, indent="\t") + "\n")
+        sh = b / "maps/start-here.canvas"
+        sh.write_text(sh.read_text().replace("}", "} ", 1))
+        (b / "AGENTS.md").write_text(USER_RULES + (b / "AGENTS.md").read_text())   # text outside our block
+        self.write(b, ".brain/backups/mine/old-note.md", "a copy I keep\n")
+        (b / "notes.bin").write_bytes(bytes(range(256)) * 4)                      # unknown file type
+        self.write(b, ".obsidian/app.json", '{"theme": "moonstone"}\n')
+        self.write(b, ".env", "MY_SETTING=1\n")
+        os.symlink("hot.md", b / "hot-link.md")
+        git(b, "add", "-A"); git(b, "commit", "-q", "-m", "third: more")
+        self.assertEqual(git(b, "rev-list", "--count", "HEAD").strip(), "3")
+        return b
+
+    def kit_owned(self, rel, before):
+        """Files uninstall may remove: unmodified kit files, pointer/registry/settings it made, generated maps."""
+        src = REPO / rel
+        if src.is_file() and before[rel][1] == hashlib.sha256(src.read_bytes()).hexdigest():
+            return True
+        return rel in (".kits.json", "CLAUDE.md", "GEMINI.md", ".gitignore", ".claude/settings.json",
+                       ".gemini/settings.json", "maps/brain.html", ".brain/map.json", ".brain/search.db",
+                       ".brain/collector.lock", ".brain/watch.lock")
+
+    def test_rich_base_uninstall_keeps_every_user_file_and_backup_restores(self):
+        b = self.rich_base()
+        before = full_tree(b)
+        log0 = git(b, "log", "--format=%H %s")
+        r = run(BRAIN, "uninstall", b, env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        after = full_tree(b)
+        removed, changed = [], []
+        for rel, v in before.items():
+            if rel.startswith(".git/") or rel == ".git":
+                self.assertEqual(after.get(rel), v, rel)                 # the repository, byte for byte
+                continue
+            if after.get(rel) == v:
+                continue
+            if v[0] == "dir" and rel not in after:
+                continue
+            if rel == "AGENTS.md":                                   # only our block left it: your text stays
+                self.assertEqual((b / "AGENTS.md").read_text().strip("\n"), USER_RULES.strip("\n"))
+                continue
+            self.assertTrue(self.kit_owned(rel, before), f"user file lost or changed: {rel}")
+            removed.append(rel)
+        self.assertEqual(git(b, "log", "--format=%H %s"), log0)
+        for rel in ("wiki/projects/garden.md", "wiki/people/kim-example.md", "raw/docs/contract.txt",
+                    "raw/inbox/clip.md", "board/2026-11-11-fix-the-fence.md", "agents/gardener.md",
+                    "agents/twin.md", "templates/person.md", "hot.md", "progress/agents.log", "maps/brain.canvas",
+                    "maps/start-here.canvas", ".brain/collector.json", ".brain/backups/mine/old-note.md",
+                    "notes.bin", ".obsidian/app.json", ".env", "hot-link.md", "wiki/index.md"):
+            self.assertEqual(after.get(rel), before[rel], rel)
+        for f in [k for k in before if k.startswith("raw/inbox/collected/") and before[k][0] == "file"]:
+            self.assertEqual(after.get(f), before[f], f)
+        self.assertFalse((b / "tools/brain.py").exists())                   # unmodified kit file: removed
+        self.assertNotIn("base-folder:start", (b / "AGENTS.md").read_text())
+        self.assertIn("Your data is kept in", r.stdout)
+        self.assertIn(".git/  git repository and history (3 commits), untouched", r.stdout)
+        self.assertIn("init", r.stdout); self.assertIn("adopted, never overwritten", r.stdout)
+        # the backup archive: outside the base, mode 600, restores to the exact tree from before
+        arcs = list((self.home / "skeleton-base-backups").glob("base-*.tar.gz"))
+        self.assertEqual(len(arcs), 1)
+        self.assertEqual(arcs[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "skeleton-base-backups").stat().st_mode & 0o777, 0o700)
+        self.assertIn(str(arcs[0]), r.stdout)
+        m = re.search(r"restore: (.+)", r.stdout)
+        self.assertTrue(m and "tar -xzf" in m.group(1), r.stdout)
+        out = self.tmp / "restored"
+        out.mkdir()
+        subprocess.run(["tar", "-xzf", str(arcs[0]), "-C", str(out)], check=True)
+        self.assertEqual(full_tree(out / "base"), before)
+        self.assertEqual(git(out / "base", "log", "--format=%H %s"), log0)
+
+    def test_reinstall_adopts_kept_data_without_loss_or_duplication(self):
+        b = self.rich_base()
+        before = full_tree(b)
+        self.assertEqual(run(BRAIN, "uninstall", b, env={"HOME": str(self.home)}).returncode, 0)
+        kept = {k: v for k, v in full_tree(b).items() if v[0] == "file" and not k.startswith(".git/")
+                and k != "AGENTS.md"}
+        r = run(BRAIN, "init", b, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        now = full_tree(b)
+        for k, v in kept.items():
+            if k in (".kits.json", ".brain/map.json"):
+                continue
+            self.assertEqual(now.get(k), v, f"reinstall changed {k}")
+        a = (b / "AGENTS.md").read_text()
+        self.assertTrue(a.startswith(USER_RULES))
+        self.assertEqual(a.count("<!-- base-folder:start"), 1)
+        self.assertEqual(a.count("Always cite the page you used."), 1)
+        for rel, v in before.items():                                         # nothing of yours went missing
+            if v[0] == "file" and not self.kit_owned(rel, before) and rel != "AGENTS.md":
+                self.assertEqual(now.get(rel), v, rel)
+        files = self.collected()
+        self.ok("collect")                                                    # dedupe state kept: nothing new
+        self.assertEqual(self.collected(), files)
+        self.assertEqual(now["maps/brain.canvas"], before["maps/brain.canvas"])   # your edited map left alone
+
+    def test_edits_inside_the_kit_block_are_copied_before_removal(self):
+        b = self.base
+        a = (b / "AGENTS.md").read_text()
+        (b / "AGENTS.md").write_text(a.replace("<!-- base-folder:end -->", "My extra rule.\n<!-- base-folder:end -->"))
+        r = run(BRAIN, "uninstall", b, "--no-backup", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("backup: skipped (--no-backup)", r.stdout)
+        self.assertFalse((self.home / "skeleton-base-backups").exists())
+        copies = list((b / ".base-folder/backup").glob("*/AGENTS.md"))
+        self.assertEqual(len(copies), 1)
+        self.assertIn("My extra rule.", copies[0].read_text())
+        self.assertIn("you edited inside the kit block", r.stdout)
+
+    def test_backup_dir_inside_base_or_unwritable_refuses_and_changes_nothing(self):
+        b = self.base
+        t0 = full_tree(b)
+        r = run(BRAIN, "uninstall", b, "--backup-dir", b / "bk", env={"HOME": str(self.home)})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("inside the base", r.stdout + r.stderr)
+        self.assertEqual(full_tree(b), t0)
+        ro = self.tmp / "ro"
+        ro.mkdir(); ro.chmod(0o500)
+        self.addCleanup(ro.chmod, 0o700)
+        r = run(BRAIN, "uninstall", b, "--backup-dir", ro / "x", env={"HOME": str(self.home)})
+        if os.geteuid() != 0:
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("backup failed, nothing was uninstalled", r.stdout)
+            self.assertEqual(full_tree(b), t0)
+
+    def test_map_edits_survive_map_and_init(self):
+        b = self.base
+        cv = b / "maps/brain.canvas"
+        mine = cv.read_text().replace('"nodes"', '"nodes" ', 1)
+        cv.write_text(mine)
+        self.write(b, "wiki/projects/new.md", PAGE.format(t="New", s="talk", b="x"))
+        r = self.hb("map")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)        # same as for any map file not made by map
+        self.assertIn("changed by you since map wrote it", r.stderr)
+        self.assertEqual(cv.read_text(), mine)
+        self.init(b)
+        self.assertEqual(cv.read_text(), mine)
+        self.ok("map", "--force")
+        self.assertNotEqual(cv.read_text(), mine)
+        self.assertEqual([p.read_text() for p in (b / ".brain/backups").glob("map-*/maps/brain.canvas")], [mine])
+
+    def test_own_settings_layout_given_back_byte_identical(self):
+        d = self.tmp / "own-settings"
+        mine = '{"theme":"dark",   "permissions": {"deny": ["Bash(rm *)"]}}\n'
+        self.write(d, ".claude/settings.json", mine)
+        self.init(d)
+        self.assertNotEqual((d / ".claude/settings.json").read_text(), mine)
+        r = run(BRAIN, "uninstall", d, "--no-backup")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((d / ".claude/settings.json").read_text(), mine)
+
+    def test_disconnect_never_touches_the_base_data(self):
+        b = self.rich_base()
+        (self.home / ".claude").mkdir(exist_ok=True)
+        self.ok("connect")
+        t1 = full_tree(b)
+        self.ok("disconnect")
+        t2 = full_tree(b)
+        diff = sorted(k for k in set(t1) | set(t2) if t1.get(k) != t2.get(k))
+        self.assertEqual(diff, [".kits.json"])                                # only its own record
+        self.assertEqual(git(b, "rev-list", "--count", "HEAD").strip(), "3")
 
 
 class NeverTests(HomeBase):
