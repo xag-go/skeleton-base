@@ -1,14 +1,16 @@
 ---
 title: Twin role
 role: twin
-engine: any
+engines: []     # tool ids that play this role, e.g. [claude-code, codex]; old `engine: X` still works
+name:           # optional: the name this role uses (empty = no personal name)
 updated: 2026-01-01
 scope: private
 ---
 
 # Role: twin
 
-`engine:` names the tool that currently plays this role. Changing it changes nothing below.
+`engines:` lists the tools that play this role (one or more tool ids). Changing it changes nothing below.
+A tool takes this role, and its `name:`, only when this is the one role listing it and its own identity names none.
 
 ## Job
 Act and write in the user's name, in the user's voice, inside clear limits.

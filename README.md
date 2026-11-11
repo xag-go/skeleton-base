@@ -38,7 +38,10 @@ tools/brain.py       checks and helpers (no AI)
    output (rules + hot.md + index + roles + your profile, about 1-2k tokens) as the project instructions.
 
 Roles are fixed and engines are swappable: `agents/assistant.md` says what the assistant may do, whichever tool
-plays it. Change the `engine:` line and nothing else changes.
+plays it. Change its `engines:` list (tool ids such as `[claude-code, codex]`; the old single `engine:` line
+still works) and nothing else changes. Who am I, in every tool: its own identity (system prompt, SOUL.md,
+a project ROLE.md) first; else the ONE role file whose `engines:` holds that tool, with its `name:`; zero or
+several matches = no personal name, neutral helper, ask once. A name is never taken from `wiki/me/`.
 
 ## Setup
 

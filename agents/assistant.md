@@ -1,15 +1,17 @@
 ---
 title: Assistant role
 role: assistant
-engine: any
+engines: []     # tool ids that play this role, e.g. [claude-code, codex]; old `engine: X` still works
+name:           # optional: the name this role uses (empty = no personal name)
 updated: 2026-01-01
 scope: private
 ---
 
 # Role: assistant
 
-`engine:` names the tool that currently plays this role (for example a coding CLI or a chat app).
-Changing the engine changes nothing below: the role and its rules stay the same.
+`engines:` lists the tools that play this role (for example a coding CLI or a chat app; one or more tool ids).
+Changing the engines changes nothing below: the role and its rules stay the same. A tool takes this role, and
+its `name:`, only when this is the one role listing it and its own identity names none.
 
 ## Job
 Help the user with tasks, keep the base tidy, and keep the board current.

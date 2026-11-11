@@ -2,6 +2,21 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.5.1 - 2026-11-12
+Every tool now knows which role it plays, and a name is never borrowed from the user's own notes:
+- Who am I (one rule, in the pointer block `connect` writes for all 26 tools, `connect --print`, and the base's
+  AGENTS.md block): the tool's own identity (system prompt, SOUL.md / identity file, a project ROLE.md) wins;
+  otherwise the ONE file in `agents/` whose `engines:` lists the tool's id gives its role and `name:`; zero or
+  several matches = no personal name, a neutral helper that asks once which role it plays; never a name from
+  `wiki/me/` or the user file. Fixes a coding CLI started outside the base calling itself by the twin's name.
+- Role files: `engines: [tool-id, ...]` (several tools can play one role); the old single `engine:` line is still
+  read (`engine: any` claims nothing). Templates ship `engines: []` and an empty `name:`.
+- `lint`: an engine value that is not a tool id is a problem; one engine claimed by two roles is a warning.
+- Upgrade: re-run `init` (AGENTS.md block) and `connect` (tool blocks); existing role files are left as they are.
+- Watcher unit: `MemoryMax` 40M -> 160M. `watch --once` with filing peaks at about 67 MB on a real base, so the
+  1.5.0 watcher was OOM-killed in a restart loop. A test runs `watch --once` on 50 collected items and checks the
+  peak RSS leaves 2x headroom under the cap. The collect and tidy units have no memory cap.
+
 ## v1.5.0 - 2026-11-12
 Memories from any tool reach the wiki at once, with no model, and a rare model pass keeps the pages clean:
 - `brain.py file [--dry-run]` (also run by `collect` and by the watcher, right after collecting): each new collected

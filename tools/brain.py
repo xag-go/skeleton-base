@@ -102,7 +102,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.5.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.5.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -914,6 +914,58 @@ def roles(root):
     return {p.stem for p in a.glob("*.md")} if a.is_dir() else set()
 
 
+ENGINE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+NO_ENGINE = {"", "any", "none", "unset", "-"}     # legacy `engine: any`: no tool claimed
+
+
+def fm_list(text, key):
+    """Values of frontmatter `key`: inline `[a, b]`, a block list (`- a` lines) or one plain value."""
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end < 0:
+        return None
+    lines = text[4:end].splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"^{re.escape(key)}\s*:(.*)$", line)
+        if not m:
+            continue
+        v = m.group(1).split(" #")[0].strip()
+        if v.startswith("[") and v.endswith("]"):
+            return [x.strip().strip("\"'") for x in v[1:-1].split(",") if x.strip().strip("\"'")]
+        if v:
+            return [v.strip("\"'")]
+        out = []
+        for l in lines[i + 1:]:
+            mm = re.match(r"^\s*-\s*(.*)$", l)
+            if not mm:
+                break
+            if mm.group(1).split(" #")[0].strip().strip("\"'"):
+                out.append(mm.group(1).split(" #")[0].strip().strip("\"'"))
+        return out
+    return None
+
+
+def role_engines(text):
+    """The engines (tool ids) a role file claims: `engines:` (list) plus the legacy single `engine:` value.
+    `any`/`none`/empty claim nothing."""
+    vals = (fm_list(text, "engines") or []) + (fm_list(text, "engine") or [])
+    out = []
+    for v in vals:
+        v = v.strip()
+        if v.lower() not in NO_ENGINE and v not in out:
+            out.append(v)
+    return out
+
+
+def role_for(root, engine):
+    """The one role file whose engines hold `engine`, else None (zero or several matches: never guess)."""
+    a = pathlib.Path(root) / "agents"
+    hits = [p for p in sorted(a.glob("*.md")) if engine in role_engines(p.read_text(encoding="utf-8"))] \
+        if a.is_dir() else []
+    return hits[0] if len(hits) == 1 else None
+
+
 def status(root):
     m, todo = load_manifest(root), []
     for p in raw_files(root):
@@ -1027,6 +1079,23 @@ def lint(root):
         check_links(hot, prose(hot.read_text(encoding="utf-8")))
     else:
         errs.append("hot.md: missing")
+
+    # roles: engines must be tool ids; one engine claimed by two roles cannot tell them apart
+    claims = {}
+    ad = root / "agents"
+    for rp in (sorted(ad.glob("*.md")) if ad.is_dir() else []):
+        rt = rp.read_text(encoding="utf-8")
+        for v in (fm_list(rt, "engines") or []) + (fm_list(rt, "engine") or []):
+            if v.lower() not in NO_ENGINE and not ENGINE_ID.match(v):
+                errs.append(f"{rel(rp, root)}: engine '{v}' is not a tool id (lowercase, digits, . _ -; "
+                            f"e.g. claude-code, codex, hermes)")
+        for e in role_engines(rt):
+            if ENGINE_ID.match(e):
+                claims.setdefault(e, []).append(rel(rp, root))
+    for e, fs in sorted(claims.items()):
+        if len(fs) > 1:
+            warns.append(f"engine '{e}' is claimed by {len(fs)} roles ({', '.join(fs)}): a tool running {e} takes no "
+                         f"role and no name unless its own identity (system prompt, SOUL.md, ROLE.md) names one")
 
     # board
     rs = roles(root)
@@ -3086,6 +3155,8 @@ def pointer_body(base):
 - Plain coding or general questions: do not read it.
 - Never edit `{b}/raw/`. When you change the base, follow `{b}/AGENTS.md`.
 
+{role_rule(b + '/agents')}
+
 ## Saving knowledge
 - Durable knowledge (facts about the user, decisions, people, clients, project status) is saved in the base at
   `{b}`: about the user -> the page of `wiki/me/` it fits;
@@ -3101,6 +3172,18 @@ def pointer_body(base):
 - If your tool blocks a path in it, do not save the knowledge elsewhere: ask the user to allow `{b}` (read and
   write) in your tool's settings. `connect` already added it where a tool has a user setting for this:
   {access_text(base)}."""
+
+
+def role_rule(agents):
+    """Who am I: the same rule in every tool's pointer block and in the base's AGENTS.md block."""
+    return f"""## Your role and name
+- Your own identity (your system prompt, SOUL.md or identity file, a project ROLE.md) names your role or name: use it.
+- Otherwise, before you say who you are or act in a role, read the frontmatter of `{agents}/*.md`. A role whose
+  `engines:` list (or old `engine:` line) holds your tool's id (lowercase with hyphens: `claude-code`, `codex`,
+  `gemini`, `hermes`, `opencode`, ...) is yours when it is the ONLY such role: take its `name:` (if any) and duties.
+- No match, or several: use no personal name, act as a neutral helper, and ask the user once which role you play
+  (they add your tool id to that role's `engines:`).
+- Never take your name from `wiki/me/` or the user's file: names there are the user's words about specific roles."""
 
 
 def index_cmd(base):
@@ -3168,7 +3251,7 @@ def tidy_unit_texts(base):
 def watch_unit_texts(base):
     service = (f"[Unit]\nDescription=Skeleton Base: instant memory watcher (collect, index, map, auto-connect)\n\n"
                f"[Service]\nType=simple\nExecStart=/usr/bin/env python3 -S {unit_esc(base / 'tools' / 'brain.py')} "
-               f"watch --base {unit_esc(base)}\nRestart=on-failure\nRestartSec=10\nMemoryMax=40M\nNice=10\n\n"
+               f"watch --base {unit_esc(base)}\nRestart=on-failure\nRestartSec=10\nMemoryMax=160M\nNice=10\n\n"
                f"[Install]\nWantedBy=default.target\n")
     return {f".config/systemd/user/{WATCH_UNIT}.service": service}
 

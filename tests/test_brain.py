@@ -1320,7 +1320,7 @@ class ZeroTouchTests(WatchBase):
         r = self.ok("connect", "--watch", "--kick")
         u = self.home / ".config/systemd/user"
         svc = (u / "skeleton-base-watch.service").read_text()
-        for line in ("Type=simple", "Restart=on-failure", "MemoryMax=40M", "Nice=10", "WantedBy=default.target",
+        for line in ("Type=simple", "Restart=on-failure", "MemoryMax=160M", "Nice=10", "WantedBy=default.target",
                      f"watch --base {self.base}\n"):
             self.assertIn(line, svc)
         self.assertTrue((u / "skeleton-base-collect.timer").is_file(), "daily timer stays as a safety net")
@@ -3540,3 +3540,113 @@ class TidyScheduleTests(FileBase):
         self.assertEqual(set(home0), set(after), "disconnect removes exactly what connect added")
         self.assertEqual({k: v for k, v in home0.items() if "memories/" not in k},
                          {k: v for k, v in after.items() if "memories/" not in k})
+
+
+ROLE_TWIN = ("---\ntitle: Twin role\nrole: twin\nengines: [hermes]\nname: TwinName\nupdated: 2026-11-11\n"
+             "scope: private\n---\n\n# Role: twin\n")
+ROLE_ENGINEER = ("---\ntitle: Engineer role\nrole: engineer\nengines:\n  - claude-code\n  - codex   # both CLIs\n"
+                 "updated: 2026-11-11\nscope: private\n---\n\n# Role: engineer\n")
+ROLE_LEGACY = "---\ntitle: Old role\nrole: old\nengine: gemini\nname: Gem\nupdated: 2026-11-11\nscope: private\n---\n"
+
+
+class RoleTests(ToolHome):
+    """Who am I: the tool's own identity first, else the ONE role in agents/ that lists the tool, never wiki/me/."""
+
+    def test_rule_in_every_tool_block_print_and_agents_md_then_disconnect_byte_identical(self):
+        self.every_tool()
+        home0 = full_tree(self.home)
+        self.ok("connect")
+        rule = B.role_rule(str(self.base) + "/agents")
+        for f in ALL_RULES:
+            self.assertIn(rule, (self.home / f).read_text(), f)
+        for f in (self.home / ".hermes/profiles").glob("*/SOUL.md"):
+            self.assertIn(rule, f.read_text(), f)
+        self.assertIn(rule, self.ok("connect", "--print").stdout)
+        for k in B.TOOLS:                       # one block body for every row: the rule rides along for all 26
+            self.assertIn("## Your role and name", B.pointer_body(self.base), k)
+        for t in (rule, B.role_rule("agents")):
+            self.assertIn("engines:", t)
+            self.assertIn("Never take your name from `wiki/me/`", t)
+            self.assertIn("use no personal name", t)
+        self.assertIn(B.role_rule("agents"), (REPO / "AGENTS.md").read_text())
+        self.assertIn(B.role_rule("agents"), (self.base / "AGENTS.md").read_text())
+        self.ok("disconnect")
+        self.assertEqual(full_tree(self.home), home0, "disconnect gives back every byte")
+
+    def test_upgrade_rewrites_old_blocks(self):
+        rule = B.role_rule(str(self.base) + "/agents")
+        a = self.base / "AGENTS.md"
+        a.write_text(a.read_text().replace(B.role_rule("agents") + "\n", ""))       # an older base block
+        self.write(self.home, ".claude/CLAUDE.md", "mine\n")
+        self.bins("claude")
+        self.ok("connect")
+        c = self.home / ".claude/CLAUDE.md"
+        c.write_text(c.read_text().replace(rule + "\n\n", ""))                       # an older pointer block
+        self.assertNotIn("Your role and name", c.read_text())
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home), "PATH": self.path()})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(B.role_rule("agents"), a.read_text())
+        self.ok("connect")
+        self.assertIn(rule, c.read_text())
+        self.assertEqual(c.read_text().count("<!-- base-folder:start"), 1)
+
+    def test_engines_list_block_list_and_legacy_engine(self):
+        self.assertEqual(B.role_engines(ROLE_TWIN), ["hermes"])
+        self.assertEqual(B.role_engines(ROLE_ENGINEER), ["claude-code", "codex"])
+        self.assertEqual(B.role_engines(ROLE_LEGACY), ["gemini"])
+        for t in ("engine: any", "engines: []", "engines: [any]", "engine:"):
+            self.assertEqual(B.role_engines(f"---\ntitle: x\n{t}\n---\n"), [], t)
+        self.assertEqual(B.role_engines("---\nengine: hermes\nengines: [hermes, codex]\n---\n"), ["hermes", "codex"])
+        for t in ((REPO / "agents/twin.md").read_text(), (REPO / "agents/assistant.md").read_text()):
+            self.assertEqual(B.role_engines(t), [], "templates claim no engine")
+            self.assertEqual(B.fm_list(t, "engines"), [])
+        ag = self.base / "agents"
+        for n, t in (("twin.md", ROLE_TWIN), ("engineer.md", ROLE_ENGINEER), ("old.md", ROLE_LEGACY)):
+            (ag / n).write_text(t)
+        self.assertEqual(B.role_for(self.base, "codex").name, "engineer.md")
+        self.assertEqual(B.role_for(self.base, "gemini").name, "old.md")
+        self.assertIsNone(B.role_for(self.base, "opencode"), "no match: no role")
+        (ag / "helper.md").write_text(ROLE_ENGINEER.replace("engineer", "helper"))
+        self.assertIsNone(B.role_for(self.base, "codex"), "two matches: never guess")
+
+    def test_lint_validates_engines_and_warns_on_shared_engine(self):
+        ag = self.base / "agents"
+        (ag / "twin.md").write_text(ROLE_TWIN)
+        (ag / "engineer.md").write_text(ROLE_ENGINEER)
+        r = self.hb("lint")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("claimed by", r.stderr + r.stdout)
+        (ag / "reviewer.md").write_text(ROLE_ENGINEER.replace("engineer", "reviewer"))
+        r = self.hb("lint")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stderr + r.stdout
+        self.assertIn("engine 'claude-code' is claimed by 2 roles", out)
+        self.assertIn("engine 'codex' is claimed by 2 roles", out)
+        (ag / "bad.md").write_text("---\ntitle: Bad\nrole: bad\nengines: [Claude Code]\nupdated: 2026-11-11\n"
+                                   "scope: private\n---\n")
+        r = self.hb("lint")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("engine 'Claude Code' is not a tool id", r.stderr + r.stdout)
+
+
+class WatchMemoryCapTests(FileBase):
+    def test_watch_once_with_50_items_stays_under_the_unit_cap(self):
+        cap = int(re.search(r"MemoryMax=(\d+)M", next(iter(B.watch_unit_texts(self.base).values()))).group(1))
+        self.assertGreaterEqual(cap, 160)
+        for i in range(50):
+            collected_item(self.base, "codex", f"~/.codex/memories/n{i}.md",
+                           f"Project Alpha note {i}: the pricing page moved to plan {i} with {i * 3} seats.\n")
+        probe = ("import resource, subprocess, sys\n"
+                 "r = subprocess.run(sys.argv[1:], capture_output=True, text=True)\n"
+                 "print(r.returncode, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n"
+                 "sys.stderr.write(r.stdout[-400:] + r.stderr[-800:])\n")
+        r = run("-c", probe, sys.executable, "-S", self.base / "tools/brain.py", "watch", "--once",
+                "--base", self.base, "--no-commit", "--no-connect", env={"HOME": str(self.home), "PATH": TEST_PATH})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rc, kb = map(int, r.stdout.split())
+        self.assertEqual(rc, 0, r.stderr)
+        self.assertGreater(len(self.collected_lines("projects/project-alpha.md")) +
+                           (self.page("unsorted.md").count("codex") if (self.base / "wiki/unsorted.md").exists() else 0),
+                           0, "the run filed the items")
+        print(f"\nwatch --once, 50 items: peak RSS {kb // 1024} MB (cap {cap}M)", file=sys.stderr)
+        self.assertLess(kb * 1024, cap * 1024 * 1024 // 2, f"peak {kb} KB must leave 2x headroom under {cap}M")
