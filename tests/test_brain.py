@@ -963,7 +963,7 @@ class ConnectTests(HomeBase):
         self.assertIn(f"Path: {b}\n", cl)
         self.assertIn("## Saving knowledge", cl)
         self.assertIn(f"`{b}/hot.md` first", cl)
-        self.assertIn(f"`cd {b} && python3 tools/brain.py index`", cl)     # a plain path is never quoted
+        self.assertIn(f"`python3 {b}/tools/brain.py index`", cl)     # a plain path is never quoted
         cx = (self.home / ".codex/AGENTS.md").read_text()
         self.assertNotIn("start v1", cx)
         self.assertTrue(cx.startswith("codex rules first\n\n<!-- base-folder:start v2 -->"))
@@ -1654,6 +1654,187 @@ class UninstallKeepsDataTests(HomeBase):
         self.assertEqual(git(b, "rev-list", "--count", "HEAD").strip(), "3")
 
 
+class AccessTests(HomeBase):
+    """connect opens each tool's own folder wall for the base (one entry, merged by key, recorded); disconnect
+    removes only that entry (exact old bytes when nothing else changed)."""
+
+    def access(self):
+        return json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"].get("access", {})
+
+    def test_claude_additional_directories_merged_idempotent_and_given_back(self):
+        mine = ('{"model": "x", "permissions": {"allow": ["Read(~/notes/**)"], "additionalDirectories": '
+                '["/srv/other"]}, "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}')
+        p = self.write(self.home, ".claude/settings.json", mine)
+        r = self.ok("connect")
+        self.assertIn("permissions.additionalDirectories", r.stdout)
+        s = json.loads(p.read_text())
+        self.assertEqual(s["permissions"], {"allow": ["Read(~/notes/**)", f"Bash(python3 {self.base}/tools/brain.py *)"],
+                                            "additionalDirectories": ["/srv/other", str(self.base)]})
+        self.assertEqual(s["model"], "x")
+        self.assertEqual(s["hooks"]["SessionEnd"][0], {"hooks": [{"type": "command", "command": "echo bye"}]})
+        h = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"]["hooks"]
+        self.assertEqual((h["dir"], h["dir_added"], h["had_permissions_key"], h["had_dirs_key"]),
+                         (str(self.base), True, True, True))
+        snap = tree(self.home)
+        self.ok("connect")
+        self.assertEqual(snap, tree(self.home))
+        self.assertEqual(json.loads(p.read_text())["permissions"]["additionalDirectories"].count(str(self.base)), 1)
+        self.ok("disconnect")
+        self.assertEqual(p.read_text(), mine)                 # untouched since: the exact old bytes
+        # changed after connect: only our entry goes, the empty keys we created go too, the rest stays
+        p.write_text('{"model": "x"}')
+        self.ok("connect")
+        s = json.loads(p.read_text()); s["theme"] = "dark"; p.write_text(json.dumps(s))
+        self.ok("disconnect")
+        self.assertEqual(json.loads(p.read_text()), {"model": "x", "theme": "dark"})
+
+    def test_claude_entry_already_there_is_not_duplicated_nor_removed(self):
+        mine = json.dumps({"permissions": {"additionalDirectories": [str(self.base) + "/"]}})
+        p = self.write(self.home, ".claude/settings.json", mine)
+        self.ok("connect")
+        self.assertEqual(json.loads(p.read_text())["permissions"]["additionalDirectories"], [str(self.base) + "/"])
+        s = json.loads(p.read_text()); s["theme"] = "dark"; p.write_text(json.dumps(s))
+        self.ok("disconnect")
+        self.assertEqual(json.loads(p.read_text()), {"permissions": {"additionalDirectories": [str(self.base) + "/"]},
+                                                     "theme": "dark"})
+
+    def test_codex_writable_roots_text_merge_every_other_byte_kept(self):
+        import tomllib
+        b = json.dumps(str(self.base))
+        cases = {
+            "no table": '# my codex config\nmodel = "m"  # keep this comment\n\n[tui]\nx = true\n',
+            "table, no key": 'model = "m"\n[sandbox_workspace_write] # mine\nnetwork_access = true\n\n[tui]\nx = 1',
+            "multi-line list": ('[sandbox_workspace_write]\nwritable_roots = [\n  "/srv/a", # a\n  "/srv/b",\n]\n'
+                                '[tui]\nwritable_roots = "not this one"\n'),
+            "empty list": "[sandbox_workspace_write]\nwritable_roots = []\n",
+        }
+        for name, mine in cases.items():
+            with self.subTest(name):
+                p = self.write(self.home, ".codex/config.toml", mine)
+                r = self.ok("connect")
+                self.assertIn("sandbox_workspace_write.writable_roots", r.stdout)
+                new = p.read_text()
+                ins = self.access()[".codex/config.toml"]["undo"]["insert"]
+                self.assertEqual(new.replace(ins, "", 1), mine, "only our text was added")
+                d, old = tomllib.loads(new), tomllib.loads(mine)
+                self.assertEqual(d["sandbox_workspace_write"]["writable_roots"][0], str(self.base))
+                old.setdefault("sandbox_workspace_write", {}).setdefault("writable_roots", []).insert(0, str(self.base))
+                self.assertEqual(d, old, "the same config plus the base, nothing else")
+                snap = tree(self.home)
+                self.ok("connect")
+                self.assertEqual(snap, tree(self.home))
+                self.ok("disconnect")
+                self.assertEqual(p.read_text(), mine)
+                # changed after connect: only our insert goes
+                self.ok("connect")
+                p.write_text(p.read_text() + "\n[extra]\ny = 2\n")
+                self.ok("disconnect")
+                self.assertEqual(p.read_text(), mine + "\n[extra]\ny = 2\n")
+        # no config.toml: created, then removed
+        (self.home / ".codex/config.toml").unlink()
+        self.ok("connect")
+        self.assertEqual((self.home / ".codex/config.toml").read_text(),
+                         f"[sandbox_workspace_write]\nwritable_roots = [{b}]\n")
+        self.ok("disconnect")
+        self.assertFalse((self.home / ".codex/config.toml").exists())
+
+    def test_codex_profile_or_bad_toml_left_alone_with_a_note(self):
+        for mine, word in (('default_permissions = "mine"\n', "permission profile"), ("x = [\n", "not valid TOML")):
+            p = self.write(self.home, ".codex/config.toml", mine)
+            r = self.ok("connect")
+            self.assertIn(word, r.stdout)
+            self.assertEqual(p.read_text(), mine)
+            self.ok("disconnect")
+            self.assertEqual(p.read_text(), mine)
+
+    def test_gemini_and_qwen_include_directories(self):
+        g = self.write(self.home, ".gemini/settings.json", '{"context": {"fileName": ["AGENTS.md"]}, "theme": "x"}')
+        (self.home / ".qwen").mkdir()
+        self.ok("connect")
+        self.assertEqual(json.loads(g.read_text()), {"context": {"fileName": ["AGENTS.md"],
+                                                                 "includeDirectories": [str(self.base)]},
+                                                     "theme": "x"})
+        q = self.home / ".qwen/settings.json"
+        self.assertEqual(json.loads(q.read_text()), {"context": {"includeDirectories": [str(self.base)]}})
+        snap = tree(self.home)
+        self.ok("connect")
+        self.assertEqual(snap, tree(self.home))
+        s = json.loads(q.read_text()); s["model"] = {"name": "any"}; q.write_text(json.dumps(s))
+        self.ok("disconnect")
+        self.assertEqual(g.read_text(), '{"context": {"fileName": ["AGENTS.md"]}, "theme": "x"}')
+        self.assertEqual(json.loads(q.read_text()), {"model": {"name": "any"}})   # our empty keys gone too
+        # a settings file with comments (not plain JSON) is left alone, with a note
+        g.write_text('// mine\n{"theme": "x"}\n')
+        r = self.ok("connect")
+        self.assertIn("add the base by hand", r.stdout)
+        self.assertEqual(g.read_text(), '// mine\n{"theme": "x"}\n')
+
+    def test_opencode_external_directory_only_where_it_has_rules(self):
+        p = self.home / ".config/opencode/opencode.json"
+        rule = {"action": "external_directory", "resource": f"{self.base}/**", "effect": "allow"}
+        v2 = {"permissions": [{"action": "external_directory", "resource": "*", "effect": "ask"}]}
+        v1 = {"permission": {"external_directory": {"~/x/**": "allow", "*": "ask"}}}
+        for mine, want in ((v2, {"permissions": v2["permissions"] + [rule]}),
+                           (v1, {"permission": {"external_directory": {"~/x/**": "allow", "*": "ask",
+                                                                       f"{self.base}/**": "allow"}}}),
+                           ({"theme": "x"}, {"theme": "x"})):              # no rules: its default lets it in
+            text = json.dumps(mine)
+            self.write(self.home, ".config/opencode/opencode.json", text)
+            self.ok("connect")
+            self.assertEqual(json.loads(p.read_text()), want)
+            self.ok("disconnect")
+            self.assertEqual(p.read_text(), text)
+        p.unlink()
+        self.ok("connect")
+        self.assertFalse(p.exists(), "no opencode.json: none is created")
+        self.ok("disconnect")
+        self.write(self.home, ".config/opencode/opencode.json", '{"permission": {"external_directory": "ask"}}')
+        r = self.ok("connect")
+        self.assertIn("by hand", r.stdout)
+
+    def test_pointer_block_tells_any_tool_how_to_get_access(self):
+        self.write(self.home, ".acme-ai/AGENTS.md", "# acme rules\n")
+        self.write(self.home, ".acme-ai/memories/x.md", "acme memory\n")
+        self.ok("connect")
+        r = self.ok("watch", "--base", self.base, "--once", "--no-commit")
+        t = (self.home / ".acme-ai/AGENTS.md").read_text()
+        self.assertIn(f"Path: {self.base}\n", t)
+        self.assertIn(f"ask the user to allow `{self.base}` (read and\n  write)", t)
+        for s in ("permissions.additionalDirectories", "writable_roots", "context.includeDirectories",
+                  "external_directory"):
+            self.assertIn(s, t)
+        self.assertIn("Hermes: no folder wall", self.ok("connect", "--print").stdout)
+
+    def test_every_known_tool_is_found_readable_writable_and_collected(self):
+        """The README matrix, one row per known tool: (a) rules block, (b/c) its own access setting, (d) memory."""
+        self.make_stores()
+        for d in (".qwen", ".config/opencode", ".codeium/windsurf", ".kiro", ".cursor"):
+            (self.home / d).mkdir(parents=True, exist_ok=True)
+        self.write(self.home, ".hermes/SOUL.md", "I am the agent.\n")
+        self.write(self.home, ".openclaw/workspace/AGENTS.md", "# openclaw\n")
+        self.write(self.home, ".qwen/QWEN.md", "## Qwen Added Memories\n- qwen memory line\n")
+        home0 = tree(self.home)
+        self.ok("connect")
+        for f in (".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md", ".qwen/QWEN.md",
+                  ".config/opencode/AGENTS.md", ".codeium/windsurf/memories/global_rules.md",
+                  ".kiro/steering/skeleton-base.md", ".openclaw/workspace/AGENTS.md", ".hermes/SOUL.md"):
+            self.assertIn(f"Path: {self.base}\n", (self.home / f).read_text(), f)              # (a)
+        b = str(self.base)
+        self.assertIn(b, json.loads((self.home / ".claude/settings.json").read_text())
+                      ["permissions"]["additionalDirectories"])                                # (b, c)
+        self.assertIn(f"writable_roots = [{json.dumps(b)}]", (self.home / ".codex/config.toml").read_text())
+        for f in (".gemini/settings.json", ".qwen/settings.json"):
+            self.assertEqual(json.loads((self.home / f).read_text())["context"]["includeDirectories"], [b])
+        self.ok("collect")                                                                      # (d)
+        got = "".join(p.read_text() for p in (self.base / "raw/inbox/collected").rglob("*.md"))
+        for s in ("Project A ships on Friday", "codex raw memory one", "codex markdown memory",
+                  "likes short answers", "qwen memory line", "hermes memory line", "Client Example Co pays",
+                  "openclaw long-term memory"):
+            self.assertIn(s, got)
+        self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home))
+
+
 class NeverTests(HomeBase):
     def test_never_list_keeps_files_out_of_connect(self):
         self.write(self.home, ".hermes/SOUL.md", "You are calm.\n")
@@ -1936,6 +2117,31 @@ class FrugalGlobalTests(Base):
         self.assertEqual(pages, tree(self.base / "wiki/me"))
         self.assertEqual(len(list(self.base.glob("board/*review-frugal*"))), 1)
 
+    def test_claude_access_entry_next_to_frugal_hooks_in_one_settings_file(self):
+        """Frugal-Bridge's hooks and the base's additionalDirectories entry share ~/.claude/settings.json: each
+        kit's entries survive the other's runs, and the base's disconnect removes only its own."""
+        self.frugal_install()
+        p = self.home / ".claude/settings.json"
+        frugal0 = json.loads(p.read_text())
+        self.sb("connect")
+        s = json.loads(p.read_text())
+        self.assertEqual(s["permissions"]["additionalDirectories"], [str(self.base)])
+        for ev, entries in frugal0.get("hooks", {}).items():
+            for e in entries:
+                self.assertIn(e, s["hooks"][ev], f"Frugal-Bridge's {ev} hook lost")
+        self.frugal_install()                       # Frugal re-runs: our entry stays
+        self.assertEqual(json.loads(p.read_text())["permissions"]["additionalDirectories"], [str(self.base)])
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        self.sb("connect")
+        snap = self.snap()
+        self.sb("connect")
+        self.assertEqual(snap, self.snap())
+        self.sb("disconnect")
+        after = json.loads(p.read_text())
+        self.assertNotIn("permissions", after)
+        self.assertEqual(after.get("hooks"), frugal0.get("hooks"), "Frugal-Bridge's hooks exactly as it wrote them")
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+
     def test_watch_autoconnect_puts_base_block_before_frugal_block(self):
         self.sb("connect")
         self.frugal_install()
@@ -2167,10 +2373,10 @@ class SpacePathTests(Base):
         sys.path.insert(0, str(REPO / "tools"))
         import brain
         self.assertEqual(brain.parse_path_line(re.search(r"^Path: (.*)$", cl, re.M).group(1)), b)
-        cd = re.search(r"`(cd .*? && python3 tools/brain.py index)`", cl).group(1)
-        r = subprocess.run(["sh", "-c", cd.replace("python3 tools/brain.py index", "pwd")], capture_output=True,
-                           text=True)
-        self.assertEqual(r.stdout.strip(), b, "the cd command in the block works as written")
+        cmd = re.search(r"`(python3 .*?/tools/brain.py' index)`", cl).group(1)
+        r = subprocess.run(["sh", "-c", cmd.replace("python3 ", "ls ", 1).removesuffix(" index")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), b + "/tools/brain.py", "the index command in the block works as written")
         # Claude Code hooks: the commands run as written by a shell
         s = json.loads((self.home / ".claude/settings.json").read_text())
         collect = s["hooks"]["SessionEnd"][0]["hooks"][0]["command"]

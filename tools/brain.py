@@ -76,7 +76,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.3.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.3.5"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -1942,8 +1942,25 @@ def pointer_body(base):
 - Durable knowledge (facts, decisions, people, clients, project status) is saved in the base at `{b}`:
   client -> `wiki/clients/SLUG.md` (from `templates/client.md`); decision -> `wiki/decisions/YYYY-MM-DD-SLUG.md`;
   person -> `wiki/people/SLUG.md`; project status -> `wiki/projects/SLUG.md`, plus `hot.md` if it matters now.
-- Then run `cd {q} && python3 tools/brain.py index` and append one line to `{b}/progress/agents.log`.
-- Keep a short copy in your own memory too; both should have it. Never only in your own memory."""
+- Then run `{index_cmd(base)}` and append one line to `{b}/progress/agents.log`.
+- Keep a short copy in your own memory too; both should have it. Never only in your own memory.
+
+## Access
+- This folder is outside your project; read and write it with your normal file tools, from any folder.
+- If your tool blocks a path in it, do not save the knowledge elsewhere: ask the user to allow `{b}` (read and
+  write) in your tool's settings. `connect` already added it where a tool has a user setting for this:
+  {access_text(base)}."""
+
+
+def index_cmd(base):
+    """One plain command (no cd, no &&): a tool's allow rule for it (claude_allow) matches it from any folder."""
+    import shlex
+    return f"python3 {shlex.quote(str(base) + '/tools/brain.py')} index"
+
+
+def claude_allow(base):
+    import shlex
+    return f"Bash(python3 {shlex.quote(str(base) + '/tools/brain.py')} *)"
 
 
 def pointer_block(base):
@@ -2179,6 +2196,141 @@ def touch_frontmatter(text, src):
     return head + rest
 
 
+# ---------------------------------------------------------------- folder access: each tool's own user-level setting
+# Tools that keep their agent inside the folder they started in get the base added to their own allow list, so
+# the pointer block's paths can be read AND written from any folder. One entry per tool, merged by key, recorded in
+# the connect record (kits.base-folder.connect.access), removed by disconnect (exact old bytes when unchanged).
+# Sources: Claude Code permissions.additionalDirectories (code.claude.com/docs/en/permissions); Codex
+# sandbox_workspace_write.writable_roots (developers.openai.com/codex/config-reference); Gemini CLI
+# context.includeDirectories (github.com/google-gemini/gemini-cli docs/reference/configuration.md); Qwen Code the same
+# key (github.com/QwenLM/qwen-code docs/users/configuration/settings.md); opencode external_directory
+# (opencode.ai/docs/permissions, opencode.ai/v1/docs/permissions). Claude Code's entry lives in merge_hooks().
+ACCESS = {
+    ".codex": ("toml", ".codex/config.toml", "Codex", "sandbox_workspace_write.writable_roots"),
+    ".gemini": ("json", ".gemini/settings.json", "Gemini CLI", "context.includeDirectories"),
+    ".qwen": ("json", ".qwen/settings.json", "Qwen Code", "context.includeDirectories"),
+    ".config/opencode": ("opencode", ".config/opencode/opencode.json", "opencode", "permission external_directory"),
+}
+# no folder wall to open (or no user-level setting for it): said in the README matrix and `connect --print`
+ACCESS_NOTES = {
+    ".hermes": "Hermes: no folder wall (its file tools reach any path the user can)",
+    ".openclaw": "OpenClaw: no folder wall by default (sandboxing is opt-in in its own config)",
+    ".codeium/windsurf": "Windsurf: no user-level allow list in a file; the agent asks you for paths outside the "
+                         "workspace (or add the base folder to the workspace)",
+    ".kiro": "Kiro: no user-level allow list in a file; add the base folder to the workspace when it asks",
+    ".cursor": "Cursor: no user-level allow list in a file; add the base folder to the workspace when it asks",
+}
+TOML_TABLE = re.compile(r"(?m)^[ \t]*\[[ \t]*sandbox_workspace_write[ \t]*\][ \t]*(?:#.*)?$")
+TOML_ANY_TABLE = re.compile(r"(?m)^[ \t]*\[")
+TOML_ROOTS = re.compile(r"(?m)^[ \t]*writable_roots[ \t]*=[ \t]*\[")
+
+
+def access_text(base):
+    """The exact setting per tool (for the pointer block and `connect --print`)."""
+    b = json.dumps(str(base))
+    return (f"Claude Code `permissions.additionalDirectories: [{b}]` in `~/.claude/settings.json`; "
+            f"Codex `[sandbox_workspace_write] writable_roots = [{b}]` in `~/.codex/config.toml`; "
+            f"Gemini CLI / Qwen Code `context.includeDirectories: [{b}]` in `~/.gemini/settings.json` / "
+            f"`~/.qwen/settings.json`; opencode `permission.external_directory: {{\"{base}/**\": \"allow\"}}` in "
+            f"`~/.config/opencode/opencode.json`")
+
+
+def toml_add_root(text, value):
+    """(new_text, undo, note): `value` added to [sandbox_workspace_write] writable_roots by a text insert; every
+    other byte stays. new_text None: nothing to do (note says why when it is a problem)."""
+    import tomllib
+    try:
+        old = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None, None, "is not valid TOML: add the base by hand"
+    if old.get("default_permissions"):
+        return None, None, (f"uses the permission profile {old['default_permissions']!r} (writable_roots is then "
+                            f"ignored): add {json.dumps(value)} = \"write\" to its [permissions.NAME.filesystem]")
+    swr = old.get("sandbox_workspace_write", {})
+    roots = swr.get("writable_roots", []) if isinstance(swr, dict) else None
+    if not isinstance(roots, list):
+        return None, None, "has a sandbox_workspace_write we cannot read: add the base by hand"
+    if any(isinstance(x, str) and same_dir(x, value) for x in roots):
+        return None, None, None
+    lit, head = json.dumps(value), TOML_TABLE.search(text)
+    if "writable_roots" in swr:
+        nxt = TOML_ANY_TABLE.search(text, head.end()) if head else None
+        m = TOML_ROOTS.search(text, head.end(), nxt.start() if nxt else len(text)) if head else None
+        if not m:
+            return None, None, "sets writable_roots in a form we do not edit: add the base by hand"
+        ins = lit + (", " if roots else "")
+        at = m.end()
+    elif head:
+        ins, at = f"\nwritable_roots = [{lit}]", head.end()
+    elif "sandbox_workspace_write" in old:
+        return None, None, "sets sandbox_workspace_write with dotted keys: add writable_roots by hand"
+    else:
+        at = len(text)
+        ins = ("" if not text else "\n" if text.endswith("\n") else "\n\n") + \
+            f"[sandbox_workspace_write]\nwritable_roots = [{lit}]\n"
+    new = text[:at] + ins + text[at:]
+    want = json.loads(json.dumps(old))
+    want.setdefault("sandbox_workspace_write", {}).setdefault("writable_roots", []).insert(
+        0 if "writable_roots" in swr else len(roots), value)
+    try:
+        if tomllib.loads(new) != want:
+            raise ValueError
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None, None, "could not be merged safely: add the base by hand"
+    return new, {"insert": ins}, None
+
+
+def toml_remove_root(text, undo, value):
+    import tomllib
+    ins = undo.get("insert", "")
+    i = text.find(ins) if ins else -1
+    if i < 0:
+        return None
+    new = text[:i] + text[i + len(ins):]
+    try:
+        roots = tomllib.loads(new).get("sandbox_workspace_write", {}).get("writable_roots", [])
+    except tomllib.TOMLDecodeError:
+        return None
+    return new if not any(isinstance(x, str) and same_dir(x, value) for x in roots) else None
+
+
+def json_add(data, path, value, same):
+    """Append value to the list at path (dicts created as needed). (made, note): made = depths created, None when
+    the value is already there."""
+    cur, made = data, []
+    for i, k in enumerate(path):
+        last = i == len(path) - 1
+        if k not in cur:
+            cur[k] = [] if last else {}
+            made.append(i)
+        cur = cur[k]
+        if not isinstance(cur, list if last else dict):
+            return None, f"{'.'.join(path[:i + 1])} is not a {'list' if last else 'object'}: add the base by hand"
+    if any(same(x, value) for x in cur):
+        return None, None
+    cur.append(value)
+    return made, None
+
+
+def json_remove(data, path, value, made, same):
+    chain, cur = [data], data
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return False
+        cur = cur[k]; chain.append(cur)
+    if not isinstance(cur, list):
+        return False
+    cur[:] = [x for x in cur if not same(x, value)]
+    for i in reversed(range(len(path))):        # drop what we created, only when it is empty again
+        if i in made and not chain[i + 1]:
+            chain[i].pop(path[i])
+    return True
+
+
+def same_path(x, v):
+    return isinstance(x, str) and same_dir(x, v)
+
+
 class Connector:
     """Writes (and removes) the per-user pointer blocks, Claude Code hooks, timer and watch service for one base."""
 
@@ -2273,7 +2425,7 @@ class Connector:
         rec = {"home": str(self.home), "connected": prev.get("connected") or today(),
                "blocks": dict(prev.get("blocks", {})), "hooks": dict(prev.get("hooks", {})),
                "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {})),
-               "pointer": dict(prev.get("pointer", {}))}
+               "pointer": dict(prev.get("pointer", {})), "access": dict(prev.get("access", {}))}
 
         never = [x.removeprefix("~/") for x in watch_cfg(self.base).get("never", []) if isinstance(x, str)]
         skip = lambda r: any(fnmatch.fnmatchcase(r, g) or r.startswith(g.rstrip("/") + "/") for g in never)
@@ -2286,6 +2438,8 @@ class Connector:
                 self.tools[key] = {"state": "connected", "files": done}
             else:
                 self.tools[key] = {"state": "needs-user", "why": NEEDS_USER.get(key, "no rules file found")}
+            if key in ACCESS and not skip(ACCESS[key][1]):
+                self.grant(rec, key)
         if unknown:                                       # zero-touch: a dir that looks like an AI tool
             for key, d in tool_dirs(self.home, self.base):
                 if skip(key):
@@ -2327,6 +2481,103 @@ class Connector:
         self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [])
         return self.log
 
+    def grant(self, rec, key):
+        """Open the tool's own folder wall for the base (ACCESS); recorded in rec["access"][file]."""
+        kind, r, name, setting = ACCESS[key]
+        p, b = self.home / r, str(self.base)
+        a = rec["access"].get(r)
+        text = read(p)
+        if a and a.get("sha") != sha(text or ""):
+            a["exact"] = False            # changed since: disconnect then removes only our entry
+        undo, note = None, None
+        if kind == "toml":
+            new, undo, note = toml_add_root(text or "", b)
+        else:
+            try:
+                data = json.loads(text) if text and text.strip() else {}
+            except json.JSONDecodeError:
+                data, note = None, "is not valid JSON (comments?): add the base by hand"
+            if data is not None and not isinstance(data, dict):
+                data, note = None, "is not a JSON object: add the base by hand"
+            new = None
+            if data is not None and kind == "json":
+                made, note = json_add(data, ("context", "includeDirectories"), b, same_path)
+                if made is not None:
+                    undo = {"path": ["context", "includeDirectories"], "value": b, "made": made}
+            elif data is not None:                    # opencode: only where it has rules; its default lets it in
+                if text is None:
+                    return
+                rule = {"action": "external_directory", "resource": f"{b}/**", "effect": "allow"}
+                if isinstance(data.get("permissions"), list):                     # V2: ordered rules, last wins
+                    if rule not in data["permissions"]:
+                        data["permissions"].append(rule); undo = {"v2": rule}
+                elif isinstance(data.get("permission"), dict) and "external_directory" in data["permission"]:
+                    ed = data["permission"]["external_directory"]
+                    if not isinstance(ed, dict):
+                        note = (f"permission.external_directory is {ed!r}: make it an object with "
+                                f"\"{b}/**\": \"allow\" by hand")
+                    elif ed.get(f"{b}/**") != "allow":
+                        undo = {"v1": f"{b}/**", "had": ed.get(f"{b}/**")}
+                        ed[f"{b}/**"] = "allow"
+                else:
+                    return                                                         # no rules: nothing walls it
+            if undo:
+                new = dump_json(data)
+        if note:
+            self.log.append(f"{name}: ~/{r} {note}")
+            return
+        if new is None:
+            if a:
+                a["sha"] = sha(read(p) or "")
+            return                                    # already there (ours from before, or yours)
+        if not a:
+            a = {"tool": key, "kind": kind, "created": text is None, "previous": self.backup(r),
+                 "dirs": self.missing_dirs(r), "exact": True}
+        a["undo"] = undo
+        self.put(r, new)
+        a["sha"] = sha(read(p))
+        rec["access"][r] = a
+        self.log.append(f"{name}: the base is readable and writable from any folder ({setting})")
+
+    def ungrant(self, r, a):
+        p, b = self.home / r, str(self.base)
+        cur = read(p)
+        if cur is None:
+            return
+        if a.get("exact") and sha(cur) == a.get("sha"):     # untouched since connect: the exact old bytes
+            if a.get("previous"):
+                shutil.copy2(self.base / a["previous"], p); self.log.append(f"restored ~/{r}")
+            else:
+                p.unlink(); self.log.append(f"removed ~/{r}")
+            return
+        u, new = a.get("undo") or {}, None
+        if a["kind"] == "toml":
+            new = toml_remove_root(cur, u, b)
+        else:
+            try:
+                data = json.loads(cur)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                if "path" in u and json_remove(data, u["path"], u["value"], u.get("made", []), same_path):
+                    new = dump_json(data)
+                elif "v2" in u and isinstance(data.get("permissions"), list) and u["v2"] in data["permissions"]:
+                    data["permissions"].remove(u["v2"]); new = dump_json(data)
+                elif "v1" in u:
+                    ed = (data.get("permission") or {}).get("external_directory")
+                    if isinstance(ed, dict) and u["v1"] in ed:
+                        if u.get("had") is None:
+                            ed.pop(u["v1"])
+                        else:
+                            ed[u["v1"]] = u["had"]
+                        new = dump_json(data)
+        if new is None:
+            self.log.append(f"~/{r}: remove {b} from it by hand (it changed in a way we do not edit)")
+        elif a.get("created") and new.strip() in ("", "{}"):
+            p.unlink(); self.log.append(f"removed ~/{r}")
+        elif new != cur:
+            write(p, new); self.log.append(f"removed the base folder entry from ~/{r}")
+
     def units(self, store, texts):
         for r, text in texts.items():
             t = store.get(r) or {}
@@ -2363,10 +2614,66 @@ class Connector:
             entries.append(entry)
             if ev not in h["events"]:
                 h["events"].append(ev)
+        self.merge_access(data, h)
         new = dump_json(data)
         if read(p) != new:
             self.put(r, new)
         h["sha"] = sha(read(p))
+
+    def merge_access(self, data, h):
+        """Claude Code reads only its working folder and permissions.additionalDirectories: the pointer block sends
+        it to the base from any folder, so the base goes in that list (one entry, recorded in h, merged by key)."""
+        perms = data.get("permissions", {})
+        if not isinstance(perms, dict):
+            self.log.append("~/.claude/settings.json: \"permissions\" is not an object; add the base to "
+                            "permissions.additionalDirectories by hand")
+            return
+        lst = perms.get("additionalDirectories", [])
+        if not isinstance(lst, list):
+            self.log.append("~/.claude/settings.json: permissions.additionalDirectories is not a list; add "
+                            f"{self.base} by hand")
+            return
+        allow = perms.get("allow", [])
+        if not isinstance(allow, list):
+            allow = None
+        rule = claude_allow(self.base)
+        need_dir = not any(isinstance(x, str) and same_dir(x, self.base) for x in lst)
+        need_rule = allow is not None and rule not in allow
+        if not need_dir and not need_rule:
+            return                                  # already there (ours from before, or yours / another kit's)
+        h.setdefault("had_permissions_key", "permissions" in data)
+        if need_dir:
+            if not h.get("dir_added"):
+                h.update({"dir": str(self.base), "dir_added": True, "had_dirs_key": "additionalDirectories" in perms})
+            lst.append(str(self.base))
+            perms["additionalDirectories"] = lst
+            self.log.append("Claude Code: the base is readable and writable from any folder "
+                            "(permissions.additionalDirectories)")
+        if need_rule:
+            if not h.get("allow_added"):
+                h.update({"allow_added": rule, "had_allow_key": "allow" in perms})
+            allow.append(rule)
+            perms["allow"] = allow
+            self.log.append(f"Claude Code: may run the base's brain.py from any folder (permissions.allow {rule})")
+        data["permissions"] = perms
+
+    @staticmethod
+    def unmerge_access(data, h):
+        perms = data.get("permissions")
+        if not isinstance(perms, dict) or not (h.get("dir_added") or h.get("allow_added")):
+            return
+        lst = perms.get("additionalDirectories")
+        if h.get("dir_added") and isinstance(lst, list):
+            lst[:] = [x for x in lst if not (isinstance(x, str) and same_dir(x, h["dir"]))]
+            if not lst and not h.get("had_dirs_key"):
+                perms.pop("additionalDirectories")
+        allow = perms.get("allow")
+        if h.get("allow_added") and isinstance(allow, list):
+            allow[:] = [x for x in allow if x != h["allow_added"]]
+            if not allow and not h.get("had_allow_key"):
+                perms.pop("allow")
+        if not perms and not h.get("had_permissions_key"):
+            data.pop("permissions")
 
     # -- Frugal-Bridge at user level: import its USER.md, switch it to the base; give it back on disconnect
     def user_slot(self, k=None):
@@ -2643,6 +2950,9 @@ class Connector:
         h = rec.get("hooks")
         if h:
             self.unmerge_hooks(h)
+        for r, a in rec.get("access", {}).items():
+            self.ungrant(r, a)
+            dirs |= set(a.get("dirs", []))
         # everything Frugal-Bridge could find this base from goes first (blocks, units, pointer file), then it is
         # re-run (frugal_give_back below), so it really goes back to its own user file
         for r, t in (list(rec.get("timer", {}).items()) + list(rec.get("watch", {}).items())
@@ -2697,10 +3007,11 @@ class Connector:
                     hooks.pop(ev, None)
             if not hooks and not h.get("had_hooks_key"):
                 data.pop("hooks")
+        self.unmerge_access(data, h)
         if not data and h.get("created"):
             p.unlink(); self.log.append(f"removed ~/{r}")
         else:
-            write(p, dump_json(data)); self.log.append(f"removed our hooks from ~/{r}")
+            write(p, dump_json(data)); self.log.append(f"removed our hooks and base folder entry from ~/{r}")
 
 
 # ---------------------------------------------------------------- watch (instant collect, zero-touch connect)
@@ -3596,7 +3907,9 @@ def main(argv):
         if cmd == "watch":
             return watch_main(base, opts)
         if cmd == "connect" and opts.get("--print"):
-            print(pointer_block(base)); return 0
+            print(pointer_block(base))
+            print("\nTools without such a setting:\n" + "\n".join(f"- {v}" for v in ACCESS_NOTES.values()))
+            return 0
         if cmd == "collect":
             since = None
             if "--since" in opts:

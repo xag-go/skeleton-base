@@ -2,6 +2,26 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.5 - 2026-11-11
+- Any tool can read and write the base from any folder. `connect` (and the watcher's auto-connect) adds the base
+  to each tool's own user-level allow list: Claude Code `permissions.additionalDirectories` (plus a
+  `permissions.allow` rule for `python3 BASE/tools/brain.py *`, so `index` runs from any folder), Codex
+  `[sandbox_workspace_write] writable_roots` (a text insert in `~/.codex/config.toml`, checked by parsing: every
+  other byte kept; a permission profile or a file it cannot merge safely gets a note instead), Gemini CLI and Qwen
+  Code `context.includeDirectories`, opencode an `external_directory` allow rule where its `opencode.json` has
+  rules. Merged by key, idempotent, recorded in `kits.base-folder.connect` (`hooks` for Claude Code, `access` for
+  the others); an entry that was already there is never duplicated nor removed. `disconnect` removes only our
+  entry (and keys we created that are empty again) and gives the exact old bytes back when the file did not change.
+  Before, Claude Code started in another folder was denied reading the base.
+- The pointer block has an Access section: the base is outside your project; if your tool blocks it, ask the user
+  to allow it (the exact setting of each tool). The index command in it is one plain command
+  (`python3 BASE/tools/brain.py index`) so the allow rule matches it. `connect --print` also lists the tools that
+  have no such wall or setting.
+- README: a tool x (finds, reads, writes, collected) matrix with evidence, and why the base works with any
+  provider (no step needs a model).
+- Tests: 9 new (107): each tool's setting (merge, idempotent, give back, changed-after-connect, bad files left
+  alone), coexistence with Frugal-Bridge hooks in one `settings.json`, the block for unknown tools, the matrix.
+
 ## v1.3.4 - 2026-11-11
 - Uninstall keeps your data (owner rule: removing Skeleton Base never loses anything of the user's).
   - `uninstall` first writes a full backup of the base (`.git` and dotfiles included) to

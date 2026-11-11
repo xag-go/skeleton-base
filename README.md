@@ -170,6 +170,9 @@ For the current user, `connect`:
 
 - merges two Claude Code hooks into `~/.claude/settings.json` (`SessionEnd`, `PreCompact`) that run
   `collect --quiet`. Other hooks and keys are kept; a backup goes to `.brain/backups/`.
+- opens each tool's own folder wall for the base, so its agent can read **and write** the base from any folder
+  (next section). One entry per tool, merged by key, recorded; `disconnect` removes only that entry and gives the
+  exact old bytes back when nothing else changed in the file.
 - with `--timer`: writes `~/.config/systemd/user/skeleton-base-collect.service` and `.timer` (daily and 10 minutes
   after boot, `Persistent=true`) and prints the command to enable it:
   `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
@@ -185,9 +188,49 @@ remove exactly that and give the previous text back, including an older pointer 
 **Base paths with spaces** work everywhere `connect` writes the path. A plain path is written as it is
 (`Path: /home/me/base`). A path with a space, a quote, a backslash, a backtick or `$` is wrapped in the first of
 `"` `'` `` ` `` that it does not contain, with no escaping inside (`Path: "/home/me/My Base"`). Shell commands in the
-block and the Claude Code hooks are shell-quoted (`cd '/home/me/My Base' && ...`), and the systemd units quote
+block and the Claude Code hooks are shell-quoted (`python3 '/home/me/My Base/tools/brain.py' index`), and the systemd units quote
 and escape `ExecStart=` the way systemd reads it (`%` -> `%%`, `$` -> `$$`, `\` and `"` escaped). A path with a
 line break is refused for the units.
+
+### Any tool, any provider: what connect does for each
+
+Four things must hold for a tool to use the base: (a) it finds the base (the pointer block is in a rules file it
+loads in every session), (b) it can read the base, (c) it can write the base (the Saving knowledge rule: both its
+own memory and the base), (d) what it remembers on its own is collected into the base. Tools that keep their agent
+inside the folder it started in get the base added to their own user-level allow list:
+
+| tool | (a) finds it | (b) read + (c) write | (d) memory collected | evidence |
+|---|---|---|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` | `permissions.additionalDirectories: [BASE]` and `permissions.allow: ["Bash(python3 BASE/tools/brain.py *)"]` in `~/.claude/settings.json` [1] | `.claude/projects/*/memory/*.md` | tests `AccessTests.test_claude_*`, `FrugalGlobalTests.test_claude_access_entry_next_to_frugal_hooks_in_one_settings_file`; real `claude -p` from `/tmp`: answered from the base and wrote a page + ran `index` (acceptEdits) |
+| Codex | `~/.codex/AGENTS.md` | reads anywhere in its sandbox; writes: `[sandbox_workspace_write] writable_roots = [BASE]` in `~/.codex/config.toml` (text insert, every other byte kept) [2]. With a permission profile (`default_permissions`) it prints the line to add instead | `.codex/memories/**/*.md`, `.codex/memories_*.sqlite` | `AccessTests.test_codex_*`; real `codex sandbox` from `/tmp` (workspace-write): read and wrote the base, a write next to it was refused |
+| Gemini CLI | `~/.gemini/GEMINI.md` | `context.includeDirectories: [BASE]` in `~/.gemini/settings.json` [3] | `GEMINI.md` (its saved memories), `**/memory*.md` | `AccessTests.test_gemini_and_qwen_include_directories` |
+| Qwen Code | `~/.qwen/QWEN.md` | `context.includeDirectories: [BASE]` in `~/.qwen/settings.json` [4] | `QWEN.md` | same test |
+| opencode | `~/.config/opencode/AGENTS.md` | lets agents out by default; where `opencode.json` has rules: an `external_directory` allow rule for `BASE/**` (V2 `permissions` list, last rule wins; V1 `permission.external_directory` object) [5] | no memory store of its own: the block makes it save in the base | `AccessTests.test_opencode_*` |
+| OpenClaw | `~/.openclaw/workspace/AGENTS.md` (when it exists) | no wall: its sandbox is off by default [6]; if you turn it on, bind the base into it | `MEMORY.md`, `USER.md`, `memory/*.md` | `CollectTests`, matrix test |
+| Hermes | `~/.hermes/SOUL.md`, `profiles/*/SOUL.md` (when they exist) | no wall: its file tools reach any path you can | `memories/*.md`, `memory_store.db` (facts) | matrix test; real `hermes chat -q` from `/tmp` answered from the base |
+| Windsurf | `~/.codeium/windsurf/memories/global_rules.md` | no file setting known: it asks, or add the base to the workspace | its memories are not plain files: not collected (the block makes it save in the base) | matrix test (a) |
+| Kiro | `~/.kiro/steering/skeleton-base.md` | no file setting known: add the base to the workspace when it asks | none of its own | matrix test (a) |
+| Cursor | needs you: paste `connect --print` into its User Rules | no file setting known: add the base to the workspace | not collected | listed as needs-user |
+| any AI-like tool (a folder in your home with `AGENTS.md`/`NAME.md` rules or a `memory` store) | its rules file, when it has one (else listed as needs-user) | the block gives the absolute path and says: if your tool blocks it, ask the user to allow it (with the exact setting of each tool above) | its memory folder is watched and collected | `ZeroTouchTests`, `AccessTests.test_pointer_block_tells_any_tool_how_to_get_access` |
+
+Matrix test: `AccessTests.test_every_known_tool_is_found_readable_writable_and_collected` (fake HOME, every tool
+at once, then `disconnect` gives the home back byte-identical). `connect --print` prints the block and the notes.
+
+**Any provider.** Nothing in the base needs a model: `init`, `connect`, `collect`, `watch`, `map`, `lint`,
+`index`, `check` are plain Python with no network call and no model or provider name. The pointer block and
+`AGENTS.md` are plain instructions any model follows; the optional AI steps (`skills/base-ingest`,
+`skills/base-lint`, the interview) work with whatever model your tool runs. So the same tool on another provider
+(Claude Code through another Anthropic-compatible endpoint, Hermes or opencode on OpenRouter or a local model)
+loads the same rules file and the same settings: what the table says holds, because none of it depends on the
+model. Tested here: Claude Code (Anthropic) and Hermes (its configured provider) for real; other providers are not
+tested here, by design they change nothing above.
+
+Sources: [1] code.claude.com/docs/en/permissions (Working directories, additionalDirectories);
+[2] developers.openai.com/codex/config-reference (`sandbox_workspace_write.writable_roots`) and
+developers.openai.com/codex/concepts/sandboxing; [3] github.com/google-gemini/gemini-cli
+`docs/reference/configuration.md` (`context.includeDirectories`); [4] github.com/QwenLM/qwen-code
+`docs/users/configuration/settings.md`; [5] opencode.ai/docs/permissions and opencode.ai/v1/docs/permissions
+(`external_directory`); [6] docs.openclaw.ai/gateway/sandboxing ("Sandboxing is off by default").
 
 ### With Frugal-Bridge installed for the whole user (`install --global`)
 
