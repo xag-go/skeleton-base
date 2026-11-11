@@ -2,6 +2,18 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.4.1 - 2026-11-11
+Fixes found by real runs of real tools (Claude Code, Hermes, Qwen Code, each in a fresh temporary home):
+- The pointer block's save step: run the `brain.py index` command on its own (the exact form tools allow) and add
+  the log line with the file tools. Claude Code chained both in one shell command, which its allow rule did not
+  match, so the step was refused.
+- "Remember ..." is named as durable knowledge that goes into the base first (facts about the user: the fitting
+  page of `wiki/me/`), then a short copy in the tool's memory. Qwen Code on a Gemini model had saved only to its own
+  memory; after the change it saved to both.
+- `collect` skips empty memory files (a fresh, empty `MEMORY.md` index was collected as an item with no content).
+- Tests: the Hermes-only Frugal-Bridge test makes an installed Hermes (its `config.yaml`) instead of relying on a
+  real `hermes` on PATH; 3 new tests (128).
+
 ## v1.4.0 - 2026-11-11
 - Every known harness, one row each (26: Claude Code, Codex and the ChatGPT desktop app, Gemini CLI, Qwen Code,
   opencode v1/v2, Kilo Code, Grok Build, Copilot CLI, OpenClaw, Hermes, Crush, Goose, Amp, Aider, Factory Droid,

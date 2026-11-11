@@ -1680,6 +1680,33 @@ class AccessTests(HomeBase):
     def access(self):
         return json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"].get("access", {})
 
+    def test_pointer_save_step_is_one_allowed_command(self):
+        """Real Claude Code run: the agent chained `brain.py index` with an `echo >> progress/agents.log` in one shell
+        command, which the allow rule connect writes does not match, so the index step was refused. The block now
+        says to run the index command on its own (the exact allowed form) and log with the file tools."""
+        self.write(self.home, ".claude/settings.json", "{}")
+        self.ok("connect")
+        t = (self.home / ".claude/CLAUDE.md").read_text()
+        sys.path.insert(0, str(REPO / "tools"))
+        import brain
+        cmd = brain.index_cmd(self.base)
+        self.assertIn(f"`{cmd}` as a command of its own", t)
+        self.assertIn("with your file tools", t)
+        allow = json.loads((self.home / ".claude/settings.json").read_text())["permissions"]["allow"]
+        rule = next(a for a in allow if a.startswith("Bash("))[5:-1]
+        import fnmatch
+        self.assertTrue(fnmatch.fnmatchcase(cmd, rule), (cmd, rule))
+        self.assertFalse(fnmatch.fnmatchcase(f"B=x; {cmd}; echo y >> log", rule))
+
+    def test_pointer_says_remember_goes_to_the_base_first(self):
+        """Real Qwen Code run (OpenAI-compatible Gemini): told "remember ...", it saved only to its own memory.
+        The block names the request and where a fact about the user goes."""
+        self.write(self.home, ".claude/settings.json", "{}")
+        self.ok("connect")
+        t = (self.home / ".claude/CLAUDE.md").read_text()
+        self.assertIn('"Remember ..." from the user is durable knowledge: write it in the base first', t)
+        self.assertIn("about the user -> the page of `wiki/me/` it fits", t)
+
     def test_claude_additional_directories_merged_idempotent_and_given_back(self):
         mine = ('{"model": "x", "permissions": {"allow": ["Read(~/notes/**)"], "additionalDirectories": '
                 '["/srv/other"]}, "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}')
@@ -2746,6 +2773,21 @@ class EveryToolTests(ToolHome):
         for src, root in (("kilo", ".local/share/kilo/memory"), ("goose", ".config/goose/memory"),
                           ("grok", ".grok/memory"), ("qwen", ".qwen/projects")):
             self.assertIn((src, str(h / root)), locs)
+
+    def test_empty_memory_files_are_not_collected(self):
+        """Real Qwen Code run: its fresh, empty `memories/MEMORY.md` index landed in the inbox as an item with no
+        content (to be ingested for nothing). Blank store files are skipped; they are collected once they get text."""
+        h = self.home
+        self.write(h, ".qwen/memories/MEMORY.md", "")
+        self.write(h, ".qwen/memories/user/blank.md", "\n  \n")
+        self.write(h, ".qwen/memories/user/tea.md", "token-tea Moonleaf\n")
+        self.ok("collect")
+        got = sorted(p.name for p in (self.base / "raw/inbox/collected").rglob("*.md"))
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("tea", got[0])
+        self.write(h, ".qwen/memories/MEMORY.md", "- [tea](user/tea.md)\n")
+        self.ok("collect")
+        self.assertEqual(len(list((self.base / "raw/inbox/collected").rglob("*.md"))), 2)
 
 
 class DetectionTests(ToolHome):

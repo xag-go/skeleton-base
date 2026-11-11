@@ -87,7 +87,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.4.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.4.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -1867,6 +1867,8 @@ def collect(base, only=None, baseline=False, since=None, quiet=False):
     for src, origin, ts, content in collect_items(home, notes, cfg):
         if src not in only:
             continue
+        if not content.strip():           # an empty store file (e.g. a fresh MEMORY.md index) is not a memory
+            continue
         ts = ts if ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
         if since is not None and ts < since:
             old += 1; continue
@@ -1959,11 +1961,14 @@ def pointer_body(base):
 - Never edit `{b}/raw/`. When you change the base, follow `{b}/AGENTS.md`.
 
 ## Saving knowledge
-- Durable knowledge (facts, decisions, people, clients, project status) is saved in the base at `{b}`:
+- Durable knowledge (facts about the user, decisions, people, clients, project status) is saved in the base at
+  `{b}`: about the user -> the page of `wiki/me/` it fits;
   client -> `wiki/clients/SLUG.md` (from `templates/client.md`); decision -> `wiki/decisions/YYYY-MM-DD-SLUG.md`;
   person -> `wiki/people/SLUG.md`; project status -> `wiki/projects/SLUG.md`, plus `hot.md` if it matters now.
-- Then run `{index_cmd(base)}` and append one line to `{b}/progress/agents.log`.
-- Keep a short copy in your own memory too; both should have it. Never only in your own memory.
+- Then run `{index_cmd(base)}` as a command of its own (nothing chained before or after it: tools allow exactly
+  that form) and add one line to `{b}/progress/agents.log` with your file tools.
+- "Remember ..." from the user is durable knowledge: write it in the base first, then a short copy in your own
+  memory; both should have it. Never only in your own memory.
 
 ## Access
 - This folder is outside your project; read and write it with your normal file tools, from any folder.
