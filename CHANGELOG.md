@@ -2,6 +2,24 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.5.4 - 2026-11-11
+Three fixes from a live run of `tidy` and `file` on a real base:
+- **`tidy` no longer puts a good page back because the watcher wrote at the same time.** Each page run now holds the
+  collector lock (`.brain/collector.lock`, the one `collect` uses), and the watcher's file step holds the wiki lock
+  and waits for a tidy run to finish, then goes on (its queue is kept: events are not dropped). The outside-wiki
+  check ignores the watcher's generated writes (`maps/`) and NEW collected memories under `raw/inbox/collected/`.
+  It still flags a change to an EXISTING raw file, to any other file outside `wiki/`, and a NEW file that is not a
+  collected memory. Tests: a fake harness that edits its page while a simulated watcher writes maps and a new memory
+  (accepted, and the lock is seen as held during the run); a fake harness that edits an existing raw file (put back).
+- **`tidy` exits 0 when a page was put back.** The unit no longer shows `failed` for a put-back that was handled
+  (raw kept, retried next run); the log line says `put back`. Non-zero stays for real errors: no harness found for
+  `--harness`, a crash, bad arguments.
+- **`file` records index lines and duplicates as done.** A noop item gets the same bookkeeping as a filed one, page =
+  the page it duplicates or `wiki/index.md`, and `watch` commits that bookkeeping too (a fresh clone no longer sees
+  the item as NEW). Test: after `file`, `status` reports 0 pending and `lint` 0 warnings for an index-only item.
+  Note: in the fixture this already reported 0 pending; the live case could not be reproduced in the test base, so
+  the test pins the behaviour and the commit gap is the part that was really missing.
+
 ## v1.5.3 - 2026-11-11
 `brain.py file` now flags a small number change as a conflict too: a patch or minor version bump (1.5.1 -> 1.5.2),
 a port or a count that changed in the same place of the sentence. Before, only a number with no shared digits

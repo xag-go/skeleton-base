@@ -103,7 +103,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.5.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.5.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -2382,6 +2382,19 @@ def wiki_lock(base, wait=True):
     return f
 
 
+def collector_lock(base):
+    """The lock `collect` and each tidy page run share (.brain/collector.lock). Blocking: a page run is never
+    mixed with the watcher's own writes (new collected memories, maps), and the watcher waits, then goes on."""
+    (base / ".brain").mkdir(parents=True, exist_ok=True)
+    f = open(base / ".brain" / "collector.lock", "w")
+    try:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass
+    return f
+
+
 def atomic_write(p, text):
     p = pathlib.Path(p)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -2528,7 +2541,7 @@ def _file_items(base, dry_run, variant, quiet, items):
             rep["unsorted" if target == UNSORTED else "filed"] += 1
             touched.append(target)
         if not dry_run:
-            filed["raws"][rr] = {"at": day, "pages": sorted(set(touched))}
+            filed["raws"][rr] = {"at": day, "pages": sorted(set(touched)) or ["wiki/index.md"]}
             man[rr] = {"sha": sha(p.read_bytes()), "pages": sorted(set(touched)) or ["wiki/index.md"],
                        "date": day, "by": "file"}
     if not dry_run:
@@ -2869,6 +2882,9 @@ def tidy_verify(base, job, snap0, texts0, lint0, log0):
         if r == "progress/agents.log":
             if not (read(base / r) or "").startswith(log0 or ""):
                 probs.append("progress/agents.log was rewritten (only appending is allowed)")
+        elif r.startswith("maps/") or (r not in snap0 and r.startswith("raw/inbox/collected/")
+                                        and read_collected(base / r)):
+            continue                # the watcher's own writes (generated maps, a NEW collected memory), not the harness
         elif not r.startswith("wiki/"):
             probs.append(f"changed a file outside wiki/: {r}")
         elif job["page"] != UNSORTED and r not in (job["page"], "wiki/index.md", "wiki/log.md"):
@@ -3015,6 +3031,7 @@ def tidy_main(base, harness=None, model=None, dry_run=False, force=False, check_
             if not j:
                 continue
             tiers = [t] if t == "mid" else [t, "mid"]
+            clock = collector_lock(base)           # the watcher's writes wait for this page run
             for k, tt in enumerate(tiers):
                 m = model if (model and k == 0) else (models.get(tt) or row.get(tt))
                 texts0, snap0, lint0 = wiki_texts(base), snapshot(base), lint_errors(base)
@@ -3058,6 +3075,7 @@ def tidy_main(base, harness=None, model=None, dry_run=False, force=False, check_
             else:
                 results.append({"page": j["page"], "ok": False})
                 stuck[job_key(j)] = j["page"]
+            clock.close()
         ok = [r for r in results if r.get("ok")]
         if ok:
             import io, contextlib
@@ -3083,7 +3101,7 @@ def tidy_main(base, harness=None, model=None, dry_run=False, force=False, check_
         lock.close()
     print(f"tidy: {len(ok)} page(s) merged, {len(results) - len(ok)} put back"
           + (f", cost ${total_cost:.4f}" if total_cost else ""))
-    return 0 if len(ok) == len(results) else 2
+    return 0                    # a put-back page is handled (raw kept, retried next run): not a failed unit
 
 
 def tidy_commit(base, msg):
@@ -5845,26 +5863,35 @@ def watch_once(base, commit=True, connect=True):
     except (json.JSONDecodeError, IndexError):
         last = {}
     out["new"] = new = last.get("new", 0)
-    touched = []
-    if (base / "wiki").is_dir():
-        try:
-            rep = file_items(base, quiet=True)
-            touched = sorted({d["page"] for d in rep.get("decisions", []) if d.get("action") == "file"})
-            if touched:
-                out["filed"] = rep["filed"] + rep["unsorted"]
-        except Exception as e:                            # filing never blocks the collect
-            out["error"] = f"file: {e}"
-    if new or out.get("connect") or touched:
-        with contextlib.redirect_stdout(io.StringIO()):
-            build_index(base, quiet=True)
-            build_map(base, quiet=True)
-        if commit and (base / ".git").exists():
+    touched, filed_any, rep = [], False, {"items": 0, "decisions": []}
+    wl = wiki_lock(base, wait=True) if (base / "wiki").is_dir() else None   # tidy holds the wiki for its run: wait
+    try:
+        if wl is not None:
+            try:
+                rep = _file_items(base, False, "B", True, None)
+                touched = sorted({d["page"] for d in rep.get("decisions", []) if d.get("action") == "file"
+                                  and d.get("page")})
+                filed_any = bool(rep.get("items"))
+                if touched:
+                    out["filed"] = rep["filed"] + rep["unsorted"]
+            except Exception as e:                        # filing never blocks the collect
+                out["error"] = f"file: {e}"
+        if new or out.get("connect") or touched:
+            with contextlib.redirect_stdout(io.StringIO()):
+                build_index(base, quiet=True)
+                build_map(base, quiet=True)
+        if (new or out.get("connect") or touched or filed_any) and commit and (base / ".git").exists():
             per = ", ".join(f"{k} {v}" for k, v in sorted(last.get("per_source", {}).items()))
             msg = f"watch: collect {new} new" + (f" ({per})" if per else "") if new else \
-                ("watch: file" if touched else "watch: auto-connect")
+                ("watch: file" if touched else "watch: file (already known)" if filed_any else "watch: auto-connect")
             if touched:
                 msg += f", filed on {len(touched)} page(s)"
-            out["commit"] = git_commit(base, msg, touched + [FILED, ".brain/manifest.json"] if touched else ())
+            # the bookkeeping of already-known items (filed.json, manifest) is committed too, or a fresh clone
+            # would see those raw files as NEW again
+            out["commit"] = git_commit(base, msg, touched + [FILED, ".brain/manifest.json"] if filed_any else ())
+    finally:
+        if wl is not None:
+            wl.close()
     if touched:
         try:
             if tidy_kick(base):

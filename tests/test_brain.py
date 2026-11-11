@@ -3149,6 +3149,36 @@ class FileTests(FileBase):
         self.assertIn("[[unsorted]]", (self.base / "wiki/index.md").read_text())
         self.assertIn("file: 0 item(s)", self.run_file().stdout, "nothing twice")
 
+    def test_index_only_item_is_done_after_file(self):
+        raw = collected_item(self.base, "claude-code", "~/.claude/projects/-home-x/memory/MEMORY.md",
+                             "# Memory Index\n\n- [Project Alpha](project_alpha.md) - the alpha notes\n"
+                             "- [Owner](owner.md) - who the owner is\n")
+        r = self.run_file()
+        self.assertIn("noop  " + raw, r.stdout)
+        st = self.hb("status")
+        self.assertIn("pending: 0", st.stderr, st.stdout)
+        self.assertNotIn(raw, st.stdout)
+        lint = self.lint_ok()
+        self.assertIn("0 warning(s)", lint.stdout + lint.stderr)
+        man = json.loads((self.base / ".brain/manifest.json").read_text())
+        self.assertEqual(man[raw]["pages"], ["wiki/index.md"], "a noop is recorded as done, page = wiki/index.md")
+        filed = json.loads((self.base / ".brain/filed.json").read_text())
+        self.assertEqual(filed["raws"][raw]["pages"], ["wiki/index.md"])
+        self.assertIn("file: 0 item(s)", self.run_file().stdout, "nothing twice")
+
+    def test_watch_commits_the_bookkeeping_of_known_items(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.base)
+        git(self.base, "add", "-A")
+        git(self.base, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "start")
+        raw = collected_item(self.base, "claude-code", "~/.claude/projects/-home-x/memory/MEMORY.md",
+                             "- [Project Alpha](project_alpha.md) - the alpha notes\n")
+        r = self.hb("watch", "--once", "--no-connect", "--base", self.base)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("watch: file (already known)", git(self.base, "log", "-1", "--format=%s"))
+        self.assertEqual(git(self.base, "status", "--porcelain", "--", ".brain/manifest.json", ".brain/filed.json"),
+                         "", "the manifest of the noop item is in git, so a clone does not see it as NEW")
+        self.assertIn(raw, git(self.base, "show", "HEAD:.brain/manifest.json"))
+
     def test_page_prose_is_never_rewritten(self):
         before = self.page("projects/project-alpha.md")
         collected_item(self.base, "kilo", "~/.local/share/kilo/memory/a/project.md",
@@ -3343,6 +3373,22 @@ pathlib.Path(os.environ["FAKE_LOG"]).open("a").write(json.dumps(a) + "\n")
 prompt = a[a.index("-p") + 1] if "-p" in a else a[-1]
 model = a[a.index("--model") + 1] if "--model" in a else "default"
 mode = os.environ.get("FAKE_TIDY", "merge")
+if mode == "watch-sim":          # a watcher writes maps/ and a NEW collected memory while the page is edited
+    import fcntl
+    pathlib.Path(os.environ["FAKE_BASE"], "maps").mkdir(exist_ok=True)
+    pathlib.Path(os.environ["FAKE_BASE"], "maps/brain.html").write_text("<html>watcher</html>\n")
+    pathlib.Path(os.environ["FAKE_WATCH_NEW"]).write_text(os.environ["FAKE_WATCH_TEXT"])
+    lk = open(os.path.join(os.environ["FAKE_BASE"], ".brain/collector.lock"), "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = "free"
+    except BlockingIOError:
+        held = "held"
+    pathlib.Path(os.environ["FAKE_LOCK_OUT"]).write_text(held)
+    mode = "merge"
+if mode == "raw-edit":           # the harness edits an EXISTING collected memory: must still put the page back
+    pathlib.Path(os.environ["FAKE_RAW"]).write_text("edited by the harness\n")
+    mode = "merge"
 if mode == "break-cheap":
     mode = "break" if model == "haiku" else "merge"
 m = re.search(r"current folder: (wiki/\S+?\.md)\.", prompt) or re.search(r"inbox page (wiki/\S+?\.md) ", prompt)
@@ -3390,9 +3436,10 @@ class TidyTests(FileBase):
         p.write_text(FAKE_HARNESS.replace("/usr/bin/env python3", sys.executable))
         p.chmod(0o755)
 
-    def tidy(self, *args, mode="merge", code=None):
+    def tidy(self, *args, mode="merge", code=None, extra=None):
         r = run(self.base / "tools" / "brain.py", "tidy", "--base", self.base, *args,
-                env={"HOME": str(self.home), "PATH": self.path, "FAKE_LOG": str(self.log), "FAKE_TIDY": mode})
+                env={"HOME": str(self.home), "PATH": self.path, "FAKE_LOG": str(self.log), "FAKE_TIDY": mode,
+                     "FAKE_BASE": str(self.base), **(extra or {})})
         if code is not None:
             self.assertEqual(r.returncode, code, r.stdout + r.stderr)
         return r
@@ -3467,14 +3514,15 @@ class TidyTests(FileBase):
         before = self.page("projects/project-alpha.md")
         for mode, why in (("break", "frontmatter lost"), ("drop", "dropped without its facts"),
                           ("outside", "outside wiki/")):
-            r = self.tidy("--force", mode=mode, code=2)
+            r = self.tidy("--force", mode=mode, code=0)          # a put-back is handled: the unit must not fail
+            self.assertIn("put back", r.stdout, mode)
             self.assertEqual(self.page("projects/project-alpha.md"), before, mode)
             log = (self.base / ".brain/tidy.log").read_text()
             self.assertIn(why, log, mode)
 
     def test_a_page_failing_on_both_models_is_skipped_until_its_lines_change(self):
         self.alpha_lines(5)
-        self.tidy("--tier", "cheap", mode="break", code=2)
+        self.tidy("--tier", "cheap", mode="break", code=0)
         self.assertEqual(len(self.calls()), 2)
         r = self.tidy("--check", code=0)
         self.assertIn("NEEDS YOU", r.stdout)
@@ -3483,6 +3531,35 @@ class TidyTests(FileBase):
         (self.base / ".brain/tidy.json").write_text(json.dumps(st))
         self.tidy(mode="break", code=0)
         self.assertEqual(len(self.calls()), 2, "no money spent again on the same stuck lines")
+
+    def test_watcher_writes_during_a_page_run_do_not_put_the_page_back(self):
+        self.alpha_lines(5)
+        new = self.base / "raw/inbox/collected/claude-code/20261111-watch-new-0a1b2c3d.md"
+        new.parent.mkdir(parents=True, exist_ok=True)
+        text = B.COLLECT_HEADER.format(src="claude-code", origin="~/.claude/projects/x/memory/watch.md",
+                                       at="2026-11-11T09:00:00Z", h="0a1b2c3d" * 8)
+        text += "Project Alpha watcher note about the sample region.\n"
+        lock_out = self.tmp / "lock.out"
+        r = self.tidy(code=0, extra={"FAKE_WATCH_NEW": str(new), "FAKE_WATCH_TEXT": text,
+                                     "FAKE_LOCK_OUT": str(lock_out)}, mode="watch-sim")
+        self.assertIn("1 page(s) merged, 0 put back", r.stdout)
+        self.assertEqual(lock_out.read_text(), "held", "tidy holds the collector lock during a page run")
+        self.assertIn("copper buttons", self.page("projects/project-alpha.md"))
+        self.assertEqual((self.base / "maps/brain.html").read_text(), "<html>watcher</html>\n",
+                         "the watcher's map is not reverted")
+        self.assertTrue(new.is_file(), "the watcher's new memory is kept")
+        rec = json.loads((self.base / ".brain/tidy.log").read_text().splitlines()[-1])
+        self.assertTrue(rec["ok"], rec)
+
+    def test_harness_edit_of_an_existing_raw_file_still_puts_the_page_back(self):
+        self.alpha_lines(5)
+        before = self.page("projects/project-alpha.md")
+        raw = sorted((self.base / "raw/inbox/collected").rglob("*.md"))[0]
+        r = self.tidy("--force", code=0, mode="raw-edit", extra={"FAKE_RAW": str(raw)})
+        self.assertIn("put back", r.stdout)
+        self.assertEqual(self.page("projects/project-alpha.md"), before)
+        self.assertIn("changed a file outside wiki/: " + raw.relative_to(self.base).as_posix(),
+                      (self.base / ".brain/tidy.log").read_text())
 
     def test_unsorted_lines_go_in_small_batches(self):
         for i in range(10):
