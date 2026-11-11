@@ -1556,10 +1556,10 @@ class UninstallKeepsDataTests(HomeBase):
         self.assertEqual((self.home / "skeleton-base-backups").stat().st_mode & 0o777, 0o700)
         self.assertIn(str(arcs[0]), r.stdout)
         m = re.search(r"restore: (.+)", r.stdout)
-        self.assertTrue(m and "tar -xzf" in m.group(1), r.stdout)
+        self.assertTrue(m and "tar -xpzf" in m.group(1), r.stdout)
         out = self.tmp / "restored"
         out.mkdir()
-        subprocess.run(["tar", "-xzf", str(arcs[0]), "-C", str(out)], check=True)
+        subprocess.run(["tar", "-xpzf", str(arcs[0]), "-C", str(out)], check=True)
         self.assertEqual(full_tree(out / "base"), before)
         self.assertEqual(git(out / "base", "log", "--format=%H %s"), log0)
 
@@ -1623,8 +1623,7 @@ class UninstallKeepsDataTests(HomeBase):
         mine = cv.read_text().replace('"nodes"', '"nodes" ', 1)
         cv.write_text(mine)
         self.write(b, "wiki/projects/new.md", PAGE.format(t="New", s="talk", b="x"))
-        r = self.hb("map")
-        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)        # same as for any map file not made by map
+        r = self.ok("map")                                             # your edited map is not an error
         self.assertIn("changed by you since map wrote it", r.stderr)
         self.assertEqual(cv.read_text(), mine)
         self.init(b)

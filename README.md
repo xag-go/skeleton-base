@@ -64,7 +64,7 @@ Removing Skeleton Base never deletes anything of yours.
 1. **A full backup comes first.** `uninstall` writes the whole base (every file, dotfiles, `.git`) to
    `~/skeleton-base-backups/NAME-YYYYmmdd-HHMMSS.tar.gz` (mode 600, folder 700), outside the base, reads it
    back to check it, and prints its path plus a one-line restore command
-   (`mkdir -p PARENT && tar -xzf ARCHIVE -C PARENT`). If the backup cannot be written, nothing is uninstalled.
+   (`mkdir -p PARENT && tar -xpzf ARCHIVE -C PARENT`, file modes kept). If the backup cannot be written, nothing is uninstalled.
    `--backup-dir DIR` picks another folder (never inside the base); `--no-backup` skips it, only when you say so.
 2. **Only unmodified kit files go.** A file init copied is removed only when it is still byte-identical to what
    init wrote. Everything else stays where it is: your wiki pages, `raw/` (also `raw/inbox/collected/`),

@@ -814,7 +814,7 @@ def archive_base(base, dest=None):
 
 def restore_line(archive, base):
     base = pathlib.Path(base).resolve()
-    return f"mkdir -p {shq(base.parent)} && tar -xzf {shq(archive)} -C {shq(base.parent)}"
+    return f"mkdir -p {shq(base.parent)} && tar -xpzf {shq(archive)} -C {shq(base.parent)}"
 
 
 def kept_report(base, kit_kept=()):
@@ -1452,7 +1452,7 @@ def build_map(root, quiet=False, force=False):
                   file=sys.stderr)
         sizes = ", ".join(f"{r} ({(root / r).stat().st_size // 1024 + 1} KB)" for r in out if r not in skipped)
         print(f"map: {len(items)} pages, {len(edges)} links, {len(groups)} groups -> {sizes or 'nothing written'}")
-    return (1 if skipped else 0), wrote
+    return (1 if set(skipped) - set(edited) else 0), wrote      # your edited map is not an error
 
 
 MAP_HTML = r"""<!doctype html>

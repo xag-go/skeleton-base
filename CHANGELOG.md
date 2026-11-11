@@ -6,13 +6,14 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - Uninstall keeps your data (owner rule: removing Skeleton Base never loses anything of the user's).
   - `uninstall` first writes a full backup of the base (`.git` and dotfiles included) to
     `~/skeleton-base-backups/NAME-YYYYmmdd-HHMMSS.tar.gz` (mode 600, folder 700, outside the base, read back and
-    checked), prints its path and a one-line restore command; a failed backup stops the uninstall with nothing
+    checked), prints its path and a one-line restore command (`tar -xpzf`, file modes kept); a failed backup stops the uninstall with nothing
     changed. `--backup-dir DIR` (refused inside the base), `--no-backup` only when given.
   - After uninstall it prints what was kept and where (per folder, git commit count) and how to re-open or
     reinstall (`init` adopts the files).
   - Generated maps: `.brain/map.json` records what `map` wrote. A map you changed is no longer deleted by
     uninstall nor overwritten by `map`/`init` (before: any file with the map marker was deleted/overwritten);
     `map --force` keeps a copy in `.brain/backups/map-TIME/` first, also over a file map did not make.
+    `map` exits 0 when the only thing it left alone is your edited map (an installer re-running it does not fail).
   - Text you wrote inside our block of `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`/`.gitignore` is copied to
     `.base-folder/backup/` before the block (or a block-only file) is removed.
   - `.claude/settings.json` / `.gemini/settings.json`: when removing our keys leaves your original settings, your
