@@ -1799,16 +1799,21 @@ class Connector:
                "blocks": dict(prev.get("blocks", {})), "hooks": dict(prev.get("hooks", {})),
                "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {}))}
 
+        never = [x.removeprefix("~/") for x in watch_cfg(self.base).get("never", []) if isinstance(x, str)]
+        skip = lambda r: any(fnmatch.fnmatchcase(r, g) or r.startswith(g.rstrip("/") + "/") for g in never)
         for key, files in AUTO_TOOLS.items():           # every installed tool we know: its global rules file
-            if not (self.home / key).is_dir():
+            if not (self.home / key).is_dir() or skip(key):
                 continue
-            done = [r for pat, how in files for r in self.rules_files(pat) if self.block_into(rec, r, how == "create")]
+            done = [r for pat, how in files for r in self.rules_files(pat)
+                    if not skip(r) and self.block_into(rec, r, how == "create")]
             if done:
                 self.tools[key] = {"state": "connected", "files": done}
             else:
                 self.tools[key] = {"state": "needs-user", "why": NEEDS_USER.get(key, "no rules file found")}
         if unknown:                                       # zero-touch: a dir that looks like an AI tool
             for key, d in tool_dirs(self.home, self.base):
+                if skip(key):
+                    continue
                 rules, mem = ai_signals(d)
                 if not rules and not mem:
                     continue                              # not an AI tool: never touched

@@ -22,6 +22,7 @@ Changes to the skeleton structure and tools (not to anyone's content).
   folder that looks like an AI tool (rules file, memory folder or memory database) through its existing rules
   file, and watches its memory. No rules file: listed as `needs-user` in `.brain/watch.json` and `watch --list`.
   Other folders are never touched. All of it is recorded in `.kits.json` and undone by `disconnect`.
+  `"never"` in `.brain/watch.json` (folders or globs under `~`) keeps tools or files out of connect and auto-connect.
 - `connect --watch` writes `~/.config/systemd/user/skeleton-base-watch.service` (`Restart=on-failure`,
   `MemoryMax=40M`, `Nice=10`) plus the daily timer as a safety net, and prints the enable command; `--kick` adds a
   Claude Code `PostToolUse` (`Write|Edit`) hook that writes `.brain/kick`. `disconnect` removes both.

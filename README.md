@@ -179,7 +179,8 @@ python3 tools/brain.py watch                     # run it in the foreground inst
   file, a `memory` / `memories` folder, a `memory*.db`) gets the block in its existing rules file and its memory
   is watched and collected. If there is no rules file, its memory is still watched and the tool is listed as
   `needs-user` in `watch --list`. Folders that do not look like an AI tool are never touched. A watcher on a base
-  that is not connected only collects.
+  that is not connected only collects. To keep a tool or file out, list it in `.brain/watch.json` as
+  `"never": ["~/.hermes/profiles", "~/.kiro"]` (folders or globs under `~`); `connect` honours it too.
 - **Self-healing:** a folder that does not exist yet is picked up when it appears, a deleted and re-created one
   too; a full rescan every 10 minutes catches anything missed.
 - **Small:** ~19 MB of memory idle, 0 CPU while nothing changes. The service runs with `Nice=10` and

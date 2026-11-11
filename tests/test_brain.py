@@ -1415,3 +1415,17 @@ class WatchCollectTests(HomeBase):
         self.ok("collect")
         self.assertTrue(any(f.startswith("notes/") for f in self.collected()), self.collected())
         self.assertIn("notes", self.ok("collect", "--only", "notes").stdout + "notes")
+
+
+class NeverTests(HomeBase):
+    def test_never_list_keeps_files_out_of_connect(self):
+        self.write(self.home, ".hermes/SOUL.md", "You are calm.\n")
+        self.write(self.home, ".hermes/profiles/a/SOUL.md", "Profile a.\n")
+        self.write(self.home, ".qwen/QWEN.md", "q\n")
+        self.write(self.base, ".brain/watch.json", json.dumps({"never": ["~/.hermes/profiles", ".qwen"]}))
+        self.ok("connect")
+        self.assertIn("base-folder:start", (self.home / ".hermes/SOUL.md").read_text())
+        self.assertEqual((self.home / ".hermes/profiles/a/SOUL.md").read_text(), "Profile a.\n")
+        self.assertEqual((self.home / ".qwen/QWEN.md").read_text(), "q\n")
+        self.ok("disconnect")
+        self.assertEqual((self.home / ".hermes/SOUL.md").read_text(), "You are calm.\n")
