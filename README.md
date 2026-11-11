@@ -193,7 +193,8 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
   (the old one is backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`). Everything Frugal-Bridge could find the
   base from goes first (pointer blocks, systemd units, the pointer file); then it is told to forget the base
   (`--no-base` when its setup takes it, otherwise the `base` entry it recorded in its `global.json` is dropped, since
-  it looks there first) and its `install --global` is re-run, so it works on its own file again.
+  it looks there first) and its `install --global --hosts <its tools>` is re-run, so it works on its own file
+  again. Every re-run names Frugal-Bridge's own tools (also those waiting for a rules file), never more.
 - Which of these a Frugal-Bridge build supports is read from its setup script (`frugal_caps` in `tools/brain.py`:
   quoted `Path:`, pointer file, systemd units, `--base`, `--no-base`), never from its version or its messages.
 

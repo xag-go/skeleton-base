@@ -2172,13 +2172,15 @@ class Connector:
                             "`python3 <frugal-bridge>/kit/setup.py install --global` yourself so it picks this up")
             return False
         caps = frugal_caps(kit)
-        hosts = sorted(hosts if hosts is not None else (reg.get("tools") or {}))
-        cmd = [sys.executable, str(kit), "install", "--global"] + (["--hosts", ",".join(hosts)] if hosts else [])
+        if hosts is None:        # the tools it has, plus those waiting for a rules file (e.g. Hermes without SOUL.md)
+            hosts = set(reg.get("tools") or {}) | set(reg.get("needs_user") or {}) | set(reg.get("copied") or {})
+        hosts = sorted(hosts)
+        cmd = [sys.executable, str(kit), "install", "--global", "--hosts", ",".join(hosts)]
         env = dict(os.environ)
         if leave:
             if same_dir(env.get("FRUGAL_BASE"), self.base):
                 env.pop("FRUGAL_BASE")
-            if "no_base" in caps:
+            if "no_base" in caps and hosts:
                 cmd.append("--no-base")
             else:
                 cur = frugal_reg(self.home)
@@ -2187,6 +2189,9 @@ class Connector:
                     write(frugal_home(self.home) / "global.json", json.dumps(cur, indent=2) + "\n")
         elif "base" in caps:
             cmd += ["--base", str(self.base)]
+        if not hosts:            # without --hosts its auto-detection would widen the user's choice of tools
+            self.log.append("Frugal-Bridge: no tools recorded in its global.json; not re-run")
+            return False
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
         except (OSError, subprocess.SubprocessError) as e:

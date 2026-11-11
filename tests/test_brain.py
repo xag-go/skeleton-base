@@ -1855,7 +1855,11 @@ class FrugalGlobalTests(Base):
         self.sb("connect")
         self.assertFalse((self.home / ".hermes/SOUL.md").exists())
         self.assertEqual((self.home / ".config/skeleton-base/base").read_text(), f"{self.base}\n")
-        e = {"HERMES_HOME": str(self.home / ".hermes")}
+        fake_bin = self.tmp / "bin"                     # another tool's program on PATH (not chosen for Frugal):
+        fake_bin.mkdir()                                # re-running Frugal must not widen its tools to it
+        (fake_bin / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "claude").chmod(0o755)
+        e = {"HERMES_HOME": str(self.home / ".hermes"), "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
         self.x(self.setup_py, "install", "--global", "--hosts", "hermes", extra=e)
         self.assertFalse((self.fh / "USER.md").exists(), "Frugal made a second user file next to the base")
         self.assertEqual(self.frugal_base(), str(self.base))
@@ -1865,6 +1869,9 @@ class FrugalGlobalTests(Base):
         self.assertIsNone(self.frugal_base())
         self.assertTrue((self.fh / "USER.md").is_file())
         self.assertFalse((self.home / ".config").exists())
+        self.assertFalse((self.home / ".claude").exists(), "Frugal re-run widened to a tool the user did not pick")
+        self.assertEqual(sorted(json.loads((self.fh / "global.json").read_text()).get("needs_user") or {}),
+                         ["hermes"])
         self.x(self.setup_py, "uninstall", "--global", extra=e)
         self.assert_home_back(home0)
 
