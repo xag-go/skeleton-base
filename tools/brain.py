@@ -189,6 +189,16 @@ def find_block(text, start_re=START_RE, end=END):
     return (m.start(), e + len(end)) if e >= 0 else None
 
 
+def strip_kit_blocks(text):
+    """Text without the kits' own marked blocks (this base's pointer, Frugal-Bridge's rules): rules, not memory."""
+    for sr, en in ((START_RE, END), (FRUGAL_START_RE, "<!-- frugal-bridge:end -->")):
+        r = find_block(text, sr, en)
+        while r:
+            text = text[:r[0]] + text[r[1]:]
+            r = find_block(text, sr, en)
+    return text
+
+
 def block_body(rel, start_re=START_RE, end=END):
     """Body of the Base block in the skeleton's own copy of rel (between the markers)."""
     t = read(SRC / rel)
@@ -1568,9 +1578,7 @@ def collect_items(home, notes, cfg=None):
             if f.is_file():
                 text, ts = read_md(f, notes)
                 if text is not None:
-                    r = find_block(text)                   # our own pointer block is not a memory
-                    if r:
-                        text = text[:r[0]] + text[r[1]:]
+                    text = strip_kit_blocks(text)          # kit blocks (ours, Frugal-Bridge's) are not memories
                     if text.strip():
                         yield src, rel_home(f), ts, text
 
@@ -2497,9 +2505,7 @@ def extra_items(home, cfg, notes):
             text, ts = read_md(f, notes)
             if text is None:
                 continue
-            span = find_block(text)                        # our own pointer block is not a memory
-            if span:
-                text = text[:span[0]] + text[span[1]:]
+            text = strip_kit_blocks(text)                  # kit blocks (ours, Frugal-Bridge's) are not memories
             if text.strip():
                 yield src, home_rel(f, home), ts, text
 

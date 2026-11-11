@@ -1667,6 +1667,9 @@ class FrugalGlobalTests(Base):
         t = g.read_text()
         self.assertEqual(t[FRUGAL_BLOCK.search(t).start():], old, "Frugal's bytes untouched, ours in front")
         self.assertTrue(t.startswith("<!-- base-folder:start v2 -->"))
+        got = self.base / "raw/inbox/collected"
+        self.assertFalse(got.is_dir() and [f for f in got.rglob("*.md") if "frugal-bridge" in f.read_text()],
+                         "Frugal-Bridge's rules block was collected as a memory")
         self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"), r.stdout)
         snap = self.snap()
         self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
