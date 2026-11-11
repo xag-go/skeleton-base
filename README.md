@@ -122,12 +122,15 @@ missing store or an unknown database layout is skipped with a note, never an err
 | source | where (under your home folder) |
 |---|---|
 | `claude-code` | `.claude/projects/*/memory/*.md` |
-| `codex` | `.codex/memories/**/*.md`, `.codex/memories_*.sqlite` (table `stage1_outputs`) |
+| `codex` | `.codex/memories/**/*.md`, `.codex/memories_v2/**/*.md`, `.codex/memories_*.sqlite` (table `stage1_outputs`); the ChatGPT desktop app is the same Codex host |
 | `gemini` | `.gemini/GEMINI.md` (without the base's own block), `.gemini/**/memory*.md` |
-| `qwen` | `.qwen/QWEN.md` (without the base's own block) |
+| `qwen` | `.qwen/QWEN.md` (without the base's own block), its auto-memory `.qwen/projects/*/memory/**/*.md`, `.qwen/memories/**/*.md` |
 | `hermes` | `.hermes/memories/*.md`, `.hermes/profiles/*/memories/*.md` |
 | `hermes-facts` | `.hermes/memory_store.db`, `.hermes/profiles/*/memory_store.db` (table `facts`) |
-| `openclaw` | `.openclaw/workspace/MEMORY.md`, `USER.md`, `memory/*.md` |
+| `openclaw` | `.openclaw/workspace/MEMORY.md`, `USER.md`, `DREAMS.md`, `memory/*.md` |
+| `kilo` | `.local/share/kilo/memory/*/*.md` (Kilo's project memory, off by default in Kilo) |
+| `goose` | `.config/goose/memory/*` (the Memory extension's global files) |
+| `grok` | `.grok/memory/**/*.md` (Grok's memory, off by default in Grok; its index database is skipped) |
 | any name | every location added with `watch --add` (see below) |
 
 ```sh
@@ -150,33 +153,43 @@ python3 tools/brain.py connect --print    # only print the pointer block (for a 
 ```
 
 For the current user, `connect`:
-- writes a marked pointer block (`<!-- base-folder:start v2 -->` ... `<!-- base-folder:end -->`) into the global
-  rules file of every installed tool (its folder exists). It says where the base is, to read `hot.md` then
-  `wiki/index.md` only when owner context is needed (never for plain coding), never to edit `raw/`, and the Saving
-  knowledge rule. An older block is replaced in place; all other text stays byte-identical.
-
-  | tool | file | |
-  |---|---|---|
-  | Claude Code | `~/.claude/CLAUDE.md` | created if missing |
-  | Codex | `~/.codex/AGENTS.md` | created if missing |
-  | Gemini CLI | `~/.gemini/GEMINI.md` | created if missing |
-  | Qwen Code | `~/.qwen/QWEN.md` | created if missing |
-  | opencode | `~/.config/opencode/AGENTS.md` | created if missing |
-  | Windsurf | `~/.codeium/windsurf/memories/global_rules.md` | created if missing |
-  | Kiro | `~/.kiro/steering/skeleton-base.md` | its own steering file |
-  | OpenClaw | `~/.openclaw/workspace/AGENTS.md` | only if it exists (OpenClaw seeds it on first run) |
-  | Hermes | `~/.hermes/SOUL.md`, `~/.hermes/profiles/*/SOUL.md` | only if it exists: it is the agent's identity, the only context file Hermes loads globally; creating one would replace its default identity |
-  | Cursor | - | needs you: global User Rules live in its app settings (`connect --print`) |
-
+- finds every installed tool it knows (the table below) and writes a marked pointer block
+  (`<!-- base-folder:start v2 -->` ... `<!-- base-folder:end -->`) into ONE global rules file that tool loads in
+  every session. It says where the base is, to read `hot.md` then `wiki/index.md` only when owner context is
+  needed (never for plain coding), never to edit `raw/`, and the Saving knowledge rule. An older block is replaced
+  in place; all other text stays byte-identical. Where a tool has a rules folder, the block gets its own file
+  there (`~/.kiro/steering/skeleton-base.md`, `~/.grok/rules/`, `~/.continue/rules/`, `~/Documents/Cline/Rules/`,
+  `~/.copilot/instructions/`), so no file of yours is edited.
+- **Installed** means: the tool's own config file exists (one we did not create ourselves), or its program is on
+  `PATH` and its config folder exists. A folder that another tool also makes is never enough on its own:
+  `~/.gemini` is also made by Antigravity, so Gemini CLI needs the `gemini` program or its `settings.json`.
+- **Loaded once per tool.** Some files are read by several tools: `~/.agents/AGENTS.md` (Warp Agent CLI, Factory
+  Droid, Cline), `~/.config/AGENTS.md` (Crush, Amp) and `~/.claude/CLAUDE.md` (also loaded by Kilo when it has no
+  `AGENTS.md` of its own, and by Devin unless `read_config_from.claude` is false). When the shared file is used
+  (it exists, or Warp needs it), the block goes there once and not into the members' own files; a block written
+  before into a member's own file is taken out again. Kilo and Devin get no second copy next to the one in
+  `~/.claude/CLAUDE.md`. Codex: when `~/.codex/AGENTS.override.md` has text it hides `AGENTS.md`, so the block
+  goes into the override file.
+- **Size check.** Codex loads at most 32 KiB of AGENTS.md (its global file and the project's together), Hermes
+  cuts a context file at 20,000 characters, OpenClaw at 20,000 per bootstrap file, Droid at 80,000: `connect`
+  prints a `WARNING` when a file is over (for Codex: over half). Hermes `SOUL.md` and OpenClaw's workspace
+  `AGENTS.md` are only added to when they exist (never created: SOUL.md is the agent's identity).
+- adds the base to each tool's own user-level allow list, so its agent can read **and write** the base from any
+  folder (column (b) below). JSON settings are edited as JSONC (comments, trailing commas and layout kept), TOML
+  by a checked text insert, YAML only by safe line edits (one line under a top-level key; anything else gets a
+  note telling you what to add by hand). Each entry is merged by key, recorded, and `disconnect` gives the exact
+  old bytes back when nothing else changed in the file, or takes out only our entries when it did.
+- installs the base's skills (`skills/base-*`) **once** in `~/.agents/skills/`, plus a `base-home` skill that says
+  where the base is (Cursor has no rules file: it finds the base this way). Most tools read that folder (see the
+  notes); a skill folder you already have under the same name is never overwritten.
 - merges two Claude Code hooks into `~/.claude/settings.json` (`SessionEnd`, `PreCompact`) that run
   `collect --quiet`. Other hooks and keys are kept; a backup goes to `.brain/backups/`.
-- opens each tool's own folder wall for the base, so its agent can read **and write** the base from any folder
-  (next section). One entry per tool, merged by key, recorded; `disconnect` removes only that entry and gives the
-  exact old bytes back when nothing else changed in the file.
 - with `--timer`: writes `~/.config/systemd/user/skeleton-base-collect.service` and `.timer` (daily and 10 minutes
   after boot, `Persistent=true`) and prints the command to enable it:
   `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
 - with `--watch`: the watch service as well (next section); with `--kick`: a Claude Code `PostToolUse` hook.
+- with `--mcp`: registers the base's MCP server (`brain.py mcp`, see below) in each tool's MCP config (column
+  "MCP"). Once asked for, later connects and the watcher keep it; `disconnect` removes it.
 - writes the base's pointer file `~/.config/skeleton-base/base`: one line, the base folder (no quoting). Other
   kits read it to find the base when no tool rules file carries the pointer block (a home whose only tool is Hermes
   without a `SOUL.md`, for example). If another base wrote it before, its bytes are backed up and given back on
@@ -195,42 +208,90 @@ line break is refused for the units.
 ### Any tool, any provider: what connect does for each
 
 Four things must hold for a tool to use the base: (a) it finds the base (the pointer block is in a rules file it
-loads in every session), (b) it can read the base, (c) it can write the base (the Saving knowledge rule: both its
-own memory and the base), (d) what it remembers on its own is collected into the base. Tools that keep their agent
-inside the folder it started in get the base added to their own user-level allow list:
+loads in every session), (b) it can read and write the base (its own allow list, where it has a wall), (c) what it
+remembers on its own is collected into the base, and, for apps that cannot read files, (d) the MCP server. One row
+per tool; "needs you" says exactly what you set by hand, and `connect --print` prints the same list with your
+base path in it. This table is generated (`python3 tools/brain.py connect --matrix`; a test checks it):
 
-| tool | (a) finds it | (b) read + (c) write | (d) memory collected | evidence |
-|---|---|---|---|---|
-| Claude Code | `~/.claude/CLAUDE.md` | `permissions.additionalDirectories: [BASE]` and `permissions.allow: ["Bash(python3 BASE/tools/brain.py *)"]` in `~/.claude/settings.json` [1] | `.claude/projects/*/memory/*.md` | tests `AccessTests.test_claude_*`, `FrugalGlobalTests.test_claude_access_entry_next_to_frugal_hooks_in_one_settings_file`; real `claude -p` from `/tmp`: answered from the base and wrote a page + ran `index` (acceptEdits) |
-| Codex | `~/.codex/AGENTS.md` | reads anywhere in its sandbox; writes: `[sandbox_workspace_write] writable_roots = [BASE]` in `~/.codex/config.toml` (text insert, every other byte kept) [2]. With a permission profile (`default_permissions`) it prints the line to add instead | `.codex/memories/**/*.md`, `.codex/memories_*.sqlite` | `AccessTests.test_codex_*`; real `codex sandbox` from `/tmp` (workspace-write): read and wrote the base, a write next to it was refused |
-| Gemini CLI | `~/.gemini/GEMINI.md` | `context.includeDirectories: [BASE]` in `~/.gemini/settings.json` [3] | `GEMINI.md` (its saved memories), `**/memory*.md` | `AccessTests.test_gemini_and_qwen_include_directories` |
-| Qwen Code | `~/.qwen/QWEN.md` | `context.includeDirectories: [BASE]` in `~/.qwen/settings.json` [4] | `QWEN.md` | same test |
-| opencode | `~/.config/opencode/AGENTS.md` | lets agents out by default; where `opencode.json` has rules: an `external_directory` allow rule for `BASE/**` (V2 `permissions` list, last rule wins; V1 `permission.external_directory` object) [5] | no memory store of its own: the block makes it save in the base | `AccessTests.test_opencode_*` |
-| OpenClaw | `~/.openclaw/workspace/AGENTS.md` (when it exists) | no wall: its sandbox is off by default [6]; if you turn it on, bind the base into it | `MEMORY.md`, `USER.md`, `memory/*.md` | `CollectTests`, matrix test |
-| Hermes | `~/.hermes/SOUL.md`, `profiles/*/SOUL.md` (when they exist) | no wall: its file tools reach any path you can | `memories/*.md`, `memory_store.db` (facts) | matrix test; real `hermes chat -q` from `/tmp` answered from the base |
-| Windsurf | `~/.codeium/windsurf/memories/global_rules.md` | no file setting known: it asks, or add the base to the workspace | its memories are not plain files: not collected (the block makes it save in the base) | matrix test (a) |
-| Kiro | `~/.kiro/steering/skeleton-base.md` | no file setting known: add the base to the workspace when it asks | none of its own | matrix test (a) |
-| Cursor | needs you: paste `connect --print` into its User Rules | no file setting known: add the base to the workspace | not collected | listed as needs-user |
-| any AI-like tool (a folder in your home with `AGENTS.md`/`NAME.md` rules or a `memory` store) | its rules file, when it has one (else listed as needs-user) | the block gives the absolute path and says: if your tool blocks it, ask the user to allow it (with the exact setting of each tool above) | its memory folder is watched and collected | `ZeroTouchTests`, `AccessTests.test_pointer_block_tells_any_tool_how_to_get_access` |
+<!-- tools-matrix:start -->
+| tool | (a) finds the base | (b) read + write | (c) memory collected | MCP (`connect --mcp`) | notes | source |
+|---|---|---|---|---|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` | `permissions.additionalDirectories` + `Bash(python3 BASE/tools/brain.py *)` in `~/.claude/settings.json` | `~/.claude/projects/*/memory/*.md` | `mcpServers` in `~/.claude.json` (user scope) | its own: SessionEnd, PreCompact (+ PostToolUse with --kick); skills: reads only `~/.claude/skills`, not `~/.agents/skills` (not copied there: other tools read `~/.claude/skills` too and would load them twice); the base's AGENTS.md points to its `skills/` | code.claude.com/docs/en/memory, /permissions, /mcp, /hooks |
+| Codex (CLI, IDE and the ChatGPT desktop app, one Codex host) | `~/.codex/AGENTS.override.md` if it has text, else `~/.codex/AGENTS.md` | `[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml` | `~/.codex/memories/**/*.md`, `memories_v2/**/*.md`, `memories_*.sqlite` (off by default in Codex) | `[mcp_servers.skeleton-base]` in `~/.codex/config.toml` (shared by the desktop app) | none written (Codex hooks need your trust by hash); size check: Codex loads at most 32 KiB of AGENTS.md text, this file and the project's together (project_doc_max_bytes); skills: `~/.agents/skills` | learn.chatgpt.com/docs/agent-configuration/agents-md, /config-file/config-reference, /extend/mcp, /customization/memories |
+| Gemini CLI | `~/.gemini/GEMINI.md` | `context.includeDirectories` in `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` (its saved memories) | `mcpServers` in `~/.gemini/settings.json` | `~/.gemini` alone is not proof (Antigravity makes it too): the `gemini` program or its settings file must be there; skills: `~/.agents/skills` | github.com/google-gemini/gemini-cli docs/cli/gemini-md.md, docs/reference/configuration.md |
+| Qwen Code | `~/.qwen/QWEN.md` | `context.includeDirectories` in `~/.qwen/settings.json` | `~/.qwen/QWEN.md`, auto-memory `~/.qwen/projects/*/memory/**/*.md`, `~/.qwen/memories/**/*.md` | `mcpServers` in `~/.qwen/settings.json` | the block goes in QWEN.md, not `~/.qwen/rules/` (rules files lose HTML comments, so the marked block could not be found again); skills: `~/.agents/skills` | github.com/QwenLM/qwen-code docs/users/features/memory.md, rules.md, configuration/settings.md |
+| opencode (v1 and v2) | `~/.config/opencode/AGENTS.md` | v2: an `external_directory` allow rule in `permissions` (only where it has rules: v2 lets agents out by default); v1: `permission.external_directory` (its default asks) | none of its own | v2 `mcp.servers`, v1 `mcp` in `~/.config/opencode/opencode.json(c)` | skills: `~/.agents/skills` | opencode.ai/docs/permissions, /mcp-servers, /migrate-v1; opencode.ai/v1/docs |
+| Kilo Code CLI | `~/.config/kilo/AGENTS.md`; else the block in `~/.claude/CLAUDE.md` (it loads that file) | `permission.external_directory` in `~/.config/kilo/kilo.jsonc` (its default asks) | `~/.local/share/kilo/memory/*/*.md` (off by default in Kilo) | `mcp` in `~/.config/kilo/kilo.jsonc` | without its own `~/.config/kilo/AGENTS.md` it loads `~/.claude/CLAUDE.md`: the block there reaches it; skills: `~/.agents/skills` | kilo.ai/docs (llms.txt: global rules, permissions, memory, MCP) |
+| Grok Build | `~/.grok/rules/skeleton-base.md` | sandbox off by default (no wall); with a custom profile (`[sandbox] profile` in `~/.grok/config.toml`): its `read_write` in `~/.grok/sandbox.toml` | `~/.grok/memory/**/*.md` (off by default in Grok) | loads `~/.claude.json` servers; else `[mcp_servers.skeleton-base]` in `~/.grok/config.toml` | also runs the hooks in `~/.claude/settings.json` (ours are safe to run twice); skills: `~/.agents/skills` | docs.x.ai/build (features/project-rules, sandbox, mcp-servers, settings reference) |
+| GitHub Copilot CLI | `~/.copilot/instructions/skeleton-base.instructions.md` | needs you: only per project (`--add-dir`, `/add-dir` or `permissions-config.json`) | server-side (GitHub): not a local file, not collected | `mcpServers` in `~/.copilot/mcp-config.json` | runs a repo's `.claude/settings*.json` hooks (ours are safe to run twice); skills: `~/.agents/skills` | docs.github.com copilot-cli (custom instructions, config dir reference, hooks) |
+| OpenClaw | `~/.openclaw/workspace/AGENTS.md` (if it exists) | no wall (its sandbox is off by default) | `workspace/MEMORY.md`, `USER.md`, `DREAMS.md`, `memory/*.md` | needs you: `openclaw mcp` (config format not verified) | size check: OpenClaw injects at most 20,000 characters per bootstrap file; skills: `~/.agents/skills` | docs.openclaw.ai (agent workspace, memory, sandboxing) |
+| Hermes Agent | `~/.hermes/SOUL.md` (if it exists), `~/.hermes/profiles/*/SOUL.md` (if it exists) | no wall (its file tools reach any path you can) | `memories/*.md`, `memory_store.db` facts, the same in every profile | `mcp_servers` in `~/.hermes/config.yaml` | reads `~/.agents/skills` only when it is in `skills.external_dirs`; size check: Hermes cuts a context file at 20,000 characters | hermes-agent source (agent/prompt_builder.py, hermes_cli/config_defaults.py) |
+| Crush | `~/.config/crush/CRUSH.md`; `~/.config/AGENTS.md` when it is used (Crush and Amp both read it) | needs you: it asks per tool; there is no folder setting | none of its own | needs you: `mcp add` in its crushrc (syntax not verified) | skills: `~/.agents/skills` | github.com/charmbracelet/crush README, docs/config |
+| Goose | `~/.config/goose/.goosehints` | no wall | Memory extension files `~/.config/goose/memory/*` | an `extensions` entry (type stdio) in `~/.config/goose/config.yaml` | skills: `~/.agents/skills` | github.com/aaif-goose/goose documentation (config-files, goosehints, memory-mcp) |
+| Amp | `~/.config/amp/AGENTS.md`; `~/.config/AGENTS.md` when it is used (Crush and Amp both read it) | no wall | none local (threads are server-side) | `amp.mcpServers` in `~/.config/amp/settings.json` | skills: `~/.agents/skills` | ampcode.com/docs (agents-md, mcp, skills) |
+| Aider | `read:` in `~/.aider.conf.yml` -> `~/.config/skeleton-base/AGENTS.md` | needs you: it edits only files in its git repo (start it in the base to edit it) | none | none (Aider has no MCP) | no rules file: connect adds `~/.config/skeleton-base/AGENTS.md` to `read:` in `~/.aider.conf.yml` (a repo `.aider.conf.yml` with its own `read:` replaces it) | aider.chat/docs/usage/conventions.html, /config/aider_conf.html |
+| Factory Droid | `~/.factory/AGENTS.md`; `~/.agents/AGENTS.md` when it is used (Warp Agent CLI, Factory Droid and Cline all read it) | reads anywhere; writes: `sandbox.filesystem.allowWrite` in `~/.factory/settings.json` (used when its sandbox is on) | none of its own | `mcpServers` in `~/.factory/mcp.json` | reads `~/.factory/skills` (not `~/.agents/skills` as far as documented); size check: Droid loads at most 80,000 characters of AGENTS.md at start | docs.factory.com (harness/agents-md, autonomy-and-safety/sandbox, harness/mcp) |
+| Warp (Agent CLI; the app's rules live in Warp Drive) | `~/.agents/AGENTS.md` when it is used (Warp Agent CLI, Factory Droid and Cline all read it) | no wall | cloud (Agent Memory preview): not collected | reads the Claude Code and Codex MCP configs | the app's global rules are cloud settings: paste `connect --print` there by hand; skills: `~/.agents/skills` | docs.warp.dev (agents, warp-agent-cli, mcp) |
+| Cursor (editor and cursor-agent) | the `base-home` skill in `~/.agents/skills`; always-on: needs you (User Rules) | `additionalReadwritePaths` and `additionalReadPaths` in `~/.cursor/sandbox.json`; `Read(BASE/**)`, `Write(BASE/**)` in `~/.cursor/cli-config.json` when it exists | none (Memories were removed) | `mcpServers` in `~/.cursor/mcp.json` | User Rules are app settings, not a file: it finds the base through the `base-home` skill; for an always-on rule paste `connect --print` into Settings > Rules; runs the hooks in `~/.claude/settings.json` by default (ours are safe to run twice); skills: `~/.agents/skills` | cursor.com/docs (rules, reference/sandbox, cli/reference/permissions, context/mcp, skills, reference/third-party-hooks) |
+| Devin Local / Devin Desktop / Devin CLI (formerly Windsurf) | `~/.config/devin/AGENTS.md`; else the block in `~/.claude/CLAUDE.md` (it loads that file) | `permissions.allow` `Read(BASE/**)`, `Write(BASE/**)` in `~/.config/devin/config.json` | none (Cascade memories are legacy) | imports `~/.claude.json`; else `mcpServers` in `~/.config/devin/mcp_config.json` | it loads `~/.claude/CLAUDE.md` unless `read_config_from.claude` is false: the block there reaches it; imports the hooks in `~/.claude/settings.json` (ours are safe to run twice); skills: `~/.agents/skills` | docs.devin.ai (cli/extensibility/rules, cli/reference/permissions, read-config-from, mcp) |
+| Windsurf Cascade (legacy, now Devin Desktop) | `~/.codeium/windsurf/memories/global_rules.md` | no file setting | internal, not collected | - | - | docs.devin.ai/desktop/cascade (Cascade is the legacy agent) |
+| Kiro (IDE and kiro-cli) | `~/.kiro/steering/skeleton-base.md` | `fs_read` and `fs_write` allow rules in `~/.kiro/settings/permissions.yaml` | Kiro Memory is opaque: not collected | `mcpServers` in `~/.kiro/settings/mcp.json` | reads `~/.kiro/skills` (not `~/.agents/skills`) | kiro.dev/docs (steering, permissions, mcp/configuration, memory) |
+| Cline (VS Code, JetBrains, CLI) | `~/Documents/Cline/Rules/skeleton-base.md`; `~/.agents/AGENTS.md` when it is used (Warp Agent CLI, Factory Droid and Cline all read it) | needs you: only the all-or-nothing "Read all files" / "Edit all files" auto-approve, or add the base as a workspace folder | none native | `mcpServers` in `~/.cline/data/settings/cline_mcp_settings.json` | skills: `~/.agents/skills` | docs.cline.bot (customization/cline-rules, getting-started/config, features/auto-approve) |
+| Roo Code (discontinued 2026-05-15) | detected only, nothing written | - | - | - | - | github.com/RooCodeInc/Roo-Code-Docs docs/sunset.md |
+| Continue (extension and cn) | `~/.continue/rules/skeleton-base.md` | `Read(BASE/**)`, `Write(BASE/**)` in `allow` of `~/.continue/permissions.yaml` (cn) | none native | needs you: `mcpServers` in its config.yaml (a user-level block folder is not documented) | cn runs the hooks in `~/.claude/settings.json` (ours are safe to run twice); reads `.claude/skills` in the workspace only | docs.continue.dev (rules, cli/tool-permissions, mcp); continuedev/continue source |
+| Zed (its own agent) | `~/.config/zed/AGENTS.md` | needs you: no extra-folder setting (add the base as a project folder) | none | `context_servers` in `~/.config/zed/settings.json` (comments kept) | skills: `~/.agents/skills` | zed.dev/docs/ai (instructions, mcp, tools, skills) |
+| JetBrains Junie (CLI and IDE) | `~/.junie/AGENTS.md` | `readOutsideProject` and `fileEditing` allow rules in `~/.junie/allowlist.json` | none native | `mcpServers` in `~/.junie/mcp/mcp.json` | skills: `~/.agents/skills` | junie.jetbrains.com/docs (guidelines-and-memory, action-allowlist, junie-cli-mcp-configuration) |
+| Claude app (desktop) | needs you (account Instructions); MCP server | through the MCP server: reads the base, saves notes to `raw/inbox/mcp/` | server-side (your account): not collected | `mcpServers` in `~/.config/Claude/claude_desktop_config.json` | rules and memory live in your account: paste `brief --short` into Settings > Instructions; with `connect --mcp` it reaches the base through the MCP server | modelcontextprotocol.io/docs/develop/connect-local-servers; support.claude.com |
+<!-- tools-matrix:end -->
 
-Matrix test: `AccessTests.test_every_known_tool_is_found_readable_writable_and_collected` (fake HOME, every tool
-at once, then `disconnect` gives the home back byte-identical). `connect --print` prints the block and the notes.
+Any other AI-like tool (a folder in your home with `AGENTS.md`/`NAME.md` rules or a `memory` store) is found by the
+watcher: its rules file gets the block when it has one (else it is listed as needs-user), and its memory folder is
+watched and collected. The block names the absolute base path and says: if your tool blocks it, ask the user to
+allow it. Evidence: `EveryToolTests` (every row above at once in a fake home with fake programs on `PATH`: (a),
+(b), (c), MCP, one block per file, comments kept, a second `connect` changes nothing, `disconnect` gives the home
+back byte-identical), `SharedFileTests`, `DetectionTests`, `WriterTests`, `ZeroTouchTests`, `AccessTests`. Real
+runs: Claude Code (`claude -p` from `/tmp` answered from the base and wrote to it), Codex (`codex sandbox` from
+`/tmp` read and wrote the base), Hermes (`hermes chat -q` from `/tmp`). The other rows are checked against their
+docs (sources in the table) and in tests, not with the real program.
+
+**Hooks run by other tools.** Grok Build, Cursor, Devin, Continue `cn` and Copilot CLI also run the hooks in
+`~/.claude/settings.json` (or a repo's `.claude/settings.json`), with their own payloads. Ours are safe to run
+twice and by anyone: `collect` takes a lock and skips every item it already has (by content hash), prints nothing
+(hosts that parse hook output as JSON are not disturbed), ignores its input and always exits 0 or 1, never 2
+(which would block the tool). Test: `HookTwiceTests` runs the hook five times at once with Claude, Cursor and
+Devin payloads from another folder: every item is collected once.
 
 **Any provider.** Nothing in the base needs a model: `init`, `connect`, `collect`, `watch`, `map`, `lint`,
-`index`, `check` are plain Python with no network call and no model or provider name. The pointer block and
+`index`, `check`, `mcp` are plain Python with no network call and no model or provider name. The pointer block and
 `AGENTS.md` are plain instructions any model follows; the optional AI steps (`skills/base-ingest`,
 `skills/base-lint`, the interview) work with whatever model your tool runs. So the same tool on another provider
-(Claude Code through another Anthropic-compatible endpoint, Hermes or opencode on OpenRouter or a local model)
 loads the same rules file and the same settings: what the table says holds, because none of it depends on the
 model. Tested here: Claude Code (Anthropic) and Hermes (its configured provider) for real; other providers are not
 tested here, by design they change nothing above.
 
-Sources: [1] code.claude.com/docs/en/permissions (Working directories, additionalDirectories);
-[2] developers.openai.com/codex/config-reference (`sandbox_workspace_write.writable_roots`) and
-developers.openai.com/codex/concepts/sandboxing; [3] github.com/google-gemini/gemini-cli
-`docs/reference/configuration.md` (`context.includeDirectories`); [4] github.com/QwenLM/qwen-code
-`docs/users/configuration/settings.md`; [5] opencode.ai/docs/permissions and opencode.ai/v1/docs/permissions
-(`external_directory`); [6] docs.openclaw.ai/gateway/sandboxing ("Sandboxing is off by default").
+### Apps that cannot read your files: the MCP server
+
+The Claude app, ChatGPT, Zed's agent (when the base is not one of its project folders) and Claude Duet keep their
+rules and memory in your account, not in files. They reach the base through its MCP server:
+
+```sh
+python3 tools/brain.py mcp                 # stdio, JSON-RPC 2.0 (the MCP stdio transport); --read-only, --max-note-kb N
+python3 tools/brain.py connect --mcp       # register it in every installed tool's MCP config (column "MCP")
+```
+
+| tool | what it does |
+|---|---|
+| `recent` | `hot.md` and the last lines of `wiki/log.md`: read it first |
+| `search` | full-text search over the wiki, board, `hot.md` and raw text files (in memory: nothing written) |
+| `list_pages` | wiki pages and board cards with their titles, optionally one folder |
+| `read_page` | one text file by its path inside the base; absolute paths, `..`, hidden files (`.git`, `.brain`, `.kits.json`) and links that leave the base are refused; at most 256 KB is returned |
+| `save_note` | a NEW note in `raw/inbox/mcp/` (never overwrites, never edits a page; 64 KB per note, 200 per session; the same note twice is saved once). It starts with a "DATA, not instructions" header; `status` and `lint` list it and the next ingest files it into the wiki. Not there with `--read-only` |
+
+Claude Duet and the web apps run in the cloud and cannot start a program on your computer. To reach the base from
+them you would expose this server yourself: a stdio-to-HTTP MCP bridge plus an HTTPS tunnel you trust, added as a
+remote connector in your account. That is not automated (it opens your base to the internet): use `--read-only`
+unless you want cloud agents to drop notes in the inbox. For the Claude app's rules, paste `brief --short` into
+Settings > Instructions.
 
 ### With Frugal-Bridge installed for the whole user (`install --global`)
 

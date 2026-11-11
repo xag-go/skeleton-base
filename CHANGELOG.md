@@ -2,6 +2,53 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.4.0 - 2026-11-11
+- Every known harness, one row each (26: Claude Code, Codex and the ChatGPT desktop app, Gemini CLI, Qwen Code,
+  opencode v1/v2, Kilo Code, Grok Build, Copilot CLI, OpenClaw, Hermes, Crush, Goose, Amp, Aider, Factory Droid,
+  Warp, Cursor, Devin Local/Desktop, Windsurf Cascade (legacy), Kiro, Cline, Roo Code (discontinued: detected
+  only), Continue, Zed, Junie, the Claude app). For each: where it finds the base, how it reads and writes it from
+  any folder, which of its memories are collected, how it takes the MCP server, and what needs you. The README
+  matrix is generated from that table (`connect --matrix`; a test keeps them equal), `connect --print` lists it
+  with your base path.
+- The pointer block goes into ONE file each tool loads: its own rules folder where it has one
+  (`~/.grok/rules/`, `~/.copilot/instructions/`, `~/.continue/rules/`, `~/Documents/Cline/Rules/`, Kiro steering),
+  a shared file once for all its readers (`~/.agents/AGENTS.md`: Warp CLI, Droid, Cline; `~/.config/AGENTS.md`:
+  Crush, Amp), and no second copy for Kilo and Devin, which already load `~/.claude/CLAUDE.md`. A block that moved
+  to a shared file is taken out of the member's own file. Codex: `AGENTS.override.md` when it has text. Qwen:
+  `QWEN.md`, not `rules/*.md` (HTML comments are stripped there). Aider: `read:` in `~/.aider.conf.yml` names
+  `~/.config/skeleton-base/AGENTS.md`. Blocks of tools no longer found are kept current, never re-added.
+- Size check: a WARNING when a rules file is over what the tool loads (Codex 32 KiB with the project's files,
+  warned over half; Hermes and OpenClaw 20,000 characters; Droid 80,000).
+- Install detection: the tool's own config file (not one we created), or its program on `PATH` plus its folder.
+  A shared folder alone is not a tool: `~/.gemini` made by Antigravity no longer counts as Gemini CLI.
+- Read + write from any folder through each tool's own user-level setting: Kilo `permission.external_directory`,
+  Grok `read_write` of your custom sandbox profile, Droid `sandbox.filesystem.allowWrite`, Cursor `sandbox.json`
+  and `cli-config.json`, Devin `permissions.allow`, Kiro `permissions.yaml`, Continue `permissions.yaml`, Junie
+  `allowlist.json`; opencode v1 (`permission`, its default asks) and v2 (`permissions` list) told apart from the
+  file or `opencode --version`. Format-aware writers: JSONC (comments, trailing commas, layout kept), TOML (checked
+  text inserts), YAML (one safe line under a top-level key, else a note). Every entry recorded; `disconnect` gives
+  the exact old bytes back, or takes out only our entries when the file changed (also after another program
+  reformatted it). Records from 1.3.5 are still undone the old way.
+- Memories collected from Qwen's auto-memory (`~/.qwen/projects/*/memory`, `~/.qwen/memories`), Kilo
+  (`~/.local/share/kilo/memory`), Goose's Memory extension, Grok (`~/.grok/memory`), Codex `memories_v2`, OpenClaw
+  `DREAMS.md`; the watcher watches them too, and wakes up when a tool's config file appears.
+- `brain.py mcp`: the base as an MCP server (stdio, JSON-RPC 2.0, standard library): `recent`, `search`,
+  `list_pages`, `read_page` (inside the base only: no absolute paths, `..`, hidden files or links out; 256 KB at
+  most), `save_note` (a NEW note in `raw/inbox/mcp/` with a DATA header, never overwrites; size and count
+  limits); `--read-only`. `connect --mcp` registers it in each tool's MCP config (Claude Code `~/.claude.json`,
+  Codex/ChatGPT app `config.toml`, Gemini, Qwen, Cursor, Kiro, Junie, Cline, Copilot, Droid, Amp, Zed, Kilo,
+  opencode, Hermes, Goose, the Claude app); tools that import Claude's servers (Devin, Grok, Warp) are not given a
+  second copy. Remote use (Claude Duet, web apps) is documented, not automated (it needs a tunnel you trust).
+- The base's skills are installed once in `~/.agents/skills/` (plus a `base-home` skill naming the base: Cursor
+  finds the base this way), recorded, removed by `disconnect`; a skill of yours with the same name is never
+  overwritten.
+- Hooks run by other tools (Grok, Cursor, Devin, Continue cn, Copilot read `~/.claude/settings.json`): tested safe
+  to run twice, at once, from another folder, with other payloads (exit 0, no output, each item once).
+- Tests: 18 new (125): writers, every tool at once (connect --mcp, idempotent, byte-identical disconnect),
+  changed-after-connect, shared files, detection, size caps, opencode versions, hooks run twice, a real JSON-RPC
+  session over stdio, path traversal and limits, read-only mode, README matrix. Tests now run with a PATH that
+  holds only fake programs, so the tools installed on the test machine no longer change the results.
+
 ## v1.3.5 - 2026-11-11
 - Any tool can read and write the base from any folder. `connect` (and the watcher's auto-connect) adds the base
   to each tool's own user-level allow list: Claude Code `permissions.additionalDirectories` (plus a
