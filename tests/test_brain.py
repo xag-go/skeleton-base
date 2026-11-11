@@ -1051,3 +1051,367 @@ class ClaudePermissionTests(Base):
         self.assertEqual(k["json_added"][".claude/settings.json"], ["Bash(python3 tools/brain.py *)"])
         run(BRAIN, "uninstall", own)
         self.assertEqual(json.loads((own / ".claude/settings.json").read_text()), mine)
+
+
+# ---------------------------------------------------------------- instant and zero-touch (watch)
+QUIET = "0.3"     # short debounce for tests (default 2 s)
+
+
+def proc_status(pid):
+    with open(f"/proc/{pid}/status") as f:
+        kv = dict(l.split(":", 1) for l in f if ":" in l)
+    return {k: int(kv[k].split()[0]) for k in ("VmRSS", "VmHWM")}
+
+
+class WatchBase(HomeBase):
+    def start(self, *extra):
+        self.log = self.tmp / "watch.log"
+        e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home))
+        e.pop("BRAIN_ROOT", None)
+        w = subprocess.Popen([sys.executable, str(self.base / "tools" / "brain.py"), "watch", "--base", str(self.base),
+                              "--quiet-s", QUIET, "--max-s", "2", "--log", str(self.log), *extra],
+                             env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.stop, w)
+        self.w = w
+        self.wait(lambda: len(self.runs()) >= 1, 10, "startup run")
+        return w
+
+    def stop(self, w):
+        if w.poll() is None:
+            w.terminate()
+            try:
+                w.wait(5)
+            except subprocess.TimeoutExpired:
+                w.kill(); w.wait()
+
+    def events(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(l) for l in self.log.read_text().splitlines() if l.strip()]
+
+    def runs(self):
+        return [e for e in self.events() if e["kind"] == "run"]
+
+    def wait(self, cond, timeout, what):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if cond():
+                return time.time() - t0
+            time.sleep(0.02)
+        self.fail(f"timeout after {timeout} s waiting for {what}; log:\n" +
+                  (self.log.read_text()[-3000:] if self.log.exists() else ""))
+
+    def has(self, token):
+        d = self.base / "raw/inbox/collected"
+        return d.is_dir() and any(token in f.read_text(errors="replace") for f in d.rglob("*.md"))
+
+    def collected_within(self, token, secs=5):
+        return self.wait(lambda: self.has(token), secs, f"'{token}' collected")
+
+    def settle(self, quiet=1.5, timeout=15):
+        """Wait until no run happened for QUIET seconds."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            n = len(self.runs())
+            time.sleep(quiet)
+            if len(self.runs()) == n:
+                return
+        self.fail("watcher never settled")
+
+    def git(self, *a):
+        return subprocess.run(["git", "-C", str(self.base), *a], capture_output=True, text=True)
+
+
+class WatchTests(WatchBase):
+    def test_write_and_atomic_rename_collected_fast_then_index_map_commit(self):
+        self.make_stores()
+        self.git("init", "-q"); self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "base")
+        self.start()
+        self.settle()
+        self.assertTrue(self.has("hermes memory line"), "startup run collects what is already there")
+        commits0 = int(self.git("rev-list", "--count", "HEAD").stdout)
+        proj = next((self.home / ".claude/projects").glob("*/memory"))
+        t0 = time.time()
+        (proj / "new_fact.md").write_text("- token-write-1 the client prefers mornings\n")
+        self.collected_within("token-write-1")
+        self.assertLess(time.time() - t0, 5)
+        self.settle()
+        f = self.home / ".hermes/memories/MEMORY.md"            # atomic rename, like most tools save
+        tmp = f.with_name(".MEMORY.md.tmp")
+        tmp.write_text(f.read_text() + "\ntoken-rename-2\n"); os.replace(tmp, f)
+        self.assertLess(self.collected_within("token-rename-2"), 5)
+        self.settle()
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD").stdout), commits0 + 2,
+                         self.git("log", "--oneline").stdout)
+        self.assertIn("watch: collect 1 new", self.git("log", "-1", "--format=%s").stdout)
+        self.assertEqual(self.git("status", "--porcelain", "raw", "wiki", "maps", ".brain").stdout, "")
+        self.assertIn("raw/inbox/collected/", self.git("show", "--stat", "HEAD").stdout)
+        self.assertTrue((self.base / "maps/brain.html").is_file())
+        n = len(self.runs())
+        time.sleep(2)
+        self.assertEqual(len(self.runs()), n, "no run without a change")
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD").stdout), commits0 + 2, "commit only if new")
+
+    def test_sqlite_wal_only_write_and_read_only_open_does_not_loop(self):
+        self.make_stores()
+        db = self.home / ".hermes/memory_store.db"
+        live = sqlite3.connect(db)
+        self.addCleanup(live.close)
+        live.execute("PRAGMA journal_mode=WAL"); live.execute("PRAGMA wal_autocheckpoint=0")
+        self.start()
+        self.settle()
+        st0 = db.stat()
+        live.execute("INSERT INTO facts VALUES (7, 'token-wal-3 lives only in the wal', 'x', '', "
+                     "'2026-11-11 08:00:00', '2026-11-11 08:00:00')")
+        live.commit()
+        self.assertLess(self.collected_within("token-wal-3"), 5)
+        self.assertEqual((db.stat().st_size, db.stat().st_mtime_ns), (st0.st_size, st0.st_mtime_ns),
+                         "the write must have gone to the -wal only")
+        self.assertGreater((self.home / ".hermes/memory_store.db-wal").stat().st_size, 0)
+        # our own read-only open touches -wal/-shm: that must not start another run (lab bug: loop every 2 s)
+        self.settle()
+        n = len(self.runs())
+        time.sleep(10)
+        self.assertEqual(len(self.runs()), n, "self-trigger loop while idle")
+        rss = proc_status(self.w.pid)
+        self.assertLess(rss["VmRSS"], 30 * 1024, rss)
+        self.assertLess(rss["VmHWM"], 30 * 1024, rss)
+        print(f"\n  watcher RSS {rss['VmRSS'] / 1024:.1f} MB (peak {rss['VmHWM'] / 1024:.1f} MB)", file=sys.stderr)
+
+    def test_missing_dir_created_later_and_deleted_dir_recreated(self):
+        (self.home / ".hermes/memories").mkdir(parents=True)
+        self.start()
+        self.settle()
+        d = self.home / ".openclaw/workspace/memory"            # not there at start
+        d.mkdir(parents=True)
+        (d / "2026-11-11.md").write_text("token-late-4 openclaw daily note\n")
+        self.assertLess(self.collected_within("token-late-4"), 5)
+        m = self.home / ".hermes/memories"
+        shutil.rmtree(m)
+        time.sleep(0.3)
+        m.mkdir()
+        (m / "USER.md").write_text("token-recreated-5\n")
+        self.assertLess(self.collected_within("token-recreated-5"), 5)
+        (self.home / ".openclaw/workspace/MEMORY.md").write_text("token-second-6\n")
+        self.assertLess(self.collected_within("token-second-6"), 5)
+
+    def test_burst_of_300_files_is_one_or_two_runs(self):
+        self.make_stores()
+        self.start()
+        self.settle()
+        n0 = len(self.runs())
+        proj = next((self.home / ".claude/projects").glob("*/memory"))
+        for i in range(300):
+            (proj / f"burst_{i:03d}.md").write_text(f"token-burst-{i:03d}\n")
+        self.collected_within("token-burst-299", 10)
+        self.settle()
+        runs = self.runs()[n0:]
+        self.assertIn(len(runs), (1, 2), runs)
+        self.assertEqual(sum(r.get("new", 0) for r in runs), 300)
+
+    def test_kick_file_written_by_a_hook_starts_a_run(self):
+        self.start()
+        self.settle()
+        n = len(self.runs())
+        (self.base / ".brain/kick").write_text("1\n")
+        self.wait(lambda: len(self.runs()) > n, 5, "kick run")
+        self.assertIn("kick", self.runs()[-1]["why"])
+
+    def test_poll_fallback(self):
+        (self.home / ".hermes/memories").mkdir(parents=True)
+        self.start("--poll", "--poll-s", "0.5")
+        self.assertEqual(self.events()[0]["mode"], "poll")
+        self.settle()
+        (self.home / ".hermes/memories/MEMORY.md").write_text("token-poll-7\n")
+        self.assertLess(self.collected_within("token-poll-7"), 5)
+        self.settle()
+        n = len(self.runs())
+        time.sleep(2)
+        self.assertEqual(len(self.runs()), n, "polling must not see our own run as a change")
+
+    def test_add_reloads_live_generic_sqlite_and_remove(self):
+        self.start()
+        self.settle()
+        d = self.home / ".newtool" / "memory"
+        d.mkdir(parents=True)
+        con = sqlite3.connect(d / "store.db")
+        self.addCleanup(con.close)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, access_count INT, last_accessed TEXT, "
+                    "embedding BLOB)")
+        con.commit()
+        r = self.ok("watch", "--add", str(d), "--source", "newtool")
+        self.assertIn("added ~/.newtool/memory as source 'newtool'", r.stdout)
+        cfg = json.loads((self.base / ".brain/watch.json").read_text())
+        self.assertEqual(cfg["extra"][0]["root"], "~/.newtool/memory")
+        self.wait(lambda: any("config" in r["why"] for r in self.runs()), 5, "live reload")
+        con.execute("INSERT INTO notes (body, access_count, last_accessed) VALUES "
+                    "('token-added-8 the user likes green', 0, '2026-11-11')")
+        con.commit()
+        self.assertLess(self.collected_within("token-added-8"), 5)
+        files = [f for f in self.collected() if f.startswith("newtool/")]
+        self.assertEqual(len(files), 1, files)
+        t = (self.base / "raw/inbox/collected" / files[0]).read_text()
+        self.assertIn("origin: ~/.newtool/memory/store.db#notes/1", t)
+        self.assertNotIn("access_count", t)
+        self.settle()
+        con.execute("UPDATE notes SET access_count = access_count + 1, last_accessed = '2026-11-12'")
+        con.commit()
+        self.settle()
+        self.assertEqual(len([f for f in self.collected() if f.startswith("newtool/")]), 1,
+                         "a read-only counter update is not new knowledge")
+        out = self.ok("watch", "--list").stdout
+        self.assertRegex(out, r"newtool +ok +added +~/.newtool/memory")
+        self.ok("watch", "--remove", "~/.newtool/memory")
+        self.assertNotIn("extra", json.loads((self.base / ".brain/watch.json").read_text()))
+        self.assertEqual(self.hb("watch", "--remove", "~/.newtool/memory").returncode, 1)
+
+
+class ZeroTouchTests(WatchBase):
+    def test_connect_watch_writes_service_kick_hook_and_disconnect_restores(self):
+        settings = '{"model": "x"}'
+        self.write(self.home, ".claude/settings.json", settings)
+        home0 = tree(self.home)
+        r = self.ok("connect", "--watch", "--kick")
+        u = self.home / ".config/systemd/user"
+        svc = (u / "skeleton-base-watch.service").read_text()
+        for line in ("Type=simple", "Restart=on-failure", "MemoryMax=40M", "Nice=10", "WantedBy=default.target",
+                     f"watch --base {self.base}\n"):
+            self.assertIn(line, svc)
+        self.assertTrue((u / "skeleton-base-collect.timer").is_file(), "daily timer stays as a safety net")
+        self.assertIn("systemctl --user daemon-reload && systemctl --user enable --now "
+                      "skeleton-base-watch.service skeleton-base-collect.timer", r.stdout)
+        s = json.loads((self.home / ".claude/settings.json").read_text())
+        post = s["hooks"]["PostToolUse"]
+        self.assertEqual(post[0]["matcher"], "Write|Edit")
+        kick = post[0]["hooks"][0]["command"]
+        self.assertIn(f"{self.base}/.brain/kick", kick)
+        self.assertIn("SessionEnd", s["hooks"])
+        # the hook really pokes the watcher: memory path in -> kick written; other path -> nothing, exit 0
+        p = subprocess.run(["sh", "-c", kick], input='{"tool_input": {"file_path": "/x/memory/a.md"}}',
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue((self.base / ".brain/kick").is_file())
+        (self.base / ".brain/kick").unlink()
+        p = subprocess.run(["sh", "-c", kick], input='{"tool_input": {"file_path": "/x/src/a.py"}}',
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertFalse((self.base / ".brain/kick").exists())
+        snap = tree(self.home)
+        self.ok("connect", "--watch", "--kick")
+        self.assertEqual(snap, tree(self.home), "idempotent")
+        r = self.ok("disconnect")
+        self.assertIn("systemctl --user disable --now skeleton-base-watch.service", r.stdout)
+        self.assertEqual(home0, tree(self.home))
+        self.assertEqual((self.home / ".claude/settings.json").read_text(), settings)
+
+    def test_auto_connect_known_unknown_non_ai_needs_user_then_disconnect_byte_identical(self):
+        self.write(self.home, ".claude/CLAUDE.md", "# my rules\n")
+        (self.home / ".hermes/memories").mkdir(parents=True)     # Hermes without SOUL.md: needs-user
+        home0 = tree(self.home)
+        self.ok("connect", "--watch", "--kick")
+        self.start()
+        self.settle()
+        user = {}                                                 # everything the user (their tools) writes
+
+        def put(r, text):
+            p = self.write(self.home, r, text); user[r] = text
+            return p
+        # 1. a known tool installed later: Qwen Code
+        (self.home / ".qwen").mkdir()
+        time.sleep(0.2)
+        q = put(".qwen/QWEN.md", "## Qwen Added Memories\n- token-qwen-9 prefers tea\n")
+        self.assertLess(self.collected_within("token-qwen-9"), 5)
+        self.wait(lambda: "<!-- base-folder:start v2 -->" in q.read_text(), 5, "qwen pointer")
+        self.assertTrue(q.read_text().startswith(user[".qwen/QWEN.md"] + "\n<!-- base-folder:start v2 -->\n"))
+        # 2. an unknown tool that looks like an AI tool: rules file + memory dir
+        a = self.home / ".acme-ai"
+        a.mkdir(); time.sleep(0.2)
+        put(".acme-ai/memories/user.md", "token-acme-10 remembers the user\n")
+        ag = put(".acme-ai/AGENTS.md", "# acme rules\n")
+        self.assertLess(self.collected_within("token-acme-10"), 5)
+        self.wait(lambda: "base-folder:start" in ag.read_text(), 5, "acme pointer")
+        # 3. not an AI tool: untouched
+        nt = self.home / ".notatool"
+        nt.mkdir(); (nt / "data.bin").write_bytes(b"\0x"); user[".notatool/data.bin"] = b"\0x"
+        # 4. AI-like (memory store) but no rules file: memory watched, tool listed as needs-user
+        (self.home / ".newtool").mkdir(); time.sleep(0.2)
+        con = sqlite3.connect(self.home / ".newtool/memory.db")
+        con.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, text TEXT)")
+        con.execute("INSERT INTO m (text) VALUES ('token-newtool-11 a fact')"); con.commit(); con.close()
+        user[".newtool/memory.db"] = (self.home / ".newtool/memory.db").read_bytes()
+        self.assertLess(self.collected_within("token-newtool-11", 8), 8)
+        self.settle()
+        self.assertEqual(sorted(os.listdir(nt)), ["data.bin"])
+        tools = json.loads((self.base / ".brain/watch.json").read_text())["tools"]
+        self.assertEqual({k: v["state"] for k, v in tools.items()},
+                         {".claude": "connected", ".qwen": "connected", ".acme-ai": "connected",
+                          ".hermes": "needs-user", ".newtool": "needs-user"})
+        self.assertNotIn(".notatool", tools)
+        out = self.ok("watch", "--list").stdout
+        self.assertRegex(out, r"needs-user ~/.hermes\n +why: Hermes loads only ~/.hermes/SOUL.md")
+        self.assertRegex(out, r"needs-user ~/.newtool")
+        self.assertIn("needs-user: 2", out)
+        # Hermes gets its pointer as soon as there is a SOUL.md
+        soul = put(".hermes/SOUL.md", "You are a calm assistant.\n")
+        self.wait(lambda: "base-folder:start" in soul.read_text(), 5, "hermes pointer")
+        self.settle()
+        n = len(self.runs())
+        time.sleep(3)
+        self.assertEqual(len(self.runs()), n, "auto-connect must not loop")
+        self.stop(self.w)
+        self.ok("disconnect")
+        exp = dict(home0)
+        for r, text in user.items():
+            data = text if isinstance(text, bytes) else text.encode()
+            exp[r] = hashlib.sha256(data).hexdigest()
+            for par in pathlib.PurePosixPath(r).parents:
+                if str(par) != ".":
+                    exp.setdefault(str(par), "dir")
+        self.assertEqual(exp, tree(self.home))
+
+    def test_watch_without_connect_does_not_touch_home(self):
+        (self.home / ".qwen").mkdir()
+        home0 = tree(self.home)
+        self.start()
+        self.settle()
+        (self.home / ".acme-ai").mkdir()
+        (self.home / ".acme-ai/AGENTS.md").write_text("# rules\n")
+        self.settle()
+        exp = dict(home0, **{".acme-ai": "dir",
+                             ".acme-ai/AGENTS.md": hashlib.sha256(b"# rules\n").hexdigest()})
+        self.assertEqual(exp, tree(self.home))
+
+
+class WatchCollectTests(HomeBase):
+    def test_hermes_profiles_are_built_in(self):
+        self.write(self.home, ".hermes/profiles/work/memories/MEMORY.md", "token-profile-12\n")
+        con = sqlite3.connect(self.home / ".hermes/profiles/work/memory_store.db")
+        con.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT, tags TEXT, "
+                    "created_at TEXT, updated_at TEXT)")
+        con.execute("INSERT INTO facts VALUES (1, 'token-profile-fact-13', 'c', '', '2026-11-01', '2026-11-01')")
+        con.commit(); con.close()
+        self.ok("collect")
+        texts = "".join((self.base / "raw/inbox/collected" / f).read_text() for f in self.collected())
+        self.assertIn("token-profile-12", texts)
+        self.assertIn("origin: ~/.hermes/profiles/work/memory_store.db#facts/1", texts)
+        out = self.ok("watch", "--list").stdout
+        self.assertIn("~/.hermes/profiles  */memories/*.md */memory_store.db", out)
+
+    def test_discover_suggests_and_changes_nothing(self):
+        self.make_stores()
+        self.write(self.home, ".othertool/data/memory/notes.md", "an uncovered memory\n")
+        home0, base0 = tree(self.home), tree(self.base, skip=())
+        out = self.ok("watch", "--discover").stdout
+        self.assertIn("~/.othertool/data/memory", out)
+        self.assertNotIn(".hermes/memories", out, "covered locations are not suggested")
+        self.assertEqual((home0, base0), (tree(self.home), tree(self.base, skip=())))
+
+    def test_add_refuses_the_base_and_single_file_roots_work(self):
+        self.assertEqual(self.hb("watch", "--add", str(self.base / "raw")).returncode, 1)
+        self.write(self.home, "notes/ai-memory.md", "token-file-14\n")
+        self.ok("watch", "--add", "~/notes/ai-memory.md")
+        self.ok("collect")
+        self.assertTrue(any(f.startswith("notes/") for f in self.collected()), self.collected())
+        self.assertIn("notes", self.ok("collect", "--only", "notes").stdout + "notes")
