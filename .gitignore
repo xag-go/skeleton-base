@@ -8,6 +8,8 @@
 secrets/
 # caches and generated indexes
 .brain/search.db
+.brain/backups/
+.brain/collector.lock
 .base-folder/
 __pycache__/
 *.pyc
