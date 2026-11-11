@@ -1731,7 +1731,7 @@ class FrugalGlobalTests(Base):
         self.assertEqual(reg0, (self.fh / "global.json").read_bytes(), "Frugal not run for a base it does not use")
 
     def test_base_path_with_spaces_and_frugal(self):
-        """Frugal-Bridge 6 reads `Path: (\\S+)` and cannot follow a quoted path with spaces: the base says so and
+        """An older Frugal-Bridge reads `Path: (\\S+)` and cannot follow a quoted path with spaces: the base says so and
         Frugal keeps working on its own user file. A Frugal-Bridge that reads quoted paths follows the base."""
         self.frugal_install()
         (self.fh / "USER.md").write_text(FAKE_USER)

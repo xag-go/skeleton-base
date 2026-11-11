@@ -177,10 +177,11 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
   the base block, then runs Frugal-Bridge's `install --global --hosts TOOL` for that tool alone, when Frugal-Bridge
   uses this base (`global.json` `base`), supports that tool (Claude Code, Codex, Gemini CLI, opencode, Hermes) and
   does not have it yet. The new tool gets both blocks, base first; the other tools' files are not touched.
-- **Base path with spaces:** Frugal-Bridge up to version 6 reads the `Path:` line only up to the first space, so
-  it cannot find a base whose path has one. `connect` then says so, and Frugal-Bridge keeps its own `USER.md` (both
-  kits still work, but with two user files). A Frugal-Bridge that reads quoted `Path:` values follows the base like
-  any other. Until then, keep the base in a path without spaces if you use both.
+- **Base path with spaces:** older Frugal-Bridge builds (without quoted `Path:` support) read the `Path:` line
+  only up to the first space, so they cannot find a base whose path has one. `connect` then says so, and
+  Frugal-Bridge keeps its own `USER.md` (both kits still work, but with two user files). A Frugal-Bridge that reads
+  quoted `Path:` values follows the base like any other. With an older one, keep the base in a path without spaces
+  if you use both.
 - **Block order** in every user-level file: the base block first, Frugal-Bridge's block after it. When Frugal's
   block is already there, the base block is inserted in front of it; Frugal's bytes are never changed by the base.
 - **`disconnect` / `uninstall`** while Frugal-Bridge uses the base: the user slot is written back to its `USER.md`

@@ -7,8 +7,8 @@ Changes to the skeleton structure and tools (not to anyone's content).
   quote, backslash, backtick or `$` is wrapped in the first of `"` `'` `` ` `` it does not contain, no escaping
   (`Path: "/home/me/My Base"`). The `cd` command in the block is shell-quoted (hooks already were), and the systemd
   units escape `ExecStart=` for systemd (`%%`, `$$`, `\\`, `\"`, double quotes around a word with a space). A path
-  with a line break is refused for the units. Frugal-Bridge up to version 6 cannot read such a `Path:` line: `connect`
-  says so and Frugal keeps its own user file (README).
+  with a line break is refused for the units. Older Frugal-Bridge builds (without quoted `Path:` support) cannot read
+  such a line: `connect` says so and Frugal keeps its own user file (README).
 - Zero-touch with Frugal-Bridge: when the watcher (or `connect`) connects a NEW tool and Frugal-Bridge uses this
   base, it runs Frugal's `install --global --hosts TOOL` for that tool alone, if Frugal supports it and does not
   have it yet. The new tool gets both blocks, base first.
