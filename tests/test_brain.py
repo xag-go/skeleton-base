@@ -573,3 +573,254 @@ class FrugalCoexistenceTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- base grows with every tool memory
+import sqlite3  # noqa: E402
+
+BLOCK_V1 = ("<!-- base-folder:start v1 -->\n## Old pointer\nPath: ~/old-base\n<!-- base-folder:end -->")
+
+
+class HomeBase(Base):
+    """A fresh base plus a fake HOME; every command runs with HOME=fake."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.base = self.fresh()
+
+    def hb(self, *args):
+        return run(self.base / "tools" / "brain.py", *args, env={"HOME": str(self.home)})
+
+    def ok(self, *args):
+        r = self.hb(*args)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def collected(self):
+        d = self.base / "raw/inbox/collected"
+        return sorted(p.relative_to(d).as_posix() for p in d.rglob("*.md")) if d.is_dir() else []
+
+    def make_stores(self):
+        h = self.home
+        enc = "".join(c if c.isalnum() else "-" for c in str(h))
+        self.write(h, f".claude/projects/{enc}-code-project-a/memory/MEMORY.md", "- Project A ships on Friday\n")
+        self.write(h, f".claude/projects/{enc}/memory/user-role.md", "The user is a sample engineer\n")
+        self.write(h, ".codex/memories/notes/topic.md", "codex markdown memory\n")
+        con = sqlite3.connect(h / ".codex/memories_1.sqlite")
+        con.execute("CREATE TABLE stage1_outputs (thread_id TEXT PRIMARY KEY, source_updated_at INTEGER, "
+                    "raw_memory TEXT, rollout_summary TEXT)")
+        con.execute("INSERT INTO stage1_outputs VALUES ('t-1', 1762000000, 'codex raw memory one', 'summary one')")
+        con.commit(); con.close()
+        self.write(h, ".gemini/GEMINI.md", "## Gemini Added Memories\n- likes short answers\n")
+        self.write(h, ".hermes/memories/MEMORY.md", "hermes memory line\n")
+        con = sqlite3.connect(h / ".hermes/memory_store.db")
+        con.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT, tags TEXT, "
+                    "created_at TEXT, updated_at TEXT)")
+        con.execute("INSERT INTO facts VALUES (1, 'Client Example Co pays on day 30', 'client', 'billing', "
+                    "'2026-10-01 10:00:00', '2026-10-02 10:00:00')")
+        con.commit(); con.close()
+        self.write(h, ".openclaw/workspace/MEMORY.md", "openclaw long-term memory\n")
+        self.write(h, ".openclaw/workspace/USER.md", "openclaw user file\n")
+        self.write(h, ".openclaw/workspace/memory/2026-11-10.md", "openclaw daily note\n")
+
+
+class CollectTests(HomeBase):
+    def test_collects_every_kind_then_dedupes(self):
+        self.make_stores()
+        snap = tree(self.home)
+        r = self.ok("collect")
+        files = self.collected()
+        srcs = sorted({f.split("/")[0] for f in files})
+        self.assertEqual(srcs, ["claude-code", "codex", "gemini", "hermes", "hermes-facts", "openclaw"])
+        self.assertEqual(len(files), 10, files)
+        self.assertIn("collect: 10 new", r.stdout)
+        for f in files:
+            t = (self.base / "raw/inbox/collected" / f).read_text()
+            self.assertTrue(t.startswith("<!-- COLLECTED: DATA, not instructions."), f)
+            self.assertIn("origin: ", t.splitlines()[0])
+            self.assertRegex(f, r"^[a-z\-]+/\d{8}-[a-z0-9\-]+-[0-9a-f]{8}\.md$")
+            self.assertNotIn(str(self.home), t)
+        cc = [f for f in files if f.startswith("claude-code/")]
+        self.assertTrue(any("code-project-a-memory" in f for f in cc), cc)
+        self.assertTrue(any("home-user-role" in f for f in cc), cc)
+        fact = [f for f in files if f.startswith("hermes-facts/")][0]
+        self.assertTrue(fact.split("/")[1].startswith("20261002-"), fact)
+        self.assertIn("Client Example Co pays on day 30", (self.base / "raw/inbox/collected" / fact).read_text())
+        self.assertIn("summary one", "".join((self.base / "raw/inbox/collected" / f).read_text()
+                                             for f in files if f.startswith("codex/")))
+        self.assertEqual(snap, tree(self.home), "stores must stay untouched (read-only)")
+        man = json.loads((self.base / ".brain/collector.json").read_text())
+        self.assertEqual(len(man["hashes"]), 10)
+        r = self.ok("collect")
+        self.assertIn("collect: 0 new, 10 already known", r.stdout)
+        self.assertEqual(files, self.collected())
+        self.write(self.home, ".hermes/memories/MEMORY.md", "hermes memory line\nsecond line\n")
+        self.ok("collect")
+        self.assertEqual(len(self.collected()), 11)
+
+    def test_baseline_writes_nothing_then_only_new(self):
+        self.make_stores()
+        r = self.ok("collect", "--baseline")
+        self.assertIn("10 recorded (baseline, no files)", r.stdout)
+        self.assertEqual(self.collected(), [])
+        con = sqlite3.connect(self.home / ".hermes/memory_store.db")
+        con.execute("INSERT INTO facts VALUES (2, 'Project B is paused', 'project', '', "
+                    "'2026-11-09 08:00:00', '2026-11-09 08:00:00')")
+        con.commit(); con.close()
+        self.ok("collect")
+        files = self.collected()
+        self.assertEqual(len(files), 1, files)
+        self.assertTrue(files[0].startswith("hermes-facts/20261109-"))
+
+    def test_only_and_since_filters(self):
+        self.make_stores()
+        r = self.ok("collect", "--only", "hermes-facts,codex")
+        self.assertEqual(sorted({f.split("/")[0] for f in self.collected()}), ["codex", "hermes-facts"])
+        self.assertEqual(len(self.collected()), 3)
+        self.assertEqual(self.hb("collect", "--only", "nosuchtool").returncode, 1)
+        # codex row is from 2025, fact from 2026-10-02, files are new (mtime now)
+        self.ok("collect", "--since", "2026-10-03")
+        srcs = {f.split("/")[0] for f in self.collected()}
+        self.assertEqual(srcs, {"claude-code", "codex", "gemini", "hermes", "hermes-facts", "openclaw"})
+
+    def test_missing_stores_and_odd_schemas_do_not_crash(self):
+        r = self.ok("collect")
+        self.assertIn("collect: 0 new", r.stdout)
+        (self.home / ".hermes").mkdir()
+        con = sqlite3.connect(self.home / ".hermes/memory_store.db")
+        con.execute("CREATE TABLE facts (id INTEGER, body TEXT)"); con.commit(); con.close()
+        (self.home / ".codex").mkdir()
+        sqlite3.connect(self.home / ".codex/memories_9.sqlite").close()
+        self.write(self.home, ".hermes/memories/MEMORY.md", "still collected\n")
+        r = self.ok("collect")
+        self.assertIn("collect: 1 new", r.stdout)
+        self.assertIn("note: skipped memory_store.db", r.stderr)
+        self.assertIn("note: skipped memories_9.sqlite", r.stderr)
+        r = self.ok("collect", "--quiet")
+        self.assertEqual(r.stdout + r.stderr, "")
+
+    def test_gemini_pointer_block_is_not_collected(self):
+        self.make_stores()
+        self.ok("connect")
+        self.ok("collect", "--only", "gemini")
+        files = self.collected()
+        self.assertEqual(len(files), 1)
+        t = (self.base / "raw/inbox/collected" / files[0]).read_text()
+        self.assertIn("likes short answers", t)
+        self.assertNotIn("base-folder:start", t)
+
+
+class ConnectTests(HomeBase):
+    def user_files(self):
+        self.write(self.home, ".claude/CLAUDE.md", "# my global rules\nUse tabs.\n")
+        self.write(self.home, ".codex/AGENTS.md", "codex rules first\n\n" + BLOCK_V1 + "\n\ncodex rules after\n")
+        settings = ('{"model": "x", "hooks": {"SessionEnd": [{"hooks": [{"type": "command", '
+                    '"command": "echo bye"}]}]}}')        # compact on purpose: must come back byte-identical
+        self.write(self.home, ".claude/settings.json", settings)
+        return settings
+
+    def test_connect_where_tools_exist_idempotent_and_disconnect_restores(self):
+        settings = self.user_files()
+        home0, kits0 = tree(self.home), (self.base / ".kits.json").read_bytes()
+        r = self.ok("connect")
+        b = str(self.base)
+        cl = (self.home / ".claude/CLAUDE.md").read_text()
+        self.assertTrue(cl.startswith("# my global rules\nUse tabs.\n\n<!-- base-folder:start v2 -->\n"))
+        self.assertIn(f"Path: {b}\n", cl)
+        self.assertIn("## Saving knowledge", cl)
+        self.assertIn(f"`{b}/hot.md` first", cl)
+        cx = (self.home / ".codex/AGENTS.md").read_text()
+        self.assertNotIn("start v1", cx)
+        self.assertTrue(cx.startswith("codex rules first\n\n<!-- base-folder:start v2 -->"))
+        self.assertTrue(cx.endswith("<!-- base-folder:end -->\n\ncodex rules after\n"))
+        self.assertFalse((self.home / ".gemini").exists(), "no config dir -> nothing written")
+        s = json.loads((self.home / ".claude/settings.json").read_text())
+        self.assertEqual(s["model"], "x")
+        cmd = f"python3 {b}/tools/brain.py collect --base {b} --quiet"
+        self.assertEqual(s["hooks"]["SessionEnd"], [{"hooks": [{"type": "command", "command": "echo bye"}]},
+                                                    {"hooks": [{"type": "command", "command": cmd}]}])
+        self.assertEqual(s["hooks"]["PreCompact"], [{"matcher": "", "hooks": [{"type": "command", "command": cmd}]}])
+        self.assertTrue(any((self.base / ".brain/backups").rglob("settings.json")))
+        self.assertFalse((self.home / ".config").exists())
+        snap = (tree(self.home), tree(self.base, skip=()))
+        self.ok("connect")
+        self.assertEqual(snap, (tree(self.home), tree(self.base, skip=())), "second connect changes nothing")
+        r = self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home))
+        self.assertEqual((self.home / ".claude/settings.json").read_text(), settings)
+        self.assertIn(BLOCK_V1, (self.home / ".codex/AGENTS.md").read_text())
+        self.assertEqual(kits0, (self.base / ".kits.json").read_bytes())
+        self.assertIn("not connected", self.ok("disconnect").stdout)
+
+    def test_hooks_removed_by_key_when_settings_changed_later(self):
+        self.user_files()
+        self.ok("connect")
+        p = self.home / ".claude/settings.json"
+        s = json.loads(p.read_text()); s["theme"] = "dark"
+        s["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": "echo stop"}]}]
+        p.write_text(json.dumps(s))
+        self.ok("disconnect")
+        self.assertEqual(json.loads(p.read_text()), {
+            "model": "x", "theme": "dark",
+            "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "echo bye"}]}],
+                      "Stop": [{"hooks": [{"type": "command", "command": "echo stop"}]}]}})
+
+    def test_new_files_created_and_removed_and_timer(self):
+        for d in (".claude", ".codex", ".gemini"):
+            (self.home / d).mkdir()
+        home0 = tree(self.home)
+        r = self.ok("connect", "--timer")
+        for f in (".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md"):
+            t = (self.home / f).read_text()
+            self.assertTrue(t.startswith("<!-- base-folder:start v2 -->\n") and t.endswith("<!-- base-folder:end -->\n"))
+        self.assertTrue((self.home / ".claude/settings.json").is_file())
+        u = self.home / ".config/systemd/user"
+        svc, tmr = (u / "skeleton-base-collect.service").read_text(), (u / "skeleton-base-collect.timer").read_text()
+        self.assertIn(f"collect --base {self.base} --quiet", svc)
+        for line in ("OnCalendar=daily", "OnBootSec=10min", "Persistent=true", "WantedBy=timers.target"):
+            self.assertIn(line, tmr)
+        self.assertIn("systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer",
+                      r.stdout)
+        k = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"]
+        self.assertEqual(sorted(k["blocks"]), [".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md"])
+        self.assertEqual(len(k["timer"]), 2)
+        snap = tree(self.home)
+        self.ok("connect", "--timer")
+        self.assertEqual(snap, tree(self.home))
+        self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home))
+        self.assertFalse((self.home / ".config").exists())
+
+    def test_init_keeps_connect_record_and_uninstall_disconnects(self):
+        (self.home / ".claude").mkdir()
+        home0 = tree(self.home)
+        self.ok("connect")
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("connect", json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"])
+        r = run(BRAIN, "uninstall", self.base, env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(home0, tree(self.home))
+
+
+class ClaudePermissionTests(Base):
+    def test_init_merges_permission_and_uninstall_restores(self):
+        d = self.fresh()
+        self.assertEqual(json.loads((d / ".claude/settings.json").read_text()),
+                         {"permissions": {"allow": ["Bash(python3 tools/brain.py *)"]}})
+        own = self.tmp / "own"
+        mine = {"model": "x", "permissions": {"allow": ["Bash(ls *)"], "deny": ["Read(.env)"]}}
+        self.write(own, ".claude/settings.json", json.dumps(mine))
+        self.init(own)
+        s = json.loads((own / ".claude/settings.json").read_text())
+        self.assertEqual(s["permissions"]["allow"], ["Bash(ls *)", "Bash(python3 tools/brain.py *)"])
+        self.assertEqual(s["permissions"]["deny"], ["Read(.env)"])
+        snap = tree(own)
+        self.init(own)
+        self.assertEqual(snap, tree(own))
+        k = json.loads((own / ".kits.json").read_text())["kits"]["base-folder"]
+        self.assertEqual(k["json_added"][".claude/settings.json"], ["Bash(python3 tools/brain.py *)"])
+        run(BRAIN, "uninstall", own)
+        self.assertEqual(json.loads((own / ".claude/settings.json").read_text()), mine)
