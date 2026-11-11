@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {"id": "start", "type": "text", "text": "Start here", "x": 0, "y": -140, "width": 200, "height": 60},
+    {"id": "hot", "type": "file", "file": "hot.md", "x": 0, "y": 0, "width": 320, "height": 220},
+    {"id": "index", "type": "file", "file": "wiki/index.md", "x": 420, "y": 0, "width": 320, "height": 220}
+  ],
+  "edges": [
+    {"id": "e1", "fromNode": "start", "fromSide": "bottom", "toNode": "hot", "toSide": "top"},
+    {"id": "e2", "fromNode": "hot", "fromSide": "right", "toNode": "index", "toSide": "left", "label": "then"}
+  ]
+}

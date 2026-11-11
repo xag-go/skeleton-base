@@ -1,0 +1,6 @@
+// Syncthing ignore example for this base (copy the folder with Send Only -> Receive Only).
+.obsidian
+.git
+graphify-out
+.brain
+.base-folder

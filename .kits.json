@@ -1,0 +1,14 @@
+{
+  "kits": {
+    "base-folder": {
+      "version": "1"
+    }
+  },
+  "slots": {
+    "user": "wiki/me/",
+    "now": "hot.md",
+    "decisions": "wiki/decisions/",
+    "map": "wiki/index.md",
+    "sources": "raw/"
+  }
+}

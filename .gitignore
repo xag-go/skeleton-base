@@ -1,0 +1,24 @@
+# base-folder:start v1
+# secrets: never in the base
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/
+# caches and generated indexes
+.brain/search.db
+.base-folder/
+__pycache__/
+*.pyc
+graphify-out/
+.obsidian/workspace*.json
+.trash/
+# big media (keep transcripts in raw/videos/, not the video files)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.zip
+# base-folder:end

@@ -1,0 +1,29 @@
+filters:
+  and:
+    - file.inFolder("board")
+    - file.ext == "md"
+    - file.name != "README"
+properties:
+  note.title:
+    displayName: Title
+  note.status:
+    displayName: Status
+  note.owner:
+    displayName: Owner
+  note.project:
+    displayName: Project
+  note.due:
+    displayName: Due
+views:
+  - type: table
+    name: By status
+    groupBy:
+      property: note.status
+      direction: ASC
+    order:
+      - note.title
+      - note.status
+      - note.owner
+      - note.project
+      - note.due
+      - note.updated
