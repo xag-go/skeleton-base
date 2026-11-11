@@ -10,6 +10,10 @@ secrets/
 .brain/search.db
 .brain/backups/
 .brain/collector.lock
+.brain/watch.lock
+.brain/kick
+.brain/*.tmp
+.brain/pycache/
 .base-folder/
 __pycache__/
 *.pyc
