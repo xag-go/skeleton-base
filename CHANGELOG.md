@@ -2,6 +2,21 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.1.0 - 2026-11-11
+- AGENTS.md: new "Saving knowledge" section. Durable knowledge goes into the base (clients, decisions, people,
+  project status, then `index` and the agents log); a copy in the tool's own memory is fine, never only there.
+- `brain.py collect`: copies new items from Claude Code, Codex (Markdown and SQLite), Gemini CLI, Hermes
+  (Markdown and fact store) and OpenClaw memories into `raw/inbox/collected/SOURCE/`, read-only, deduped by hash
+  in `.brain/collector.json`. `--baseline`, `--only`, `--since`, `--quiet`. Missing stores and unknown database
+  layouts are skipped with a note.
+- `brain.py connect [--timer]` / `disconnect`: per-user pointer block (v2) in `~/.claude/CLAUDE.md`,
+  `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` (only for installed tools; an older block is replaced in place),
+  Claude Code `SessionEnd` / `PreCompact` hooks that run `collect`, optional daily systemd user timer. Recorded in
+  `.kits.json`; `disconnect` and `uninstall` restore the previous files exactly.
+- init: merges `Bash(python3 tools/brain.py *)` into the base's `.claude/settings.json` `permissions.allow`
+  (removed by uninstall). `.gitignore` block also ignores `.brain/backups/` and `.brain/collector.lock`.
+- init keeps the `connect` record when it is re-run.
+
 ## v1.0.1 - 2026-11-11
 - lint: quote lines may contain inline code and quotes (only fenced examples are skipped).
 - init: a file already identical to the kit stays upgradable.

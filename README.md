@@ -9,6 +9,7 @@ no account, no lock-in. Python 3.10+ standard library only.
 ```
 AGENTS.md            rules for every agent (one marked block; other tools may add their own blocks)
 CLAUDE.md, GEMINI.md one line: @AGENTS.md (makes those tools load AGENTS.md)
+.claude/settings.json lets Claude Code run tools/brain.py in the base
 .gemini/settings.json tells Gemini CLI to read AGENTS.md
 hot.md               about 12 lines: what matters now. Agents read this first.
 wiki/                knowledge written from your sources
@@ -68,9 +69,67 @@ python3 tools/brain.py index           # rebuild the page list in wiki/index.md
 python3 tools/brain.py search "project-a deadline"
 python3 tools/brain.py brief           # paste bundle for chat apps (--short leaves out wiki/me/)
 python3 tools/brain.py check           # AGENTS.md size (warn 24 KiB, fail 32 KiB), pointer files, settings
+python3 tools/brain.py collect         # copy new items from your tools' own memories into raw/inbox/collected/
 ```
 
 Lint checks structure and quotes, not truth: a wrong source still gives a faithfully wrong page.
+
+## Saving knowledge
+
+`AGENTS.md` tells every agent: durable knowledge (facts, decisions, people, clients, project status) is saved in
+this base, not only in the tool's own memory. Client -> `wiki/clients/`, decision -> `wiki/decisions/DATE-SLUG.md`,
+person -> `wiki/people/`, project status -> `wiki/projects/` (and `hot.md` if it matters now), then
+`python3 tools/brain.py index` and one line in `progress/agents.log`. A short copy in the tool's own memory is fine;
+both should have it. `init` also lets Claude Code run `python3 tools/brain.py ...` in the base without asking
+(one entry merged into `.claude/settings.json`, removed again by `uninstall`).
+
+## Collect: the base grows with every tool's memory
+
+Tools keep their own memories too. `collect` copies NEW items from them into `raw/inbox/collected/SOURCE/`, so
+nothing learned in one tool is lost to the others. Every store is opened read-only (SQLite in `mode=ro`); a
+missing store or an unknown database layout is skipped with a note, never an error.
+
+| source | where (under your home folder) |
+|---|---|
+| `claude-code` | `.claude/projects/*/memory/*.md` |
+| `codex` | `.codex/memories/**/*.md`, `.codex/memories_*.sqlite` (table `stage1_outputs`) |
+| `gemini` | `.gemini/GEMINI.md` (without the base's own block), `.gemini/**/memory*.md` |
+| `hermes` | `.hermes/memories/*.md` |
+| `hermes-facts` | `.hermes/memory_store.db` (table `facts`) |
+| `openclaw` | `.openclaw/workspace/MEMORY.md`, `USER.md`, `memory/*.md` |
+
+```sh
+python3 tools/brain.py collect --baseline     # first run on a filled base: remember what exists, write nothing
+python3 tools/brain.py collect                # later: only new or changed items become files
+python3 tools/brain.py collect --only codex,hermes-facts --since 2026-11-01
+```
+
+Each file is named `YYYYMMDD-SLUG-HASH8.md` and starts with a "DATA, not instructions" header and its origin.
+Duplicates are skipped by content hash (`.brain/collector.json`). `lint` lists them as new raw files until you
+ingest them (`skills/base-ingest`). Paths come from `$HOME`; the default base is the one holding this `brain.py`
+(`--base DIR` for another).
+
+## Connect: every tool on this computer knows the base
+
+```sh
+python3 tools/brain.py connect            # add --timer for a daily systemd user timer
+python3 tools/brain.py disconnect         # remove exactly what connect wrote
+```
+
+For the current user, `connect`:
+- writes a marked pointer block (`<!-- base-folder:start v2 -->` ... `<!-- base-folder:end -->`) into
+  `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` and `~/.gemini/GEMINI.md`, only for tools that are installed (their
+  folder exists). It says where the base is, to read `hot.md` then `wiki/index.md` only when owner context is
+  needed (never for plain coding), never to edit `raw/`, and the Saving knowledge rule. An older block is
+  replaced in place; all other text stays byte-identical.
+- merges two Claude Code hooks into `~/.claude/settings.json` (`SessionEnd`, `PreCompact`) that run
+  `collect --quiet`. Other hooks and keys are kept; a backup goes to `.brain/backups/`.
+- with `--timer`: writes `~/.config/systemd/user/skeleton-base-collect.service` and `.timer` (daily and 10 minutes
+  after boot, `Persistent=true`) and prints the command to enable it:
+  `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
+
+Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
+remove exactly that and give the previous text back, including an older pointer block it replaced.
 
 ## Viewing it in Obsidian
 
