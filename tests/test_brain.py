@@ -340,7 +340,8 @@ class CheckPublicTests(Base):
         self.words.write_text("zebrafruit\nAcme Widgets\n")
         self.repo = self.tmp / "pub"
         self.write(self.repo, "README.md", "A clean public readme. Contact: noreply@skeleton-base.invalid\n"
-                                           "Dates like 2026-11-11 are fine.\n")
+                                           "Dates like 2026-11-11 are fine.\n"
+                                           "+@unittest.skipUnless(ok) and \\n@AGENTS.md are not emails.\n")
 
     def cp(self, d=None):
         return run(BRAIN, "check-public", "--words", self.words, d or self.repo)

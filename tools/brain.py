@@ -77,7 +77,7 @@ SECRETS = [
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("credential assignment", re.compile(r"(?i)\b(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_\-+/]{12,}")),
 ]
-EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+EMAIL = re.compile(r"(?<![\w.%+\-])[A-Za-z0-9][A-Za-z0-9._%+\-]*@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 SAFE_EMAIL_DOMAINS = re.compile(r"(?i)@(?:[\w\-]+\.)*(?:example\.(?:com|org|net)|[\w\-]+\.(?:invalid|test|example))$")
 FILE_EXTS = {"md", "py", "json", "txt", "yml", "yaml", "js", "ts", "sh", "toml", "canvas", "base"}
 PHONE = re.compile(r"(?<![\w.\-])(?:\+\d{1,3}[ .\-]?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,4}|0\d(?:[ .\-]?\d{2}){4})(?![\w\-])")
