@@ -149,6 +149,13 @@ For the current user, `connect`:
 Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
 remove exactly that and give the previous text back, including an older pointer block it replaced.
 
+**Base paths with spaces** work everywhere `connect` writes the path. A plain path is written as it is
+(`Path: /home/me/base`). A path with a space, a quote, a backslash, a backtick or `$` is wrapped in the first of
+`"` `'` `` ` `` that it does not contain, with no escaping inside (`Path: "/home/me/My Base"`). Shell commands in the
+block and the Claude Code hooks are shell-quoted (`cd '/home/me/My Base' && ...`), and the systemd units quote
+and escape `ExecStart=` the way systemd reads it (`%` -> `%%`, `$` -> `$$`, `\` and `"` escaped). A path with a
+line break is refused for the units.
+
 ### With Frugal-Bridge installed for the whole user (`install --global`)
 
 Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file (`~/.frugal-bridge/USER.md`, or
@@ -166,6 +173,14 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
   found), which finds the base through the `Path:` line of the pointer block and uses the base from then on. The
   old `USER.md` is left in place.
 - **Base first, Frugal later.** Frugal-Bridge's setup sees the base and makes no `USER.md` of its own.
+- **A tool installed later** (its folder appears after both kits are in place): the watcher's auto-connect writes
+  the base block, then runs Frugal-Bridge's `install --global --hosts TOOL` for that tool alone, when Frugal-Bridge
+  uses this base (`global.json` `base`), supports that tool (Claude Code, Codex, Gemini CLI, opencode, Hermes) and
+  does not have it yet. The new tool gets both blocks, base first; the other tools' files are not touched.
+- **Base path with spaces:** Frugal-Bridge up to version 6 reads the `Path:` line only up to the first space, so
+  it cannot find a base whose path has one. `connect` then says so, and Frugal-Bridge keeps its own `USER.md` (both
+  kits still work, but with two user files). A Frugal-Bridge that reads quoted `Path:` values follows the base like
+  any other. Until then, keep the base in a path without spaces if you use both.
 - **Block order** in every user-level file: the base block first, Frugal-Bridge's block after it. When Frugal's
   block is already there, the base block is inserted in front of it; Frugal's bytes are never changed by the base.
 - **`disconnect` / `uninstall`** while Frugal-Bridge uses the base: the user slot is written back to its `USER.md`

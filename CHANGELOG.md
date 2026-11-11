@@ -2,6 +2,23 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.2 - 2026-11-11
+- Base paths with spaces: the pointer block's `Path:` line keeps its format for a plain path; a path with a space,
+  quote, backslash, backtick or `$` is wrapped in the first of `"` `'` `` ` `` it does not contain, no escaping
+  (`Path: "/home/me/My Base"`). The `cd` command in the block is shell-quoted (hooks already were), and the systemd
+  units escape `ExecStart=` for systemd (`%%`, `$$`, `\\`, `\"`, double quotes around a word with a space). A path
+  with a line break is refused for the units. Frugal-Bridge up to version 6 cannot read such a `Path:` line: `connect`
+  says so and Frugal keeps its own user file (README).
+- Zero-touch with Frugal-Bridge: when the watcher (or `connect`) connects a NEW tool and Frugal-Bridge uses this
+  base, it runs Frugal's `install --global --hosts TOOL` for that tool alone, if Frugal supports it and does not
+  have it yet. The new tool gets both blocks, base first.
+- `.kits.json` records the product release (`kits.base-folder.release`, `RELEASE` in `tools/brain.py`), so an
+  installer can tell a newer base from an older one and never downgrade it.
+- 5 new tests (86 in total): a base path with spaces, `$`, `%` and quotes (block, hooks run by a shell, systemd
+  `ExecStart=` parsed back, `systemd-analyze verify`, disconnect byte-identical), the quoting rules, a new tool after
+  both kits with the real Frugal-Bridge setup, a new tool when Frugal does not use the base, and a path with spaces
+  plus Frugal-Bridge (old and new Frugal parser).
+
 ## v1.3.1 - 2026-11-11
 - Frugal first, base later, at user level: when Frugal-Bridge is installed with `install --global`, `connect` and
   the watcher's auto-connect merge the filled lines of `~/.frugal-bridge/USER.md` (or `$FRUGAL_HOME/USER.md`) into

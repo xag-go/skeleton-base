@@ -958,6 +958,7 @@ class ConnectTests(HomeBase):
         self.assertIn(f"Path: {b}\n", cl)
         self.assertIn("## Saving knowledge", cl)
         self.assertIn(f"`{b}/hot.md` first", cl)
+        self.assertIn(f"`cd {b} && python3 tools/brain.py index`", cl)     # a plain path is never quoted
         cx = (self.home / ".codex/AGENTS.md").read_text()
         self.assertNotIn("start v1", cx)
         self.assertTrue(cx.startswith("codex rules first\n\n<!-- base-folder:start v2 -->"))
@@ -1679,3 +1680,172 @@ class FrugalGlobalTests(Base):
         self.assertEqual(t, FRUGAL_BLOCK.search(t).group(0) + "\n", "only Frugal's block is left, as it wrote it")
         self.assertIn(f"The user file is `{self.fh / 'USER.md'}`", t)
         self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+
+
+    def test_watch_new_tool_gets_frugal_block_after_base_block(self):
+        """A tool installed after both kits: the watcher connects it and runs Frugal's install --global --hosts TOOL
+        for it alone (when Frugal knows that tool), so it gets both blocks, base first."""
+        self.sb("connect")
+        self.frugal_install()
+        self.sb("connect")                          # settle (Frugal changed settings.json after us)
+        old = {f: f.read_bytes() for f in self.rules() + [self.home / ".claude/settings.json"]}
+        tools0 = json.loads((self.fh / "global.json").read_text())["tools"]
+        (self.home / ".gemini").mkdir()                     # a tool Frugal supports
+        (self.home / ".qwen").mkdir()                       # a tool it does not
+        r = self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
+        g = self.home / ".gemini/GEMINI.md"
+        self.assert_order(g)
+        self.assertTrue(g.read_text().startswith("<!-- base-folder:start v2 -->"))
+        fb = FRUGAL_BLOCK.search(g.read_text()).group(0)
+        self.assertIn(f"A knowledge base owns the user's files: `{self.base}`", fb)
+        reg = json.loads((self.fh / "global.json").read_text())
+        self.assertEqual(sorted(reg["tools"]), ["claude-code", "codex", "gemini"], r.stdout)
+        for t_ in ("claude-code", "codex"):
+            self.assertEqual(reg["tools"][t_], tools0[t_])
+        q = (self.home / ".qwen/QWEN.md").read_text()
+        self.assertIn("base-folder:start", q)
+        self.assertNotIn("frugal-bridge:start", q)
+        for f, b in old.items():                            # only the new tool was touched
+            self.assertEqual(f.read_bytes(), b, f)
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        snap = self.snap()
+        self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
+        self.sb("connect")
+        self.assertEqual(snap[:2], self.snap()[:2], "re-runs change nothing")
+        # the base leaves: Frugal keeps the new tool, on its own user file again
+        self.sb("disconnect")
+        t = g.read_text()
+        self.assertNotIn("base-folder:start", t)
+        self.assertEqual(t, FRUGAL_BLOCK.search(t).group(0) + "\n")
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+
+    def test_new_tool_without_frugal_on_this_base_gets_only_the_base_block(self):
+        self.frugal_install()
+        shutil.rmtree(self.home / "frugal-bridge")          # its kit is gone: the base cannot switch it over
+        self.sb("connect")
+        self.assertNotIn("base", json.loads((self.fh / "global.json").read_text()))
+        reg0 = (self.fh / "global.json").read_bytes()
+        (self.home / ".gemini").mkdir()
+        self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
+        self.assertNotIn("frugal-bridge:start", (self.home / ".gemini/GEMINI.md").read_text())
+        self.assertEqual(reg0, (self.fh / "global.json").read_bytes(), "Frugal not run for a base it does not use")
+
+    def test_base_path_with_spaces_and_frugal(self):
+        """Frugal-Bridge 6 reads `Path: (\\S+)` and cannot follow a quoted path with spaces: the base says so and
+        Frugal keeps working on its own user file. A Frugal-Bridge that reads quoted paths follows the base."""
+        self.frugal_install()
+        (self.fh / "USER.md").write_text(FAKE_USER)
+        self.base = self.tmp / "My Base"
+        self.init(self.base)
+        r = self.sb("connect")
+        cl = (self.home / ".claude/CLAUDE.md").read_text()
+        self.assertIn(f'Path: "{self.base}"\n', cl)
+        for f in self.rules():
+            self.assert_order(f)
+        reg = json.loads((self.fh / "global.json").read_text())
+        if reg.get("base") == str(self.base):               # Frugal fixed on its side: it follows the base
+            self.assertIn("Frugal-Bridge: now uses this base", r.stdout)
+        else:
+            self.assertIn("cannot follow a base path with spaces", r.stdout)
+            self.assertIn(f"The user file is `{self.fh / 'USER.md'}`", cl)
+        self.assertIn("merged into wiki/me/", r.stdout)     # the import still happened
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        snap = self.snap()
+        self.sb("connect")
+        self.assertEqual(snap, self.snap())
+
+
+def unit_words(line):
+    """ExecStart= words the way systemd reads them (quotes, backslash escapes, then %% and $$)."""
+    import shlex
+    return [w.replace("%%", "%").replace("$$", "$") for w in shlex.split(line.split("=", 1)[1])]
+
+
+class SpacePathTests(Base):
+    """A base whose path has spaces (and other shell/systemd characters): every place that writes it quotes it."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        for d in (".claude", ".codex"):
+            (self.home / d).mkdir(parents=True)
+        self.write(self.home, ".claude/CLAUDE.md", "# my global rules\n")
+        self.base = self.tmp / "My Files" / "brain 50% $HOME 'x'"
+        self.init(self.base)
+
+    def hb(self, *args, ok=True):
+        r = run(self.base / "tools" / "brain.py", *args, env={"HOME": str(self.home)})
+        if ok:
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def test_blocks_hooks_and_units_quote_the_path_and_disconnect_restores(self):
+        home0 = tree(self.home)
+        self.hb("connect", "--base", self.base, "--watch", "--kick")
+        b = str(self.base)
+        cl = (self.home / ".claude/CLAUDE.md").read_text()
+        self.assertIn(f'Path: "{b}"\n', cl)                        # wrapped in quotes, nothing escaped
+        sys.path.insert(0, str(REPO / "tools"))
+        import brain
+        self.assertEqual(brain.parse_path_line(re.search(r"^Path: (.*)$", cl, re.M).group(1)), b)
+        cd = re.search(r"`(cd .*? && python3 tools/brain.py index)`", cl).group(1)
+        r = subprocess.run(["sh", "-c", cd.replace("python3 tools/brain.py index", "pwd")], capture_output=True,
+                           text=True)
+        self.assertEqual(r.stdout.strip(), b, "the cd command in the block works as written")
+        # Claude Code hooks: the commands run as written by a shell
+        s = json.loads((self.home / ".claude/settings.json").read_text())
+        collect = s["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+        kick = s["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        e = dict(os.environ, HOME=str(self.home), BRAIN_TODAY="2026-11-11")
+        r = subprocess.run(["sh", "-c", collect], capture_output=True, text=True, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.base / ".brain/collector.json").is_file(), "the hook's collect ran in the base")
+        r = subprocess.run(["sh", "-c", kick], input="/x/memory/note.md\n", capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex((self.base / ".brain/kick").read_text(), r"^\d+\n$")
+        # systemd units: ExecStart= gives back the exact path
+        units = self.home / ".config/systemd/user"
+        svc = (units / "skeleton-base-watch.service").read_text()
+        line = next(l for l in svc.splitlines() if l.startswith("ExecStart="))
+        self.assertEqual(unit_words(line), ["/usr/bin/env", "python3", "-S", f"{b}/tools/brain.py", "watch",
+                                            "--base", b])
+        line = next(l for l in (units / "skeleton-base-collect.service").read_text().splitlines()
+                    if l.startswith("ExecStart="))
+        self.assertEqual(unit_words(line), ["/usr/bin/env", "python3", f"{b}/tools/brain.py", "collect", "--base",
+                                            b, "--quiet"])
+        if shutil.which("systemd-analyze"):
+            for u in ("skeleton-base-watch.service", "skeleton-base-collect.service"):
+                r = subprocess.run(["systemd-analyze", "--user", "verify", str(units / u)], capture_output=True,
+                                   text=True, env=e)
+                self.assertNotIn("quot", (r.stdout + r.stderr).lower(), r.stdout + r.stderr)
+                self.assertNotIn(u + ":", r.stdout + r.stderr)
+        # re-run: nothing changes; disconnect: home exactly as before
+        snap = tree(self.home)
+        self.hb("connect", "--base", self.base, "--watch", "--kick")
+        self.assertEqual(snap, tree(self.home))
+        self.hb("disconnect", "--base", self.base)
+        self.assertEqual(home0, tree(self.home))
+
+    def test_unit_escaping_of_odd_characters(self):
+        sys.path.insert(0, str(REPO / "tools"))
+        import brain
+        for p in ("/srv/base", "/a b/c", '/a "b"/c', "/a\\b c", "/p/100%", "/p/$HOME x", "/p/semi;colon"):
+            with self.subTest(p=p):
+                w = brain.unit_esc(p)
+                self.assertEqual(unit_words("ExecStart=" + w), [p])
+                self.assertEqual(w == p, p in ("/srv/base",), w)     # plain paths are written unchanged
+        self.assertEqual(brain.path_line("/srv/base"), "Path: /srv/base")
+        for p, want in (("/a b", 'Path: "/a b"'), ('/a "b"', "Path: '/a \"b\"'"), ("/a \"b\" 'c'", 'Path: `/a "b" \'c\'`'),
+                        ("/x\\y z", 'Path: "/x\\y z"'), ("/\"'` z", None)):
+            with self.subTest(path_line=p):
+                line = brain.path_line(p)
+                if want:
+                    self.assertEqual(line, want)
+                self.assertEqual(brain.parse_path_line(line.removeprefix("Path: ")), p)
+                # the same value as Frugal-Bridge's parser reads it (first quote char up to the next one)
+                v = line.removeprefix("Path: ")
+                if want:
+                    self.assertEqual(v[1:v.index(v[0], 1)], p)
+        self.assertEqual(brain.parse_path_line("/srv/base"), "/srv/base")
+        with self.assertRaises(SystemExit):
+            brain.unit_esc("/a\nb")

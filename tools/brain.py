@@ -71,6 +71,7 @@ import sys
 import time
 
 VERSION = "1"
+RELEASE = "1.3.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -393,7 +394,7 @@ class Installer:
         if "frugal-bridge" in kits and not imported:
             imported = self.import_frugal(k.get("slots") or dict(FRUGAL_DEFAULT), created)
 
-        entry = {"version": VERSION, "installed": prev.get("installed") or today(),
+        entry = {"version": VERSION, "release": RELEASE, "installed": prev.get("installed") or today(),
                  "created": dict(sorted(created.items())), "placement": dict(sorted(modes.items()))}
         if json_added:
             entry["json_added"] = json_added
@@ -1674,13 +1675,46 @@ def collect(base, only=None, baseline=False, since=None, quiet=False):
 CONNECT_VERSION = "2"
 CONNECT_FILES = ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md"), (".gemini", "GEMINI.md"))   # + AUTO_TOOLS
 HOOK_EVENTS = ("SessionEnd", "PreCompact")
+FRUGAL_HOSTS = {".claude/CLAUDE.md": "claude-code", ".codex/AGENTS.md": "codex", ".gemini/GEMINI.md": "gemini",
+                ".config/opencode/AGENTS.md": "opencode", ".hermes/SOUL.md": "hermes"}   # our file -> its host name
 UNIT = "skeleton-base-collect"
 
 
-def pointer_body(base):
+def needs_quotes(s):
+    return any(c.isspace() for c in s) or any(c in s for c in "\"'\\`$")
+
+
+def path_line(base):
+    """The `Path:` line other kits read. A plain path is written as it is (`Path: /home/me/base`). A path with a
+    space, quote, backslash, backtick or `$` is wrapped, without any escaping, in the first of " ' ` that does not
+    occur in it (`Path: "/home/me/My Base"`): the value is everything up to the next same quote. Only a path that
+    holds all three quote characters falls back to a JSON string."""
     b = str(base)
+    if not needs_quotes(b):
+        return f"Path: {b}"
+    q = next((c for c in "\"'`" if c not in b), None)
+    return f"Path: {q}{b}{q}" if q else f"Path: {json.dumps(b, ensure_ascii=False)}"
+
+
+def parse_path_line(value):
+    """The base folder from the value of a `Path:` line (the reverse of path_line)."""
+    v = value.strip()
+    if len(v) >= 2 and v[0] in "\"'`" and v[0] in v[1:]:
+        if v[0] == '"' and v.endswith('"') and v.count('"') > 2:
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                pass
+        return v[1:v.index(v[0], 1)]
+    return v
+
+
+def pointer_body(base):
+    import shlex
+    b = str(base)
+    q = shlex.quote(b)
     return f"""## Knowledge base (Skeleton Base)
-Path: {b}
+{path_line(base)}
 - Read it only when you need context about the user, their projects, clients, people or decisions that this
   project does not have: `{b}/hot.md` first, then `{b}/wiki/index.md`, then only the pages you need.
 - Plain coding or general questions: do not read it.
@@ -1690,7 +1724,7 @@ Path: {b}
 - Durable knowledge (facts, decisions, people, clients, project status) is saved in the base at `{b}`:
   client -> `wiki/clients/SLUG.md` (from `templates/client.md`); decision -> `wiki/decisions/YYYY-MM-DD-SLUG.md`;
   person -> `wiki/people/SLUG.md`; project status -> `wiki/projects/SLUG.md`, plus `hot.md` if it matters now.
-- Then run `cd {b} && python3 tools/brain.py index` and append one line to `{b}/progress/agents.log`.
+- Then run `cd {q} && python3 tools/brain.py index` and append one line to `{b}/progress/agents.log`.
 - Keep a short copy in your own memory too; both should have it. Never only in your own memory."""
 
 
@@ -1713,8 +1747,15 @@ def kick_cmd(base):
 
 
 def unit_esc(s):
-    s = str(s).replace("%", "%%")
-    return f'"{s}"' if any(c.isspace() for c in s) else s
+    """One ExecStart= word for a systemd unit file: specifiers (%) and variables ($) doubled, backslashes and
+    quotes escaped, the word double-quoted when it has a space or a quote. A plain path stays as it is."""
+    s = str(s)
+    if "\n" in s or "\r" in s:
+        raise SystemExit(f"a path with a line break cannot go into a systemd unit: {s!r}")
+    s = s.replace("%", "%%").replace("$", "$$").replace("\\", "\\\\")
+    if any(c.isspace() for c in s) or any(c in s for c in "\"';"):
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
 
 
 def unit_texts(base):
@@ -2038,7 +2079,8 @@ class Connector:
                             f"{WATCH_UNIT}.service {UNIT}.timer")
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.save_kits(k)
-        self.frugal_take_over()
+        before = set(prev.get("blocks") or {})
+        self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [])
         return self.log
 
     def units(self, store, texts):
@@ -2090,14 +2132,15 @@ class Connector:
     def slot_page(self, slot, page):
         return slot + page if slot.endswith("/") else slot
 
-    def run_frugal(self, reg):
-        """Re-run Frugal-Bridge's own `install --global` for the tools it already has. True when it ran."""
+    def run_frugal(self, reg, hosts=None):
+        """Re-run Frugal-Bridge's own `install --global` for the tools it already has (or only `hosts`).
+        True when it ran."""
         kit = frugal_kit(self.home, reg)
         if not kit:
             self.log.append("Frugal-Bridge: its kit was not found (~/frugal-bridge, or set FRUGAL_BRIDGE_KIT); run "
                             "`python3 <frugal-bridge>/kit/setup.py install --global` yourself so it picks this up")
             return False
-        hosts = sorted(reg.get("tools") or {})
+        hosts = sorted(hosts if hosts is not None else (reg.get("tools") or {}))
         cmd = [sys.executable, str(kit), "install", "--global"] + (["--hosts", ",".join(hosts)] if hosts else [])
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -2109,23 +2152,56 @@ class Connector:
                             + "\n  ".join((r.stdout + r.stderr).strip().splitlines()[-6:]))
         return True
 
-    def frugal_take_over(self):
+    def frugal_take_over(self, new_files=()):
         user = frugal_home(self.home) / "USER.md"
         if user.is_file():
             self.frugal_import(user)
         reg = frugal_reg(self.home)
-        if reg is None or same_dir(reg.get("base"), self.base):
-            return                                   # not installed for this user, or already on this base
+        if reg is None:
+            return                                   # not installed for this user
+        if same_dir(reg.get("base"), self.base):     # already on this base: only tools connected just now
+            self.frugal_new_tools(reg, new_files)
+            return
         self.run_frugal(reg)
         if not frugal_points_here(self.base, self.home):
+            if needs_quotes(str(self.base)):
+                self.log.append(f"Frugal-Bridge: it cannot follow a base path with spaces or quotes yet (it reads "
+                                f"the `Path:` line only up to the first space), so it keeps its own {user}. "
+                                "Use a base path without spaces to share one user file.")
             return
         self.log.append(f"Frugal-Bridge: now uses this base for the user files (slot {self.user_slot()}); "
                         f"{user} left in place")
+        self.hooks_settled()
+
+    def hooks_settled(self):
         k = self.kits()                              # its re-run may have re-ordered its own hooks: that is the
         h = k["kits"]["base-folder"].get("connect", {}).get("hooks")   # state disconnect gives back
         if h and h.get("exact"):
             h["sha"] = sha(read(self.home / h["file"]) or "")
             self.save_kits(k)
+
+    def frugal_new_tools(self, reg, new_files):
+        """A tool connected just now (installed after Frugal-Bridge) gets Frugal's block too, after ours: its own
+        `install --global --hosts TOOL`, only for tools its setup supports and does not have yet."""
+        kit = frugal_kit(self.home, reg)
+        kit_text = (read(kit) or "") if kit else ""
+        have = set(reg.get("tools") or {})
+        hosts = []
+        for r in new_files:
+            host = FRUGAL_HOSTS.get(r)
+            if not host or host in have or host in hosts:
+                continue
+            if kit and not re.search(rf'^\s*"{re.escape(host)}"\s*:', kit_text, re.M):
+                continue                             # this Frugal-Bridge version has no such host
+            hosts.append(host)
+        if not hosts or not self.run_frugal(reg, hosts):
+            return
+        now = set((frugal_reg(self.home) or {}).get("tools") or {})
+        got = [h for h in hosts if h in now]
+        if got:
+            self.log.append(f"Frugal-Bridge: added to the new tool(s) {', '.join(got)} (its block after the base "
+                            "block)")
+        self.hooks_settled()
 
     def frugal_import(self, user):
         text = read(user) or ""
