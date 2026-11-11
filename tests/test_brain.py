@@ -2304,6 +2304,8 @@ class FrugalGlobalTests(Base):
         for d in (".claude", ".codex"):
             shutil.rmtree(self.home / d)
         (self.home / ".hermes").mkdir()
+        (self.home / ".hermes/config.yaml").write_text("model: default\n")   # an installed Hermes (Frugal-Bridge
+        # skips a tool with neither its program on PATH nor its own config file; never rely on the real PATH)
         home0 = tree(self.home, skip=())
         self.sb("connect")
         self.assertFalse((self.home / ".hermes/SOUL.md").exists())
