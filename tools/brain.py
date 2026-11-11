@@ -635,6 +635,16 @@ def done(root, raw, pages):
     return 0
 
 
+FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.M | re.S)
+CODESPAN = re.compile(r"`[^`\n]+`")
+TODO_MARK = re.compile(r"(^|\n)\s*(?:[-*]\s*(?:\[ \]\s*)?)?TODO\b|\bTODO:")
+
+
+def prose(t):
+    """Text with fenced code blocks and inline code removed (examples in code are not checked)."""
+    return CODESPAN.sub("", FENCE.sub("", t))
+
+
 def lint(root):
     errs, warns = [], []
     names, texts = {}, {}
@@ -669,6 +679,7 @@ def lint(root):
             errs.append(f"{rel(p, root)}: 'updated' is not YYYY-MM-DD")
 
     for p, t in texts.items():
+        t = prose(t)
         check_links(p, t)
         if p.name in SPECIAL and p.parent == root / "wiki":
             continue
@@ -685,14 +696,14 @@ def lint(root):
                 errs.append(f"{rel(p, root)}: quote cites missing {src}")
             elif " ".join(q.split()) not in src_cache.setdefault(src, " ".join(f.read_text(errors="replace").split())):
                 errs.append(f"{rel(p, root)}: QUOTE NOT IN SOURCE -> \"{q[:50]}\" ({src})")
-        if "TODO" in t:
+        if TODO_MARK.search(t):
             errs.append(f"{rel(p, root)}: unresolved TODO")
         if p.stem != p.stem.lower() or " " in p.stem or "_" in p.stem:
             errs.append(f"{rel(p, root)}: file name must be lowercase with hyphens")
 
     hot = root / "hot.md"
     if hot.is_file():
-        check_links(hot, hot.read_text(encoding="utf-8"))
+        check_links(hot, prose(hot.read_text(encoding="utf-8")))
     else:
         errs.append("hot.md: missing")
 

@@ -2,6 +2,10 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.0.1 - 2026-11-11
+- lint ignores fenced code blocks and inline code (examples in docs are not errors); TODO is caught only as a
+  marker (`TODO:`, a line or list item starting with TODO), not as a word in a sentence.
+
 ## v1 - 2026-11-11
 - First version. Full skeleton installed by `tools/brain.py init` (no module menu): AGENTS.md block,
   CLAUDE.md / GEMINI.md pointers, Gemini settings, hot.md, wiki/ with me/ pages, raw/, board/ with an Obsidian

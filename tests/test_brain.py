@@ -134,6 +134,19 @@ class LintTests(Base):
         self.planted(lambda d: self.linked(d, "wiki/concepts/t.md", PAGE.format(t="T", s="interview", b="TODO fix")),
                      "unresolved TODO")
 
+    def test_todo_marker_forms(self):
+        for body in ("- TODO call back", "TODO: fix this", "- [ ] TODO send"):
+            self.planted(lambda d, b=body: self.linked(d, "wiki/concepts/t.md", PAGE.format(t="T", s="interview", b=b)),
+                         "unresolved TODO")
+
+    def test_code_and_prose_mentions_are_not_errors(self):
+        d = self.fresh()
+        body = ("Lint catches a leftover `TODO`, a `[[link]]` that does not resolve, and orphan or TODO pages.\n\n"
+                "```\n> \"exact text\" - raw/<file>\n[[example-page]]\n```\n\nSee [[who-i-am]].")
+        self.linked(d, "wiki/concepts/docs-about-lint.md", PAGE.format(t="About lint", s="interview", b=body))
+        r = self.lint(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_quote_not_in_source(self):
         def s(d):
             self.write(d, "raw/docs/brief-b.md", "Project B budget review is in March.\n")
