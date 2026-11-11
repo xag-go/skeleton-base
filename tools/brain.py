@@ -36,8 +36,12 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                Claude Code SessionEnd/PreCompact hooks running collect; --timer writes a
                                daily systemd user timer; --watch writes the watch service (+ the timer);
                                --kick adds a Claude PostToolUse hook that pokes the watcher;
-                               --print only prints the pointer block (for tools you set up by hand)
-  disconnect [--base DIR]      remove exactly what connect (and auto-connect) wrote
+                               --print only prints the pointer block (for tools you set up by hand).
+                               Frugal-Bridge installed for the user: merges its USER.md into wiki/me/
+                               (never overwrites; review card for duplicates/conflicts), then re-runs its
+                               install --global so it uses the base; the base block goes before its block
+  disconnect [--base DIR]      remove exactly what connect (and auto-connect) wrote; Frugal-Bridge gets the
+                               user slot back in its USER.md and is re-run
 
 Instant and zero-touch
   watch [--base DIR] [--poll] [--quiet-s 2] [--max-s 10] [--no-commit] [--no-connect]
@@ -271,6 +275,8 @@ class Installer:
             for _ in range(2):
                 if text[b:b + 1] == "\n":
                     b += 1
+            if mode == "before-frugal" and not FRUGAL_START_RE.match(text, b) and text[a - 2:a] == "\n\n":
+                a -= 1        # the other block left since: drop the blank line we stood behind
         else:
             if text[b:b + 1] == "\n":
                 b += 1
@@ -383,8 +389,9 @@ class Installer:
             entry["json_added"] = json_added
         if imported:
             entry["imported"] = imported
-        if prev.get("connect"):
-            entry["connect"] = prev["connect"]
+        for key in ("connect", "frugal_user"):
+            if prev.get(key):
+                entry[key] = prev[key]
         kits["base-folder"] = entry
         k["slots"] = dict(BASE_SLOTS)
         new = dump_json(k)
@@ -491,6 +498,13 @@ class Installer:
 
         if me.get("connect"):
             self.log += Connector(self.d).disconnect()
+            k = load_json(self.p(".kits.json"), ".kits.json")
+            kits = k.get("kits", {})
+            me = kits["base-folder"]
+        elif frugal_points_here(self.d):           # Frugal-Bridge (user level) still uses this base: give it back
+            c = Connector(self.d)
+            c.frugal_give_back()
+            self.log += c.log
             k = load_json(self.p(".kits.json"), ".kits.json")
             kits = k.get("kits", {})
             me = kits["base-folder"]
@@ -1713,6 +1727,168 @@ def watch_unit_texts(base):
     return {f".config/systemd/user/{WATCH_UNIT}.service": service}
 
 
+# ---------------------------------------------------------------- Frugal-Bridge at user level (its "install --global")
+# Frugal-Bridge keeps one user file ($FRUGAL_HOME/USER.md, default ~/.frugal-bridge/USER.md) and global.json.
+# Frugal first, base later: connect merges the filled lines of that file into the base user slot (never overwrites;
+# duplicates and conflicts go to a board card), then re-runs Frugal's own `install --global`, which finds the base
+# through the `Path:` line of our block and uses the base slots. The old USER.md stays where it is.
+# Disconnect / uninstall: the user slot is written back to that file (old one backed up) and Frugal is re-run, so it
+# works on its own file again.
+FRUGAL_USER_MAP = (   # (start of the Frugal label, lowercase) -> (page in the user slot, label there or None)
+    ("name of the main agent", "how-to-talk-to-me.md", None),
+    ("languages", "who-i-am.md", "Languages"),
+    ("language", "how-to-talk-to-me.md", "Language"),
+    ("tone", "how-to-talk-to-me.md", "Tone"),
+    ("length", "how-to-talk-to-me.md", "Length of answers"),
+    ("format", "how-to-talk-to-me.md", "Format (lists, tables, prose)"),
+    ("answer style", "how-to-talk-to-me.md", None),
+    ("things i never want", "how-to-talk-to-me.md", "Things I never want"),
+    ("what the user decides alone", "how-to-talk-to-me.md", "What I decide alone (agents only propose)"),
+    ("what i decide alone", "how-to-talk-to-me.md", "What I decide alone (agents only propose)"),
+    ("what the main agent may just do", "how-to-talk-to-me.md", None),
+    ("other preferences", "how-to-talk-to-me.md", None),
+    ("name", "who-i-am.md", "Name"),
+    ("what i do", "who-i-am.md", "What I do"),
+    ("where i work from", "who-i-am.md", "Where I work from (city, time zone)"),
+    ("strengths", "who-i-am.md", "Strengths"),
+    ("weaknesses", "who-i-am.md", "Weaknesses / where I need help"),
+)
+FRUGAL_FALLBACK_PAGE = "who-i-am.md"          # lines with an unknown label or no label
+FRUGAL_SECTION = "## From Frugal-Bridge USER.md"
+FRUGAL_SRC_NAME = "frugal-bridge USER.md"
+FRUGAL_LABELS = ("Name of the main agent (any name the user likes)", "Language and script",
+                 "Answer style (length, format, numbers/currency)",
+                 "What the user decides alone (the main agent only proposes)", "What the main agent may just do",
+                 "Other preferences")      # Frugal's template, used when there is no USER.md to follow
+PAGE_TITLES = {"who-i-am.md": "Who I am", "how-to-talk-to-me.md": "How to talk to me"}
+LABEL_LINE = re.compile(r"^[-*]\s+([^:\n]{1,80}):[ \t]*(.*)$")
+
+
+def norm(s):
+    return " ".join(str(s).split()).casefold()
+
+
+def frugal_home(home=None):
+    e = os.environ.get("FRUGAL_HOME")
+    return pathlib.Path(e).expanduser() if e else pathlib.Path(home or home_dir()) / ".frugal-bridge"
+
+
+def frugal_reg(home=None):
+    """Frugal-Bridge's user-level registry (global.json), or None when it is not installed that way."""
+    try:
+        r = json.loads(read(frugal_home(home) / "global.json") or "null")
+    except json.JSONDecodeError:
+        return None
+    return r if isinstance(r, dict) else None
+
+
+def same_dir(a, b):
+    return bool(a) and pathlib.Path(a).expanduser().resolve() == pathlib.Path(b).resolve()
+
+
+def frugal_points_here(base, home=None):
+    r = frugal_reg(home)
+    return bool(r) and same_dir(r.get("base"), base)
+
+
+def frugal_kit(home=None, reg=None):
+    """Frugal-Bridge's kit/setup.py: $FRUGAL_BRIDGE_KIT, a 'kit' path in global.json, or ~/frugal-bridge."""
+    home = pathlib.Path(home or home_dir())
+    for c in (os.environ.get("FRUGAL_BRIDGE_KIT"), (reg or {}).get("kit"), str(home / "frugal-bridge")):
+        if not c:
+            continue
+        p = pathlib.Path(c).expanduser()
+        for f in (p, p / "setup.py", p / "kit" / "setup.py"):
+            if f.name == "setup.py" and f.is_file():
+                return f
+    return None
+
+
+def frugal_user_lines(text):
+    """Filled lines of a Frugal USER.md: [(key, label or None, value)]. Empty template fields are skipped."""
+    out = []
+    for line in body_of(text or "").splitlines():
+        t = line.strip()
+        if not t or t.startswith(("#", "<!--", ">")):
+            continue
+        m = LABEL_LINE.match(t)
+        if m:
+            label, value = m.group(1).strip(), m.group(2).strip()
+            if not value or value in ("...", "-") or re.fullmatch(r"<[^>]*>", value):
+                continue
+            out.append((norm(f"{label}: {value}"), label, value))
+        elif is_fact_line(t):
+            v = re.sub(r"^[-*]\s+", "", t)
+            out.append((norm(v), None, v))
+    return out
+
+
+def frugal_target(label):
+    if label:
+        n = norm(label)
+        for key, page, bl in FRUGAL_USER_MAP:
+            if n.startswith(key):
+                return page, bl
+    return FRUGAL_FALLBACK_PAGE, None
+
+
+def labelled(text, labels):
+    """(index, line, value) of the first '- Label: value' line whose label is one of labels."""
+    want = {norm(x) for x in labels if x}
+    for i, l in enumerate(text.split("\n")):
+        m = LABEL_LINE.match(l.strip())
+        if m and norm(m.group(1)) in want:
+            return i, l.strip(), m.group(2).strip()
+    return None
+
+
+def add_to_section(text, line):
+    if FRUGAL_SECTION not in text:
+        return text.rstrip("\n") + f"\n\n{FRUGAL_SECTION}\n{line}\n"
+    i = text.index(FRUGAL_SECTION) + len(FRUGAL_SECTION)
+    j = text.find("\n## ", i)
+    if j < 0:
+        return text.rstrip("\n") + f"\n{line}\n"
+    return text[:j].rstrip("\n") + f"\n{line}\n" + text[j:]
+
+
+def short_label(label):
+    return re.sub(r"\s*\([^)]*\)\s*$", "", label or "") or label
+
+
+def merge_user_line(text, label, value):
+    """Merge one Frugal line into a page. Returns (new text, 'filled'|'added'|'duplicate'|'conflict', base line)."""
+    _, bl = frugal_target(label)
+    if label is None:
+        for l in text.split("\n"):
+            if norm(re.sub(r"^[-*]\s+", "", l.strip())) == norm(value):
+                return text, "duplicate", l.strip()
+        return add_to_section(text, f"- {value}"), "added", None
+    want = bl or short_label(label)
+    hit = labelled(text, (bl, label, short_label(label)))
+    if hit:
+        i, line, cur = hit
+        if not cur:
+            lines = text.split("\n")
+            lines[i] = f"- {want}: {value}"
+            return "\n".join(lines), "filled", None
+        return text, ("duplicate" if norm(cur) == norm(value) else "conflict"), line
+    return add_to_section(text, f"- {want}: {value}"), "added", None
+
+
+def touch_frontmatter(text, src):
+    if not text.startswith("---\n") or text.find("\n---", 4) < 0:
+        return text
+    end = text.find("\n---", 4)
+    head, rest = text[:end], text[end:]
+    head = re.sub(r"(?m)^updated:.*$", f"updated: {today()}", head)
+    m = re.search(r"(?m)^sources:[ \t]*\[(.*)\][ \t]*$", head)
+    if m and src not in m.group(1):
+        inner = m.group(1).strip()
+        head = head[:m.start()] + f"sources: [{inner + ', ' if inner else ''}{src}]" + head[m.end():]
+    return head + rest
+
+
 class Connector:
     """Writes (and removes) the per-user pointer blocks, Claude Code hooks, timer and watch service for one base."""
 
@@ -1765,6 +1941,13 @@ class Connector:
         b = rec["blocks"].get(r)
         span = find_block(old)
         core = pointer_block(self.base)
+        fr = FRUGAL_START_RE.search(old or "")
+        if span and fr and fr.start() < span[0] and b is not None and b.get("mode") != "replaced":
+            # our block sits after Frugal-Bridge's (older connect): move ours in front, its bytes untouched
+            old, _ = Installer.strip_block(old, b.get("mode", "append"))
+            span, fr, keep = None, FRUGAL_START_RE.search(old), {x: b[x] for x in ("created", "dirs") if x in b}
+        else:
+            keep = {}
         if span and old:
             if b is None:     # a block we did not write (older version): give it back on disconnect
                 b = {"mode": "replaced", "previous": old[span[0]:span[1]]}
@@ -1773,6 +1956,8 @@ class Connector:
             b, new = {"mode": "new", "created": old is None}, core + "\n"
             if old is None and self.missing_dirs(r):
                 b["dirs"] = self.missing_dirs(r)
+        elif fr:              # fixed order: base block first, Frugal-Bridge's block after it (never edited)
+            b, new = {**keep, "mode": "before-frugal"}, old[:fr.start()] + core + "\n\n" + old[fr.start():]
         elif old.endswith("\n"):
             b, new = {"mode": "append"}, old + "\n" + core + "\n"
         else:
@@ -1845,6 +2030,7 @@ class Connector:
                             f"{WATCH_UNIT}.service {UNIT}.timer")
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.save_kits(k)
+        self.frugal_take_over()
         return self.log
 
     def units(self, store, texts):
@@ -1887,6 +2073,195 @@ class Connector:
         if read(p) != new:
             self.put(r, new)
         h["sha"] = sha(read(p))
+
+    # -- Frugal-Bridge at user level: import its USER.md, switch it to the base; give it back on disconnect
+    def user_slot(self, k=None):
+        k = k if k is not None else self.kits()
+        return (k.get("slots") or {}).get("user") or BASE_SLOTS["user"]
+
+    def slot_page(self, slot, page):
+        return slot + page if slot.endswith("/") else slot
+
+    def run_frugal(self, reg):
+        """Re-run Frugal-Bridge's own `install --global` for the tools it already has. True when it ran."""
+        kit = frugal_kit(self.home, reg)
+        if not kit:
+            self.log.append("Frugal-Bridge: its kit was not found (~/frugal-bridge, or set FRUGAL_BRIDGE_KIT); run "
+                            "`python3 <frugal-bridge>/kit/setup.py install --global` yourself so it picks this up")
+            return False
+        hosts = sorted(reg.get("tools") or {})
+        cmd = [sys.executable, str(kit), "install", "--global"] + (["--hosts", ",".join(hosts)] if hosts else [])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.log.append(f"Frugal-Bridge: install --global did not run: {e}")
+            return False
+        if r.returncode:
+            self.log.append("Frugal-Bridge: install --global reported:\n  "
+                            + "\n  ".join((r.stdout + r.stderr).strip().splitlines()[-6:]))
+        return True
+
+    def frugal_take_over(self):
+        user = frugal_home(self.home) / "USER.md"
+        if user.is_file():
+            self.frugal_import(user)
+        reg = frugal_reg(self.home)
+        if reg is None or same_dir(reg.get("base"), self.base):
+            return                                   # not installed for this user, or already on this base
+        self.run_frugal(reg)
+        if not frugal_points_here(self.base, self.home):
+            return
+        self.log.append(f"Frugal-Bridge: now uses this base for the user files (slot {self.user_slot()}); "
+                        f"{user} left in place")
+        k = self.kits()                              # its re-run may have re-ordered its own hooks: that is the
+        h = k["kits"]["base-folder"].get("connect", {}).get("hooks")   # state disconnect gives back
+        if h and h.get("exact"):
+            h["sha"] = sha(read(self.home / h["file"]) or "")
+            self.save_kits(k)
+
+    def frugal_import(self, user):
+        text = read(user) or ""
+        k = self.kits()
+        me = k["kits"]["base-folder"]
+        rec = dict(me.get("frugal_user") or {})
+        if rec.get("sha") == sha(text):
+            return                                    # nothing new since the last import
+        done = set(rec.get("lines", []))
+        slot = self.user_slot(k)
+        pages, review, counts = {}, [], {"filled": 0, "added": 0}
+        for key, label, value in frugal_user_lines(text):
+            if key in done:
+                continue
+            page, _ = frugal_target(label)
+            r = self.slot_page(slot, page)
+            if r not in pages:
+                pages[r] = read(self.base / r)
+                if pages[r] is None:
+                    title = PAGE_TITLES.get(page, pathlib.Path(r).stem)
+                    pages[r] = (f"---\ntitle: {title}\nsources: [{FRUGAL_SRC_NAME}]\nupdated: {today()}\n"
+                                f"scope: private\n---\n\n# {title}\n")
+            pages[r], what, line = merge_user_line(pages[r], label, value)
+            shown = f"- {label}: {value}" if label else f"- {value}"
+            if what in counts:
+                counts[what] += 1
+            else:
+                review.append((what, r, line, shown))
+            done.add(key)
+        changed = {r: touch_frontmatter(t, FRUGAL_SRC_NAME) for r, t in pages.items() if t != read(self.base / r)}
+        card = None
+        if changed or review:
+            bdir = self.base / ".brain" / "backups" / f"frugal-import-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(user, bdir / "frugal-USER.md")
+            for r in changed:
+                if (self.base / r).is_file():
+                    (bdir / r).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(self.base / r, bdir / r)
+            rec.setdefault("backups", []).append(rel(bdir, self.base))
+            for r, t in changed.items():
+                write(self.base / r, t)
+            if review:
+                card = self.review_card(user, slot, review)
+                rec["review"] = card
+        rec.update({"file": str(user), "sha": sha(text), "lines": sorted(done), "last": today()})
+        rec.setdefault("first", today())
+        me["frugal_user"] = rec
+        self.save_kits(k)
+        if changed or review:
+            self.log.append(f"Frugal-Bridge USER.md merged into {slot}: {counts['filled']} filled, "
+                            f"{counts['added']} added, {len(review)} to review"
+                            + (f" ({card})" if card else "") + "; nothing overwritten")
+
+    def review_card(self, user, slot, review):
+        r = f"board/{today()}-review-frugal-user-import.md"
+        p = self.base / r
+        stems = sorted({pathlib.Path(x[1]).stem for x in review if (self.base / x[1]).is_file()})
+        lines = []
+        for what, page, line, shown in review:
+            lines.append(f"- {what}: `{page}` has `{line}`; Frugal-Bridge USER.md has `{shown}`"
+                         + ("" if what == "duplicate" else " (the base kept its line)"))
+        old = read(p)
+        if old is None:
+            title = "Review what came from Frugal-Bridge USER.md"
+            links = ", ".join(f"[[{s}]]" for s in stems) or f"`{slot}`"
+            old = (f"---\ntitle: {title}\nstatus: todo\nowner: me\nproject: none\ndue:\nupdated: {today()}\n"
+                   f"scope: private\n---\n\n# {title}\n\n"
+                   f"- What: connect merged `{user}` into the base user slot `{slot}`. Nothing was overwritten. "
+                   "The lines below were already there (duplicate) or say something else (conflict).\n"
+                   f"- Why: the base is the one user file now; keep the right line in {links}.\n"
+                   "- Next step: fix the pages, then set this card to done.\n\n## Needs review\n")
+        write(p, old.rstrip("\n") + "\n" + "\n".join(lines) + "\n")
+        return r
+
+    def frugal_export_text(self, old):
+        slot = self.user_slot()
+        files = sorted((self.base / slot).glob("*.md")) if slot.endswith("/") else [self.base / slot]
+        texts = {f: read(f) or "" for f in files if f.is_file()}
+        by_page = {f.name: t for f, t in texts.items()}
+        used = set()
+        labels = []                                   # the old file's own fields, in its order (top part only)
+        for x in body_of(old or "").splitlines():
+            if x.startswith("## "):
+                break
+            m = LABEL_LINE.match(x.strip())
+            if m and m.group(1).strip() not in labels:
+                labels.append(m.group(1).strip())
+        labels = labels or list(FRUGAL_LABELS)
+        out = [f"<!-- exported from Skeleton Base on {today()} when it was disconnected: this is Frugal-Bridge's "
+               "user file again; connect the base later and it merges new lines back -->",
+               "# USER.md — who the user is and how they want answers", ""]
+        for label in labels:
+            page, bl = frugal_target(label)
+            t = by_page.get(page) if slot.endswith("/") else next(iter(texts.values()), "")
+            hit = labelled(body_of(t or ""), (bl, label, short_label(label)))
+            if hit and hit[2]:
+                used.add(norm(hit[1]))
+                out.append(f"- {label}: {hit[2]}")
+            else:
+                out.append(f"- {label}:")
+        for f, t in texts.items():
+            fm = frontmatter(t) or {}
+            keep = []
+            for l in body_of(t).splitlines():
+                s = l.strip()
+                if not is_fact_line(s) or "[[" in s or norm(s) in used:
+                    continue
+                m = LABEL_LINE.match(s)
+                if m and not m.group(2).strip():
+                    continue
+                keep.append(s if s.startswith(("-", "*")) else f"- {s}")
+            if keep:
+                out += ["", f"## {fm.get('title') or f.stem} (from the base: {rel(f, self.base)})"] + keep
+        return "\n".join(out) + "\n"
+
+    def frugal_give_back(self):
+        reg = frugal_reg(self.home)
+        if not reg or not same_dir(reg.get("base"), self.base):
+            return
+        user = frugal_home(self.home) / "USER.md"
+        old = read(user)
+        text = self.frugal_export_text(old)
+        if old != text:
+            if old is not None:
+                bd = frugal_home(self.home) / "backup" / f"skeleton-base-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
+                bd.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(user, bd / "USER.md")
+                self.log.append(f"backed up {user} -> {bd / 'USER.md'}")
+            write(user, text)
+            self.log.append(f"exported the base user slot ({self.user_slot()}) -> {user}")
+        k = self.kits()
+        me = k.get("kits", {}).get("base-folder")
+        if me is not None:                            # what we wrote is known: a later connect imports none of it
+            rec = dict(me.get("frugal_user") or {})
+            rec["lines"] = sorted(set(rec.get("lines", [])) | {x[0] for x in frugal_user_lines(text)})
+            rec.update({"file": str(user), "sha": sha(text), "exported": today()})
+            me["frugal_user"] = rec
+            self.save_kits(k)
+        self.run_frugal(reg)
+        if frugal_points_here(self.base, self.home):
+            self.log.append("Frugal-Bridge still points at this base: re-run its `install --global` by hand")
+        else:
+            self.log.append(f"Frugal-Bridge: back on its own user file {user}")
 
     def disconnect(self):
         k = self.kits()
@@ -1934,6 +2309,7 @@ class Connector:
             self.log.append(f"if the timer was enabled: systemctl --user disable --now {UNIT}.timer")
         del me["connect"]
         self.save_kits(k)
+        self.frugal_give_back()
         return self.log
 
     def unmerge_hooks(self, h):
