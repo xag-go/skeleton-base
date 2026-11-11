@@ -2,6 +2,32 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.3.0 - 2026-11-11
+- `brain.py watch`: instant collect. Foreground daemon, standard library only: inotify through `ctypes`, polling
+  every 5 s where inotify is not available (`--poll`). Debounce 2 s quiet / 10 s max (`--quiet-s`, `--max-s`).
+  Each run, in a child process: auto-connect, collect, then `index` + `map` + a git commit of only the files it
+  writes, only when something is new (never pushes). Missing folders are picked up when they appear, deleted ones
+  when re-created; a full rescan every 10 minutes. SQLite stores count only real writes to `-wal` (any reader,
+  our own read-only collect too, opens `-wal` / `-shm`). One watcher per base (`.brain/watch.lock`). The daemon
+  re-executes itself from bytecode in `.brain/pycache/`: ~19 MB idle.
+- `watch --add PATH [--source NAME] [--match GLOB,...] [--depth N]`, `--remove PATH`, `--list`, `--discover`
+  (suggestions only), `--once`. Added locations live in `.brain/watch.json` and are reloaded live. Any SQLite
+  store is read read-only: text columns of each row become one item, volatile columns (access counters, scores,
+  last use, embeddings) are left out. `collect --only` accepts the added sources.
+- New built-in locations: Hermes profiles (`~/.hermes/profiles/*/memories/*.md` and `*/memory_store.db`), Qwen Code
+  (`~/.qwen/QWEN.md`, new `qwen` source).
+- `connect` covers more tools: Qwen Code, opencode, Windsurf, Kiro (created if missing), OpenClaw and Hermes
+  (`SOUL.md`, only when it exists), Cursor listed as needs-user. `connect --print` prints the block.
+- Zero-touch: on a connected base the watcher connects a known tool as soon as its folder appears, and an unknown
+  folder that looks like an AI tool (rules file, memory folder or memory database) through its existing rules
+  file, and watches its memory. No rules file: listed as `needs-user` in `.brain/watch.json` and `watch --list`.
+  Other folders are never touched. All of it is recorded in `.kits.json` and undone by `disconnect`.
+- `connect --watch` writes `~/.config/systemd/user/skeleton-base-watch.service` (`Restart=on-failure`,
+  `MemoryMax=40M`, `Nice=10`) plus the daily timer as a safety net, and prints the enable command; `--kick` adds a
+  Claude Code `PostToolUse` (`Write|Edit`) hook that writes `.brain/kick`. `disconnect` removes both.
+- `.gitignore` block also ignores `.brain/watch.lock`, `.brain/kick`, `.brain/*.tmp`, `.brain/pycache/`;
+  uninstall removes them.
+
 ## v1.2.0 - 2026-11-11
 - `brain.py map [--force]`: draws the base as a mind map, deterministic (same pages = same bytes).
   - `maps/brain.canvas` (JSON Canvas 1.0, opens in Obsidian): `me` in the centre (`wiki/me/` + `hot.md`), one

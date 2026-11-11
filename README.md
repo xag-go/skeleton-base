@@ -95,9 +95,11 @@ missing store or an unknown database layout is skipped with a note, never an err
 | `claude-code` | `.claude/projects/*/memory/*.md` |
 | `codex` | `.codex/memories/**/*.md`, `.codex/memories_*.sqlite` (table `stage1_outputs`) |
 | `gemini` | `.gemini/GEMINI.md` (without the base's own block), `.gemini/**/memory*.md` |
-| `hermes` | `.hermes/memories/*.md` |
-| `hermes-facts` | `.hermes/memory_store.db` (table `facts`) |
+| `qwen` | `.qwen/QWEN.md` (without the base's own block) |
+| `hermes` | `.hermes/memories/*.md`, `.hermes/profiles/*/memories/*.md` |
+| `hermes-facts` | `.hermes/memory_store.db`, `.hermes/profiles/*/memory_store.db` (table `facts`) |
 | `openclaw` | `.openclaw/workspace/MEMORY.md`, `USER.md`, `memory/*.md` |
+| any name | every location added with `watch --add` (see below) |
 
 ```sh
 python3 tools/brain.py collect --baseline     # first run on a filled base: remember what exists, write nothing
@@ -113,24 +115,80 @@ ingest them (`skills/base-ingest`). Paths come from `$HOME`; the default base is
 ## Connect: every tool on this computer knows the base
 
 ```sh
-python3 tools/brain.py connect            # add --timer for a daily systemd user timer
+python3 tools/brain.py connect            # add --timer for a daily systemd user timer, --watch: see below
 python3 tools/brain.py disconnect         # remove exactly what connect wrote
+python3 tools/brain.py connect --print    # only print the pointer block (for a tool you set up by hand)
 ```
 
 For the current user, `connect`:
-- writes a marked pointer block (`<!-- base-folder:start v2 -->` ... `<!-- base-folder:end -->`) into
-  `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` and `~/.gemini/GEMINI.md`, only for tools that are installed (their
-  folder exists). It says where the base is, to read `hot.md` then `wiki/index.md` only when owner context is
-  needed (never for plain coding), never to edit `raw/`, and the Saving knowledge rule. An older block is
-  replaced in place; all other text stays byte-identical.
+- writes a marked pointer block (`<!-- base-folder:start v2 -->` ... `<!-- base-folder:end -->`) into the global
+  rules file of every installed tool (its folder exists). It says where the base is, to read `hot.md` then
+  `wiki/index.md` only when owner context is needed (never for plain coding), never to edit `raw/`, and the Saving
+  knowledge rule. An older block is replaced in place; all other text stays byte-identical.
+
+  | tool | file | |
+  |---|---|---|
+  | Claude Code | `~/.claude/CLAUDE.md` | created if missing |
+  | Codex | `~/.codex/AGENTS.md` | created if missing |
+  | Gemini CLI | `~/.gemini/GEMINI.md` | created if missing |
+  | Qwen Code | `~/.qwen/QWEN.md` | created if missing |
+  | opencode | `~/.config/opencode/AGENTS.md` | created if missing |
+  | Windsurf | `~/.codeium/windsurf/memories/global_rules.md` | created if missing |
+  | Kiro | `~/.kiro/steering/skeleton-base.md` | its own steering file |
+  | OpenClaw | `~/.openclaw/workspace/AGENTS.md` | only if it exists (OpenClaw seeds it on first run) |
+  | Hermes | `~/.hermes/SOUL.md`, `~/.hermes/profiles/*/SOUL.md` | only if it exists: it is the agent's identity, the only context file Hermes loads globally; creating one would replace its default identity |
+  | Cursor | - | needs you: global User Rules live in its app settings (`connect --print`) |
+
 - merges two Claude Code hooks into `~/.claude/settings.json` (`SessionEnd`, `PreCompact`) that run
   `collect --quiet`. Other hooks and keys are kept; a backup goes to `.brain/backups/`.
 - with `--timer`: writes `~/.config/systemd/user/skeleton-base-collect.service` and `.timer` (daily and 10 minutes
   after boot, `Persistent=true`) and prints the command to enable it:
   `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
+- with `--watch`: the watch service as well (next section); with `--kick`: a Claude Code `PostToolUse` hook.
 
 Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
 remove exactly that and give the previous text back, including an older pointer block it replaced.
+
+## Instant and zero-touch
+
+`collect` on hooks and a daily timer is good; `watch` makes it instant. It is a small foreground daemon (standard
+library, inotify through `ctypes`; it polls every 5 s where inotify is not available). On any change in a tool's
+memory it waits until things are quiet (2 s, at most 10 s during a long burst), then in one run: auto-connects
+tools that are new, collects, and if anything is new runs `index` and `map` and makes a git commit of exactly
+those files (`raw/inbox/collected/`, `wiki/index.md`, `maps/brain.*`, `.brain/collector.json`,
+`.brain/watch.json`, `.kits.json`). It never pushes.
+
+```sh
+python3 tools/brain.py connect --watch           # writes the service (+ the daily timer as a safety net)
+systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-watch.service skeleton-base-collect.timer
+python3 tools/brain.py watch --list              # locations, and every tool: connected or needs-user
+python3 tools/brain.py watch --add ~/.sometool/memory --source sometool    # watch and collect one more store
+python3 tools/brain.py watch --remove ~/.sometool/memory
+python3 tools/brain.py watch --discover          # suggest memory-like stores nothing watches yet (changes nothing)
+python3 tools/brain.py watch                     # run it in the foreground instead (Ctrl+C stops it)
+```
+
+- **What it watches:** every location in the collect table, the locations you add (kept in `.brain/watch.json`;
+  a running watcher reloads it at once), new folders in `~` and `~/.config`, and `.brain/kick`.
+- **Any store you add:** a folder of Markdown / text files, one file, or a SQLite database. A database is opened
+  read-only; every row's text columns become one item. Columns that change when a tool only reads (access
+  counters, scores, timestamps of last use, embeddings) are left out, so reading is not news.
+- **Zero-touch connect** (only once the base is connected: `connect` or `connect --watch`): when a known tool's
+  folder appears (table above), it gets the pointer block like `connect` would write it, recorded for
+  `disconnect` and backed up. An unknown folder that looks like an AI tool (an `AGENTS.md` or `NAME.md` rules
+  file, a `memory` / `memories` folder, a `memory*.db`) gets the block in its existing rules file and its memory
+  is watched and collected. If there is no rules file, its memory is still watched and the tool is listed as
+  `needs-user` in `watch --list`. Folders that do not look like an AI tool are never touched. A watcher on a base
+  that is not connected only collects.
+- **Self-healing:** a folder that does not exist yet is picked up when it appears, a deleted and re-created one
+  too; a full rescan every 10 minutes catches anything missed.
+- **Small:** ~19 MB of memory idle, 0 CPU while nothing changes. The service runs with `Nice=10` and
+  `MemoryMax=40M`, `Restart=on-failure`.
+- **Kick hook (optional):** `connect --watch --kick` adds a Claude Code `PostToolUse` hook (`Write|Edit`) that
+  writes `.brain/kick` when a memory or rules file is saved. Any hook or script can do the same: write the file
+  (a bare `touch` is not seen).
+- **Undo:** `systemctl --user disable --now skeleton-base-watch.service`, then `disconnect`: every file connect
+  and auto-connect wrote, the hooks and the service come back exactly as before.
 
 ## See your brain as a map
 
