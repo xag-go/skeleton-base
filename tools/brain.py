@@ -26,15 +26,33 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                copy NEW items from each tool's memory store (read-only) into
                                raw/inbox/collected/SOURCE/; dedupe by hash in .brain/collector.json.
                                --baseline only records hashes (content already in the base).
-                               SRC: claude-code, codex, gemini, hermes, hermes-facts, openclaw
-  connect [--base DIR] [--timer]
-                               for the current user: pointer block in ~/.claude/CLAUDE.md,
-                               ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (where the tool is installed),
-                               Claude Code SessionEnd/PreCompact hooks running collect; --timer also
-                               writes a daily systemd user timer
-  disconnect [--base DIR]      remove exactly what connect wrote
+                               SRC: claude-code, codex, gemini, qwen, hermes, hermes-facts, openclaw,
+                               plus every source added with watch --add
+  connect [--base DIR] [--timer] [--watch] [--kick] [--print]
+                               for the current user: pointer block in each installed tool's global rules
+                               file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md,
+                               ~/.qwen/QWEN.md, ~/.config/opencode/AGENTS.md, an existing
+                               ~/.openclaw/workspace/AGENTS.md or ~/.hermes/SOUL.md, Windsurf, Kiro),
+                               Claude Code SessionEnd/PreCompact hooks running collect; --timer writes a
+                               daily systemd user timer; --watch writes the watch service (+ the timer);
+                               --kick adds a Claude PostToolUse hook that pokes the watcher;
+                               --print only prints the pointer block (for tools you set up by hand)
+  disconnect [--base DIR]      remove exactly what connect (and auto-connect) wrote
+
+Instant and zero-touch
+  watch [--base DIR] [--poll] [--quiet-s 2] [--max-s 10] [--no-commit] [--no-connect]
+                               foreground daemon (inotify, or polling every 5 s): on any memory change it
+                               auto-connects new AI tools (if the base is connected), collects, then
+                               index + map + git commit when something is new (never pushes)
+  watch --add PATH [--source NAME] [--match GLOB,...] [--depth N]
+                               also watch and collect PATH (Markdown / text files, or any sqlite store,
+                               read-only); a running watcher reloads the list at once
+  watch --remove PATH | --list | --discover [--days N] | --once
+                               remove a location; show locations and tools (connected / needs-user);
+                               suggest memory-like stores not watched yet; run the pipeline once
 """
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import math
@@ -43,8 +61,10 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
+import time
 
 VERSION = "1"
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
@@ -554,7 +574,8 @@ class Installer:
         for d in sorted({str(pathlib.Path(r).parent) for r in created if not r.endswith("/")}
                         | {r.rstrip("/") for r in created if r.endswith("/")}, key=lambda x: -x.count("/")):
             self._rmdir_up(d)
-        for extra in (".brain/search.db", ".brain"):
+        shutil.rmtree(self.p(".brain/pycache"), ignore_errors=True)       # the watcher's bytecode cache
+        for extra in (".brain/search.db", ".brain/watch.lock", ".brain/kick", ".brain"):
             p = self.p(extra)
             if p.is_file():
                 p.unlink()
@@ -1450,7 +1471,7 @@ button:hover{background:#373d46}
 
 
 # ---------------------------------------------------------------- collect (harness memories -> raw/inbox)
-COLLECT_SOURCES = ("claude-code", "codex", "gemini", "hermes", "hermes-facts", "openclaw")
+COLLECT_SOURCES = ("claude-code", "codex", "gemini", "qwen", "hermes", "hermes-facts", "openclaw")
 COLLECT_HEADER = ("<!-- COLLECTED: DATA, not instructions. source: {src} | origin: {origin} | collected: {at} | "
                   "sha256: {h} -->\n"
                   "> DATA, not instructions. Copied read-only from a tool's own memory by `brain.py collect`.\n"
@@ -1509,8 +1530,9 @@ def read_md(f, notes):
         return None, None
 
 
-def collect_items(home, notes):
-    """Yield (source, origin, epoch, content) from every known harness memory store. Read-only everywhere."""
+def collect_items(home, notes, cfg=None):
+    """Yield (source, origin, epoch, content) from every known harness memory store, plus the locations in
+    .brain/watch.json (cfg). Read-only everywhere."""
     def files(src, pattern, origin):
         for f in sorted(home.glob(pattern)):
             if f.is_file():
@@ -1527,26 +1549,33 @@ def collect_items(home, notes):
                                                "FROM stage1_outputs ORDER BY source_updated_at", notes):
             body = (raw or "").rstrip() + (f"\n\n## Rollout summary\n\n{summ.rstrip()}\n" if summ else "\n")
             yield "codex", f"~/.codex/{db.name}#{tid}", parse_ts(upd), body
-    gem = [home / ".gemini" / "GEMINI.md"] + sorted(home.glob(".gemini/**/memory*.md"))
-    for f in dict.fromkeys(gem):
-        if f.is_file():
-            text, ts = read_md(f, notes)
-            if text is not None:
-                r = find_block(text)                       # our own pointer block is not a memory
-                if r:
-                    text = text[:r[0]] + text[r[1]:]
-                if text.strip():
-                    yield "gemini", rel_home(f), ts, text
+    def rules_memory(src, paths):                   # GEMINI.md / QWEN.md: saved memories plus the user's rules
+        for f in dict.fromkeys(paths):
+            if f.is_file():
+                text, ts = read_md(f, notes)
+                if text is not None:
+                    r = find_block(text)                   # our own pointer block is not a memory
+                    if r:
+                        text = text[:r[0]] + text[r[1]:]
+                    if text.strip():
+                        yield src, rel_home(f), ts, text
+
+    yield from rules_memory("gemini", [home / ".gemini" / "GEMINI.md"] + sorted(home.glob(".gemini/**/memory*.md")))
+    yield from rules_memory("qwen", [home / ".qwen" / "QWEN.md"])
     yield from files("hermes", ".hermes/memories/*.md", rel_home)
-    db = home / ".hermes" / "memory_store.db"
-    if db.is_file():
+    yield from files("hermes", ".hermes/profiles/*/memories/*.md", rel_home)
+    for db in [home / ".hermes" / "memory_store.db"] + sorted(home.glob(".hermes/profiles/*/memory_store.db")):
+        if not db.is_file():
+            continue
         for fid, content, cat, tags, cr, up in ro_rows(db, "SELECT fact_id, content, category, tags, created_at, "
                                                            "updated_at FROM facts ORDER BY fact_id", notes):
             body = (f"- fact_id: {fid}\n- category: {cat}\n- tags: {tags}\n- created: {cr}\n- updated: {up}\n\n"
                     f"{content}\n")
-            yield "hermes-facts", f"~/.hermes/memory_store.db#facts/{fid}", parse_ts(up or cr), body
+            yield "hermes-facts", f"{rel_home(db)}#facts/{fid}", parse_ts(up or cr), body
     for pattern in (".openclaw/workspace/MEMORY.md", ".openclaw/workspace/USER.md", ".openclaw/workspace/memory/*.md"):
         yield from files("openclaw", pattern, rel_home)
+    if cfg:
+        yield from extra_items(home, cfg, notes)
 
 
 def collect(base, only=None, baseline=False, since=None, quiet=False):
@@ -1554,10 +1583,12 @@ def collect(base, only=None, baseline=False, since=None, quiet=False):
     if not base.is_dir():
         print(f"collect: base {base} does not exist", file=sys.stderr); return 1
     home = home_dir()
-    only = set(only or COLLECT_SOURCES)
-    bad = only - set(COLLECT_SOURCES)
+    cfg = watch_cfg(base)
+    known = COLLECT_SOURCES + tuple(x for x in extra_sources(cfg) if x not in COLLECT_SOURCES)
+    only = set(only or known)
+    bad = only - set(known)
     if bad:
-        print(f"collect: unknown source(s) {', '.join(sorted(bad))} (use {','.join(COLLECT_SOURCES)})",
+        print(f"collect: unknown source(s) {', '.join(sorted(bad))} (use {','.join(known)})",
               file=sys.stderr); return 1
     man_p = base / ".brain" / "collector.json"
     man_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1574,7 +1605,7 @@ def collect(base, only=None, baseline=False, since=None, quiet=False):
     hashes = man.setdefault("hashes", {})
     at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     notes, per, new, dupes, old = [], {}, 0, 0, 0
-    for src, origin, ts, content in collect_items(home, notes):
+    for src, origin, ts, content in collect_items(home, notes, cfg):
         if src not in only:
             continue
         ts = ts if ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
@@ -1619,7 +1650,7 @@ def collect(base, only=None, baseline=False, since=None, quiet=False):
 
 # ---------------------------------------------------------------- connect (pointer blocks, hooks, timer)
 CONNECT_VERSION = "2"
-CONNECT_FILES = ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md"), (".gemini", "GEMINI.md"))
+CONNECT_FILES = ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md"), (".gemini", "GEMINI.md"))   # + AUTO_TOOLS
 HOOK_EVENTS = ("SessionEnd", "PreCompact")
 UNIT = "skeleton-base-collect"
 
@@ -1641,33 +1672,56 @@ Path: {b}
 - Keep a short copy in your own memory too; both should have it. Never only in your own memory."""
 
 
+def pointer_block(base):
+    return f"<!-- base-folder:start v{CONNECT_VERSION} -->\n{pointer_body(base)}\n{END}"
+
+
 def collect_cmd(base):
     import shlex
     q = shlex.quote(str(base))
     return f"python3 {shlex.quote(str(base / 'tools' / 'brain.py'))} collect --base {q} --quiet"
 
 
+def kick_cmd(base):
+    """Claude Code PostToolUse hook: a write to a memory or rules file pokes the watcher (writes, never touches:
+    a bare touch is only IN_ATTRIB). Costs ~2 ms, never fails the tool call."""
+    import shlex
+    return (f"grep -qiE 'memor|/(AGENTS|CLAUDE)\\.md' && date +%s > {shlex.quote(str(base / '.brain' / 'kick'))}"
+            " || true")
+
+
+def unit_esc(s):
+    s = str(s).replace("%", "%%")
+    return f'"{s}"' if any(c.isspace() for c in s) else s
+
+
 def unit_texts(base):
-    def esc(s):
-        s = str(s).replace("%", "%%")
-        return f'"{s}"' if any(c.isspace() for c in s) else s
     service = (f"[Unit]\nDescription=Skeleton Base: copy new tool memories into the base inbox\n\n"
-               f"[Service]\nType=oneshot\nExecStart=/usr/bin/env python3 {esc(base / 'tools' / 'brain.py')} "
-               f"collect --base {esc(base)} --quiet\n")
+               f"[Service]\nType=oneshot\nExecStart=/usr/bin/env python3 {unit_esc(base / 'tools' / 'brain.py')} "
+               f"collect --base {unit_esc(base)} --quiet\n")
     timer = (f"[Unit]\nDescription=Skeleton Base: daily memory collect\n\n"
              f"[Timer]\nOnBootSec=10min\nOnCalendar=daily\nPersistent=true\nUnit={UNIT}.service\n\n"
              f"[Install]\nWantedBy=timers.target\n")
     return {f".config/systemd/user/{UNIT}.service": service, f".config/systemd/user/{UNIT}.timer": timer}
 
 
+def watch_unit_texts(base):
+    service = (f"[Unit]\nDescription=Skeleton Base: instant memory watcher (collect, index, map, auto-connect)\n\n"
+               f"[Service]\nType=simple\nExecStart=/usr/bin/env python3 -S {unit_esc(base / 'tools' / 'brain.py')} "
+               f"watch --base {unit_esc(base)}\nRestart=on-failure\nRestartSec=10\nMemoryMax=40M\nNice=10\n\n"
+               f"[Install]\nWantedBy=default.target\n")
+    return {f".config/systemd/user/{WATCH_UNIT}.service": service}
+
+
 class Connector:
-    """Writes (and removes) the per-user pointer blocks, Claude Code hooks and timer for one base."""
+    """Writes (and removes) the per-user pointer blocks, Claude Code hooks, timer and watch service for one base."""
 
     def __init__(self, base):
         self.base = pathlib.Path(base).resolve()
         self.home = home_dir()
         self.log = []
         self.bdir = None
+        self.tools, self.auto_extra = {}, []
 
     def kits(self):
         return load_json(self.base / ".kits.json", ".kits.json")
@@ -1697,7 +1751,42 @@ class Connector:
         self.log.append(f"wrote ~/{r}")
         return True
 
-    def connect(self, timer=False):
+    def missing_dirs(self, r):
+        d, made = (self.home / r).parent, []
+        while not d.exists():
+            made.append(rel(d, self.home)); d = d.parent
+        return made
+
+    def block_into(self, rec, r, may_create=True):
+        """Put the pointer block in HOME/r (recorded in rec for disconnect). False: file missing, not allowed."""
+        old = read(self.home / r)
+        if old is None and not may_create:
+            return False
+        b = rec["blocks"].get(r)
+        span = find_block(old)
+        core = pointer_block(self.base)
+        if span and old:
+            if b is None:     # a block we did not write (older version): give it back on disconnect
+                b = {"mode": "replaced", "previous": old[span[0]:span[1]]}
+            new = old[:span[0]] + core + old[span[1]:]
+        elif not old:
+            b, new = {"mode": "new", "created": old is None}, core + "\n"
+            if old is None and self.missing_dirs(r):
+                b["dirs"] = self.missing_dirs(r)
+        elif old.endswith("\n"):
+            b, new = {"mode": "append"}, old + "\n" + core + "\n"
+        else:
+            b, new = {"mode": "append-noeol"}, old + "\n\n" + core + "\n"
+        self.put(r, new)
+        rec["blocks"][r] = b
+        return True
+
+    def rules_files(self, pat):
+        if "*" not in pat:
+            return [pat]
+        return [rel(f, self.home) for f in sorted(self.home.glob(pat)) if f.is_file()]
+
+    def connect(self, timer=False, watch=False, kick=False, unknown=False):
         if not (self.base / "tools" / "brain.py").is_file():
             raise SystemExit(f"connect: {self.base} is not a base (no tools/brain.py)")
         k = self.kits()
@@ -1708,51 +1797,62 @@ class Connector:
                              "run disconnect as that user first")
         rec = {"home": str(self.home), "connected": prev.get("connected") or today(),
                "blocks": dict(prev.get("blocks", {})), "hooks": dict(prev.get("hooks", {})),
-               "timer": dict(prev.get("timer", {}))}
-        core = f"<!-- base-folder:start v{CONNECT_VERSION} -->\n{pointer_body(self.base)}\n{END}"
+               "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {}))}
 
-        for cfg, name in CONNECT_FILES:
-            if not (self.home / cfg).is_dir():
+        for key, files in AUTO_TOOLS.items():           # every installed tool we know: its global rules file
+            if not (self.home / key).is_dir():
                 continue
-            r = f"{cfg}/{name}"
-            old = read(self.home / r)
-            b = rec["blocks"].get(r)
-            span = find_block(old)
-            if span and old:
-                if b is None:     # a block we did not write (older version): give it back on disconnect
-                    b = {"mode": "replaced", "previous": old[span[0]:span[1]]}
-                new = old[:span[0]] + core + old[span[1]:]
-            elif not old:
-                b, new = {"mode": "new", "created": old is None}, core + "\n"
-            elif old.endswith("\n"):
-                b, new = {"mode": "append"}, old + "\n" + core + "\n"
+            done = [r for pat, how in files for r in self.rules_files(pat) if self.block_into(rec, r, how == "create")]
+            if done:
+                self.tools[key] = {"state": "connected", "files": done}
             else:
-                b, new = {"mode": "append-noeol"}, old + "\n\n" + core + "\n"
-            self.put(r, new)
-            rec["blocks"][r] = b
+                self.tools[key] = {"state": "needs-user", "why": NEEDS_USER.get(key, "no rules file found")}
+        if unknown:                                       # zero-touch: a dir that looks like an AI tool
+            for key, d in tool_dirs(self.home, self.base):
+                rules, mem = ai_signals(d)
+                if not rules and not mem:
+                    continue                              # not an AI tool: never touched
+                src = slug(key.removeprefix(".config/").lstrip("."))
+                for m in mem:
+                    self.auto_extra.append({"source": src, "root": home_rel(m, self.home), "auto": True,
+                                            "match": list(EXTRA_MATCH), "depth": 4})
+                if rules:
+                    r = rel(pathlib.Path(rules[0]), self.home)
+                    self.block_into(rec, r, False)
+                    self.tools[key] = {"state": "connected", "files": [r], "auto": True}
+                else:
+                    self.tools[key] = {"state": "needs-user", "auto": True, "memory": [home_rel(m, self.home)
+                                                                                      for m in mem],
+                                       "why": "looks like an AI tool (it has a memory store, now watched) but no "
+                                              "rules file we know: add the pointer in its settings by hand"}
 
         if (self.home / ".claude").is_dir():
-            self.merge_hooks(rec)
+            self.merge_hooks(rec, kick)
 
-        if timer:
-            for r, text in unit_texts(self.base).items():
-                t = rec["timer"].get(r) or {}
-                if not t:
-                    t["previous"] = self.backup(r)          # None: the file did not exist
-                    d, made = (self.home / r).parent, []
-                    while not d.exists():
-                        made.append(rel(d, self.home)); d = d.parent
-                    t["dirs"] = made
-                self.put(r, text)
-                t["sha"] = sha(text)
-                rec["timer"][r] = t
+        if timer or watch:
+            self.units(rec["timer"], unit_texts(self.base))
             self.log.append("timer files written; enable with:\n  systemctl --user daemon-reload && "
                             f"systemctl --user enable --now {UNIT}.timer")
+        if watch:
+            self.units(rec["watch"], watch_unit_texts(self.base))
+            self.log[-1] = ("watch service + daily timer (safety net) written; enable with:\n"
+                            f"  systemctl --user daemon-reload && systemctl --user enable --now "
+                            f"{WATCH_UNIT}.service {UNIT}.timer")
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.save_kits(k)
         return self.log
 
-    def merge_hooks(self, rec):
+    def units(self, store, texts):
+        for r, text in texts.items():
+            t = store.get(r) or {}
+            if not t:
+                t["previous"] = self.backup(r)          # None: the file did not exist
+                t["dirs"] = self.missing_dirs(r)
+            self.put(r, text)
+            t["sha"] = sha(text)
+            store[r] = t
+
+    def merge_hooks(self, rec, kick=False):
         r = ".claude/settings.json"
         p = self.home / r
         data = load_json(p, "~/" + r)
@@ -1764,13 +1864,17 @@ class Connector:
         elif h.get("sha") != sha(read(p) or ""):
             h["exact"] = False            # you changed it since: disconnect then removes only our entries
         hooks = data.setdefault("hooks", {})
-        for ev in HOOK_EVENTS:
+        want = [(ev, cmd, "" if ev == "PreCompact" else None) for ev in HOOK_EVENTS]
+        if kick or h.get("kick"):
+            h["kick"] = kick_cmd(self.base)
+            want.append(("PostToolUse", h["kick"], "Write|Edit"))
+        for ev, c, matcher in want:
             entries = hooks.setdefault(ev, [])
-            if any(x.get("command") == cmd for e in entries if isinstance(e, dict) for x in e.get("hooks", [])):
+            if any(x.get("command") == c for e in entries if isinstance(e, dict) for x in e.get("hooks", [])):
                 continue
-            entry = {"hooks": [{"type": "command", "command": cmd}]}
-            if ev == "PreCompact":
-                entry = {"matcher": "", **entry}
+            entry = {"hooks": [{"type": "command", "command": c}]}
+            if matcher is not None:
+                entry = {"matcher": matcher, **entry}
             entries.append(entry)
             if ev not in h["events"]:
                 h["events"].append(ev)
@@ -1787,9 +1891,13 @@ class Connector:
             return ["not connected (nothing changed)"]
         if rec.get("home") != str(self.home):
             raise SystemExit(f"disconnect: connected for {rec.get('home')}; run it as that user (HOME)")
+        if rec.get("watch"):
+            self.log.append(f"stop the watcher first if it runs: systemctl --user disable --now {WATCH_UNIT}.service")
+        dirs = set()
         for r, b in rec.get("blocks", {}).items():
             t = read(self.home / r)
             span = find_block(t)
+            dirs |= set(b.get("dirs", []))
             if t is None or not span:
                 continue
             if b.get("mode") == "replaced":
@@ -1803,8 +1911,9 @@ class Connector:
         h = rec.get("hooks")
         if h:
             self.unmerge_hooks(h)
-        for r, t in rec.get("timer", {}).items():
+        for r, t in list(rec.get("timer", {}).items()) + list(rec.get("watch", {}).items()):
             p = self.home / r
+            dirs |= set(t.get("dirs", []))
             if p.is_file() and sha(p.read_bytes()) == t.get("sha"):
                 if t.get("previous"):
                     shutil.copy2(self.base / t["previous"], p); self.log.append(f"restored ~/{r}")
@@ -1812,7 +1921,6 @@ class Connector:
                     p.unlink(); self.log.append(f"removed ~/{r}")
             elif p.exists():
                 self.log.append(f"kept ~/{r} (changed since connect)")
-        dirs = {d for t in rec.get("timer", {}).values() for d in t.get("dirs", [])}
         for d in sorted(dirs, key=lambda x: -x.count("/")):
             d = self.home / d
             if d.is_dir() and not any(d.iterdir()):
@@ -1835,6 +1943,7 @@ class Connector:
             else:
                 p.unlink(); self.log.append(f"removed ~/{r}")
             return
+        ours = {h["command"], h.get("kick")} - {None}
         data = load_json(p, "~/" + r)      # changed since: remove only our entries, keep the rest
         hooks = data.get("hooks")
         if isinstance(hooks, dict):
@@ -1842,7 +1951,7 @@ class Connector:
                 keep = []
                 for e in hooks.get(ev, []):
                     if isinstance(e, dict) and isinstance(e.get("hooks"), list):
-                        e["hooks"] = [x for x in e["hooks"] if x.get("command") != h["command"]]
+                        e["hooks"] = [x for x in e["hooks"] if x.get("command") not in ours]
                         if not e["hooks"]:
                             continue
                     keep.append(e)
@@ -1856,6 +1965,756 @@ class Connector:
             p.unlink(); self.log.append(f"removed ~/{r}")
         else:
             write(p, dump_json(data)); self.log.append(f"removed our hooks from ~/{r}")
+
+
+# ---------------------------------------------------------------- watch (instant collect, zero-touch connect)
+WATCH_UNIT = "skeleton-base-watch"
+WATCH_CFG = ".brain/watch.json"
+KICK = ".brain/kick"
+# (source, root under HOME, match globs relative to root, depth). Mirrors collect_items(); a match only TRIGGERS a
+# run, collect decides what is copied (AGENTS.md / SOUL.md are watched so a new rules file gets its pointer).
+WATCH_BUILTIN = (
+    ("claude-code", ".claude/projects", ("*/memory/*.md",), 2),
+    ("codex", ".codex/memories", ("*.md",), 8),
+    ("codex", ".codex", ("memories_*.sqlite", "memories_*.sqlite-wal"), 0),
+    ("gemini", ".gemini", ("GEMINI.md", "memory*.md"), 6),
+    ("qwen", ".qwen", ("QWEN.md",), 0),
+    ("hermes", ".hermes/memories", ("*.md",), 0),
+    ("hermes-facts", ".hermes", ("memory_store.db", "memory_store.db-wal", "SOUL.md"), 0),
+    ("hermes", ".hermes/profiles", ("*/memories/*.md", "*/memory_store.db", "*/memory_store.db-wal", "*/SOUL.md"), 2),
+    ("openclaw", ".openclaw/workspace", ("MEMORY.md", "USER.md", "AGENTS.md", "memory/*.md"), 1),
+)
+EXTRA_MATCH = ["*.md", "*.txt", "*.db", "*.sqlite", "*.sqlite3", "*.db-wal", "*.sqlite-wal", "*.sqlite3-wal"]
+DB_EXT = (".db", ".sqlite", ".sqlite3")
+SIDECARS = ("-wal", "-shm", "-journal")
+# auto-connect: tool dir (under HOME) -> global rules files it reads every session.
+#   "create": the file may be created; "existing": only added to when it exists (seeded by the tool, or it is
+#   the tool's identity: creating it would replace the tool's default)
+AUTO_TOOLS = {
+    ".claude": ((".claude/CLAUDE.md", "create"),),
+    ".codex": ((".codex/AGENTS.md", "create"),),
+    ".gemini": ((".gemini/GEMINI.md", "create"),),
+    ".qwen": ((".qwen/QWEN.md", "create"),),
+    ".config/opencode": ((".config/opencode/AGENTS.md", "create"),),
+    ".openclaw": ((".openclaw/workspace/AGENTS.md", "existing"),),
+    ".hermes": ((".hermes/SOUL.md", "existing"), (".hermes/profiles/*/SOUL.md", "existing")),
+    ".codeium/windsurf": ((".codeium/windsurf/memories/global_rules.md", "create"),),
+    ".kiro": ((".kiro/steering/skeleton-base.md", "create"),),
+    ".cursor": (),
+}
+NEEDS_USER = {
+    ".openclaw": "OpenClaw reads ~/.openclaw/workspace/AGENTS.md, which it seeds on first run: run OpenClaw once, "
+                 "the watcher then adds the pointer",
+    ".hermes": "Hermes loads only ~/.hermes/SOUL.md (its identity) globally; there is none, and creating one would "
+               "replace its default identity: write your SOUL.md, the watcher then adds the pointer",
+    ".cursor": "Cursor keeps global User Rules in its app settings: paste the pointer text there by hand",
+}
+NOT_AI = {".cache", ".local", ".config", ".git", ".npm", ".cargo", ".rustup", ".nvm", ".pyenv", ".mozilla", ".ssh",
+          ".gnupg", ".pki", ".dbus", ".java", ".gradle", ".m2", ".var", ".steam", ".vscode-server", ".docker", ".kube",
+          ".aws", ".azure", ".gcloud", ".password-store", ".brain", ".base-folder", ".ipython", ".jupyter",
+          ".thunderbird", ".icons", ".themes", ".fonts", ".sudo_as_admin_successful", ".Trash", ".trash",
+          "systemd", "autostart", "dconf", "pulse", "gtk-3.0", "gtk-4.0", "fontconfig", "ibus", "git"}
+RULES_NAMES = ("AGENTS.md", "global_rules.md")
+TOOL_SIGNAL = re.compile(r"^(AGENTS|[A-Z][A-Z0-9_-]{1,20})\.md$|^global_rules\.md$|^memor(y|ies)$|"
+                         r"^memory[\w.-]*\.(db|sqlite3?)$", re.I)
+MEM_DIR = re.compile(r"(?i)^memor(y|ies)$")
+MEM_FILE = re.compile(r"(?i)^memory\.md$|^memory[\w.-]*\.(db|sqlite3?)$")
+VOLATILE = re.compile(r"(?i)access|seen|hit|count|score|retriev|touch|last_used|trust|weight|rank|vector|embed")
+
+
+def watch_cfg(base):
+    try:
+        cfg = json.loads(read(pathlib.Path(base) / WATCH_CFG) or "{}")
+    except json.JSONDecodeError:
+        cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def save_watch_cfg(base, cfg):
+    """Write .brain/watch.json atomically, only when it changes (the watcher reloads it live)."""
+    p = pathlib.Path(base) / WATCH_CFG
+    new = json.dumps(cfg, indent=1, sort_keys=True) + "\n"
+    if read(p) == new:
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(new, encoding="utf-8")
+    os.replace(tmp, p)
+    return True
+
+
+def home_rel(p, home):
+    p = os.path.abspath(os.path.expanduser(str(p)))
+    h = str(home)
+    return "~/" + os.path.relpath(p, h) if p.startswith(h + "/") else p
+
+
+def expand(r, home):
+    return os.path.normpath(os.path.join(str(home), r[2:]) if r.startswith("~/") else r)
+
+
+def extra_sources(cfg):
+    return tuple(dict.fromkeys(e.get("source", "other") for e in cfg.get("extra", []) if isinstance(e, dict)))
+
+
+def sqlite_items(db, src, origin, notes, max_rows=5000):
+    """Any sqlite store, READ-ONLY: each row's text columns become one item. Columns that change when the tool
+    only reads (access counters, scores, embeddings, ...) are left out, so a read does not look like news."""
+    try:
+        con = sqlite3.connect(f"{pathlib.Path(db).resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        notes.append(f"skipped {db.name}: {e}"); return
+    try:
+        for t, sql in con.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+            if t.startswith("sqlite_") or "VIRTUAL" in (sql or "").upper() or \
+                    re.search(r"_(data|idx|docsize|config|content)$", t):
+                continue
+            keep = [c[1] for c in con.execute(f'PRAGMA table_info("{t}")') if not VOLATILE.search(c[1])]
+            if not keep:
+                continue
+            q = ", ".join(f'"{c}"' for c in keep)
+            try:
+                rows = con.execute(f'SELECT rowid, {q} FROM "{t}" ORDER BY rowid LIMIT {max_rows}').fetchall()
+            except sqlite3.Error:
+                rows = [(i, *r) for i, r in enumerate(con.execute(f'SELECT {q} FROM "{t}" LIMIT {max_rows}'))]
+            for rid, *vals in rows:
+                parts = [f"- {c}: {v}" for c, v in zip(keep, vals) if isinstance(v, str) and v.strip()]
+                if parts and sum(len(v) for v in vals if isinstance(v, str)) >= 12:
+                    yield src, f"{origin}#{t}/{rid}", None, "\n".join(parts) + "\n"
+    except sqlite3.Error as e:
+        notes.append(f"skipped {db.name}: {e}")
+    finally:
+        con.close()
+
+
+def extra_items(home, cfg, notes):
+    """Items from the locations added with `watch --add` (or by auto-connect): text files and sqlite stores."""
+    for e in cfg.get("extra", []):
+        if not isinstance(e, dict) or not e.get("root"):
+            continue
+        root = pathlib.Path(expand(e["root"], home))
+        src, pats, depth = e.get("source", "other"), e.get("match") or EXTRA_MATCH, int(e.get("depth", 8))
+        if root.is_file():
+            files, root = [root], root.parent
+        elif root.is_dir():
+            files = []
+            for dp, dns, fns in os.walk(root):
+                dns[:] = sorted(d for d in dns if not d.startswith(".git"))
+                if len(pathlib.Path(dp).relative_to(root).parts) >= depth:
+                    dns[:] = []
+                files += [pathlib.Path(dp) / f for f in sorted(fns)]
+        else:
+            continue
+        for f in files:
+            r = f.relative_to(root).as_posix()
+            if f.name.endswith(SIDECARS) or not any(fnmatch.fnmatchcase(r, p) or fnmatch.fnmatchcase(f.name, p)
+                                                    for p in pats):
+                continue                                   # a -wal file only triggers; the db itself is read
+            if f.suffix in DB_EXT:
+                yield from sqlite_items(f, src, home_rel(f, home), notes)
+                continue
+            text, ts = read_md(f, notes)
+            if text is None:
+                continue
+            span = find_block(text)                        # our own pointer block is not a memory
+            if span:
+                text = text[:span[0]] + text[span[1]:]
+            if text.strip():
+                yield src, home_rel(f, home), ts, text
+
+
+# -- auto-connect
+def ai_signals(d):
+    """(rules files, memory paths) of an unknown tool dir; both empty -> not an AI tool: never touched."""
+    own = d.name.lstrip(".").upper() + ".md"
+    rules, mem = [], []
+    try:
+        top = sorted(os.scandir(d), key=lambda e: e.name)
+    except OSError:
+        return rules, mem
+    for e in top:
+        if e.is_file(follow_symlinks=False):
+            if e.name in RULES_NAMES or e.name == own:
+                rules.append(e.path)
+            elif MEM_FILE.match(e.name):
+                mem.append(e.path)
+        elif e.is_dir(follow_symlinks=False):
+            if MEM_DIR.match(e.name):
+                mem.append(e.path)
+            elif not e.name.startswith("."):
+                try:
+                    mem += sorted(x.path for x in os.scandir(e.path) if x.is_dir(follow_symlinks=False)
+                                  and MEM_DIR.match(x.name))
+                except OSError:
+                    pass
+    rules.sort(key=lambda p: (not p.endswith("/AGENTS.md"), p))
+    return rules, mem
+
+
+def tool_dirs(home, base):
+    """Dot-dirs in HOME and dirs in ~/.config that are not known tools, not system dirs and not the base."""
+    known = set(AUTO_TOOLS) | {k.split("/")[0] for k in AUTO_TOOLS}
+    out = []
+    for top, dot in ((home, True), (home / ".config", False)):
+        try:
+            ents = sorted(os.scandir(top), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e in ents:
+            key = home_rel(e.path, home)[2:]
+            if not e.is_dir(follow_symlinks=False) or (dot and not e.name.startswith(".")) or e.name in NOT_AI \
+                    or key in known or str(base) == e.path or str(base).startswith(e.path + "/"):
+                continue
+            out.append((key, pathlib.Path(e.path)))
+    return out
+
+
+def is_connected(base):
+    try:
+        return bool(json.loads(read(pathlib.Path(base) / ".kits.json") or "{}")
+                    .get("kits", {}).get("base-folder", {}).get("connect"))
+    except json.JSONDecodeError:
+        return False
+
+
+def autoconnect(base):
+    """Connect every AI tool now in HOME (known table + AI-like unknown dirs). Idempotent; returns the log."""
+    c = Connector(base)
+    log = c.connect(unknown=True)
+    cfg = watch_cfg(base)
+    old_tools = cfg.get("tools", {})
+    tools = {}
+    for key, st in sorted(c.tools.items()):
+        prev = old_tools.get(key, {})
+        st["since"] = prev["since"] if prev.get("state") == st["state"] and prev.get("since") else today()
+        tools[key] = st
+        if st["state"] == "needs-user" and prev.get("state") != "needs-user":
+            log.append(f"needs you: ~/{key}: {st['why']}")
+    extra = [e for e in cfg.get("extra", []) if isinstance(e, dict)]
+    have = {e.get("root") for e in extra}
+    for e in c.auto_extra:
+        if e["root"] not in have:
+            extra.append(e); have.add(e["root"]); log.append(f"watching {e['root']} (source {e['source']})")
+    cfg["tools"], cfg["extra"] = tools, extra
+    if not cfg["extra"]:
+        cfg.pop("extra")
+    save_watch_cfg(base, cfg)
+    return log
+
+
+# -- locations
+def watch_locations(base, home=None):
+    home = pathlib.Path(home or home_dir())
+    locs = [dict(source=s, root=os.path.join(str(home), r), match=list(m), depth=d) for s, r, m, d in WATCH_BUILTIN]
+    for e in watch_cfg(base).get("extra", []):
+        if not isinstance(e, dict) or not e.get("root"):
+            continue
+        root, m, d = expand(e["root"], home), list(e.get("match") or EXTRA_MATCH), int(e.get("depth", 8))
+        if os.path.isfile(root) or os.path.splitext(root)[1] in DB_EXT + (".md", ".txt"):
+            root, m, d = os.path.dirname(root), [os.path.basename(root), os.path.basename(root) + "-wal"], 0
+        locs.append(dict(source=e.get("source", "other"), root=root, match=m, depth=d))
+    # zero-touch: new tool dirs in HOME and ~/.config, rules / memory files appearing at the top of a tool dir
+    locs.append(dict(source="tools", root=str(home), match=[], depth=1, dirs=True))
+    locs.append(dict(source="tools", root=str(home / ".config"), match=[], depth=1, dirs=True))
+    # the base's own control files: a hook writes .brain/kick; watch --add rewrites .brain/watch.json
+    locs.append(dict(source="kick", root=str(pathlib.Path(base) / ".brain"), match=["kick", "watch.json"], depth=0))
+    for l in locs:
+        l["sqlite"] = any(x.endswith(("-wal",) + DB_EXT) for x in l["match"])
+    return locs
+
+
+def loc_key(locs):
+    return sorted((l["source"], l["root"], tuple(l["match"]), l["depth"]) for l in locs)
+
+
+def may_descend(loc, rel):
+    """Could a file below dir REL (relative to the root, ends with '/') match? Prunes the tree we watch."""
+    parts = rel.rstrip("/").split("/")
+    for p in loc["match"]:
+        pp = p.split("/")
+        if len(pp) == 1 or (len(pp) > len(parts) and all(fnmatch.fnmatchcase(a, b) for a, b in zip(parts, pp))):
+            return True
+    return False
+
+
+IN_MODIFY, IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO = 0x2, 0x4, 0x8, 0x40, 0x80
+IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF = 0x100, 0x200, 0x400, 0x800
+IN_Q_OVERFLOW, IN_IGNORED, IN_ONLYDIR, IN_EXCL_UNLINK = 0x4000, 0x8000, 0x01000000, 0x04000000
+IN_MASK_ADD, IN_ISDIR, IN_NONBLOCK, IN_CLOEXEC = 0x20000000, 0x40000000, 0o4000, 0o2000000
+FILE_EV = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE | IN_DELETE
+SELF_EV = IN_DELETE_SELF | IN_MOVE_SELF
+
+
+class Watcher:
+    """Watches every memory location (inotify via ctypes; polling when inotify is not there), debounces, and runs
+    `watch --once` in a child process so the daemon itself stays small."""
+
+    def __init__(self, base, quiet=2.0, maxwait=10.0, rescan=600.0, poll=None, poll_s=5.0, log=None, once_args=()):
+        self.base, self.quiet, self.maxwait, self.rescan_s = pathlib.Path(base), quiet, maxwait, rescan
+        self.logf, self.once_args, self.poll_s = log, list(once_args), poll_s
+        self.wd, self.first, self.last, self.hits = {}, None, None, []
+        self.stats = dict(events=0, relevant=0, runs=0, new=0)
+        self.locs = watch_locations(base)
+        self.fd = None if poll else self.inotify()
+        self.mode = "inotify" if self.fd is not None else "poll"
+        self.sig = None
+        self.resolve()
+
+    def inotify(self):
+        try:
+            import ctypes, ctypes.util
+            self.libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+            fd = self.libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        except (OSError, AttributeError):
+            return None
+        return fd if fd >= 0 else None
+
+    def emit(self, kind, **kw):
+        kw = {"kind": kind, "t": round(time.time(), 3), **kw}
+        if self.logf:
+            with open(self.logf, "a", encoding="utf-8") as f:
+                f.write(json.dumps(kw) + "\n")
+        if kind in ("start", "error") or (kind == "run" and (kw.get("new") or kw.get("connect") or kw.get("error"))):
+            print(f"watch: {kind} " + json.dumps({k: v for k, v in kw.items() if k not in ("kind", "t")}),
+                  file=sys.stderr, flush=True)
+
+    # -- inotify watches
+    def add(self, path, mask):
+        w = self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask | IN_MASK_ADD | IN_EXCL_UNLINK)
+        if w < 0:
+            import ctypes
+            if ctypes.get_errno() == 28:                 # ENOSPC
+                self.emit("error", msg="inotify watch limit reached (fs.inotify.max_user_watches)", path=path)
+            return None
+        return self.wd.setdefault(w, {"path": path, "locs": [], "pending": []})
+
+    def resolve(self):
+        """(Re)build every watch: idempotent (same inode -> same wd). Missing roots: watch the deepest existing
+        ancestor for new dirs. A root that appeared since the last resolve triggers a run (files may predate it)."""
+        if self.mode == "poll":
+            self.next_rescan = time.monotonic() + self.rescan_s
+            return
+        was = {l["root"] for e in self.wd.values() for l in e["pending"]}
+        for e in self.wd.values():
+            e["locs"], e["pending"] = [], []
+        for loc in self.locs:
+            if os.path.isdir(loc["root"]):
+                self.walk(loc, loc["root"], "", loc["depth"])
+                if loc["root"] in was:
+                    self.hit("appeared:" + loc["source"])
+            else:
+                a = os.path.dirname(loc["root"])
+                while a and not os.path.isdir(a):
+                    a = os.path.dirname(a)
+                ent = self.add(a, IN_CREATE | IN_MOVED_TO | SELF_EV | IN_ONLYDIR) if a else None
+                if ent is not None:
+                    ent["pending"].append(loc)
+        self.next_rescan = time.monotonic() + self.rescan_s
+
+    def walk(self, loc, d, rel, depth):
+        if loc.get("dirs"):
+            if rel and (rel.rstrip("/") in NOT_AI or not (rel.startswith(".") or loc["root"].endswith("/.config"))):
+                return
+            mask = IN_CREATE | IN_MOVED_TO | SELF_EV | IN_ONLYDIR
+        else:
+            if rel and not may_descend(loc, rel):
+                return
+            mask = FILE_EV | SELF_EV | IN_ONLYDIR | (IN_MODIFY if loc["sqlite"] else 0)
+        ent = self.add(d, mask)
+        if ent is None:
+            return
+        ent["locs"].append((loc, rel, depth))
+        if depth > 0:
+            try:
+                for e in os.scandir(d):
+                    if e.is_dir(follow_symlinks=False) and not e.name.startswith(".git"):
+                        self.walk(loc, e.path, f"{rel}{e.name}/", depth - 1)
+            except OSError:
+                pass
+
+    def relevant(self, ent, name, isdir, mask):
+        if name.endswith(SIDECARS):
+            # any sqlite reader (our own read-only collect too) opens -wal/-shm read-write: CLOSE_WRITE, CREATE,
+            # DELETE there are not changes. Only a real write to -wal (IN_MODIFY) counts.
+            if not (name.endswith("-wal") and mask & IN_MODIFY):
+                return None
+        elif mask & IN_MODIFY and not mask & IN_ISDIR and not name.endswith(DB_EXT):
+            return None                                   # text files count once, on close
+        for loc, rel, depth in ent["locs"]:
+            if loc.get("dirs"):
+                if not rel:
+                    if isdir and (name.startswith(".") or loc["root"].endswith("/.config")) and name not in NOT_AI:
+                        return "newtool"
+                elif TOOL_SIGNAL.search(name):
+                    return "toolfile"
+                continue
+            if isdir:
+                if depth > 0 and may_descend(loc, rel + name + "/"):
+                    return "newdir"
+                continue
+            r = rel + name
+            if any(fnmatch.fnmatchcase(r, p) or ("/" not in p and fnmatch.fnmatchcase(name, p)) for p in loc["match"]):
+                return "config" if loc["source"] == "kick" and name == "watch.json" else loc["source"]
+        return None
+
+    def handle(self, buf):
+        i, resolve = 0, False
+        while i + 16 <= len(buf):
+            w, mask, _cookie, ln = struct.unpack_from("iIII", buf, i)
+            name = buf[i + 16:i + 16 + ln].split(b"\0", 1)[0].decode(errors="replace")
+            i += 16 + ln
+            self.stats["events"] += 1
+            if mask & IN_Q_OVERFLOW:
+                self.hit("overflow"); resolve = True; continue
+            ent = self.wd.get(w)
+            if ent is None:
+                continue
+            if mask & IN_IGNORED:
+                self.wd.pop(w, None); resolve = True; continue
+            if mask & SELF_EV:
+                resolve = True; continue
+            if ent["pending"] and mask & IN_ISDIR:
+                resolve = True                            # a missing root (or a parent of it) may have appeared
+            why = self.relevant(ent, name, bool(mask & IN_ISDIR), mask)
+            if why in ("newtool", "newdir"):
+                resolve = True; self.hit(why)
+            elif why == "config":
+                resolve = self.reload() or resolve
+            elif why:
+                self.hit(why)
+        if resolve:
+            self.resolve()
+
+    def reload(self):
+        new = watch_locations(self.base)
+        if loc_key(new) == loc_key(self.locs):
+            return False                                  # only tool states changed: no run
+        self.locs = new
+        self.hit("config")
+        return True
+
+    # -- polling fallback
+    def signature(self):
+        sig = []
+        for loc in self.locs:
+            root = loc["root"]
+            if loc.get("dirs"):
+                try:
+                    tops = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False) and e.name not in NOT_AI
+                            and (e.name.startswith(".") or root.endswith("/.config"))]
+                except OSError:
+                    continue
+                for t in tops:
+                    try:
+                        sig += [(t.path, x.name) for x in os.scandir(t.path) if TOOL_SIGNAL.search(x.name)]
+                    except OSError:
+                        sig.append((t.path, None))
+                continue
+            for dp, dns, fns in os.walk(root):
+                rel = os.path.relpath(dp, root)
+                rel = "" if rel == "." else rel + "/"
+                if rel.count("/") >= loc["depth"]:
+                    dns[:] = []
+                dns[:] = [d for d in dns if not d.startswith(".git") and may_descend(loc, f"{rel}{d}/")]
+                for f in fns:
+                    if f.endswith(SIDECARS) and not f.endswith("-wal"):
+                        continue
+                    if any(fnmatch.fnmatchcase(rel + f, p) or ("/" not in p and fnmatch.fnmatchcase(f, p))
+                           for p in loc["match"]):
+                        try:
+                            st = os.stat(os.path.join(dp, f))
+                            sig.append((dp, f, st.st_mtime_ns, st.st_size))
+                        except OSError:
+                            pass
+        return hash(tuple(sorted(sig, key=repr)))
+
+    # -- debounce + run
+    def hit(self, why):
+        now = time.time()
+        self.stats["relevant"] += 1
+        self.first = self.first or now
+        self.last = now
+        self.hits.append(why)
+
+    def due(self):
+        return None if self.first is None else min(self.last + self.quiet, self.first + self.maxwait)
+
+    def run(self):
+        why, self.first, self.last, self.hits = sorted(set(self.hits)), None, None, []
+        self.stats["runs"] += 1
+        t0 = time.time()
+        p = subprocess.run([sys.executable, "-S", str(pathlib.Path(__file__).resolve()), "watch", "--once",
+                            "--base", str(self.base), *self.once_args], capture_output=True, text=True)
+        try:
+            out = json.loads(p.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            out = {"error": (p.stderr or p.stdout).strip()[-500:] or f"exit {p.returncode}"}
+        self.stats["new"] += out.get("new") or 0
+        self.emit("run", why=why, secs=round(time.time() - t0, 3), **out)
+        if self.mode == "poll":
+            self.sig = self.signature()                   # our own run must not look like a change
+
+    def loop(self, until=None):
+        self.emit("start", mode=self.mode, base=str(self.base), watches=len(self.wd), locations=len(self.locs))
+        self.hit("start")                                 # catch up on anything changed while we were down
+        if self.mode == "poll":
+            self.sig = self.signature()
+            next_poll = time.monotonic() + self.poll_s
+        else:
+            import select
+            pl = select.poll()
+            pl.register(self.fd, select.POLLIN)
+        while until is None or time.time() < until:
+            d = self.due()
+            waits = [self.next_rescan - time.monotonic()]
+            if d is not None:
+                waits.append(d - time.time())
+            if until is not None:
+                waits.append(until - time.time())
+            if self.mode == "poll":
+                waits.append(next_poll - time.monotonic())
+                time.sleep(max(0.0, min(waits)))
+                if time.monotonic() >= next_poll:
+                    next_poll = time.monotonic() + self.poll_s
+                    new = watch_locations(self.base)
+                    if loc_key(new) != loc_key(self.locs):
+                        self.locs = new; self.hit("config")
+                    s = self.signature()
+                    if s != self.sig:
+                        self.sig = s; self.hit("poll")
+            elif pl.poll(max(0.0, min(waits)) * 1000):
+                while True:
+                    try:
+                        buf = os.read(self.fd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not buf:
+                        break
+                    self.handle(buf)
+            d = self.due()
+            if d is not None and time.time() >= d:
+                self.run()
+            if time.monotonic() >= self.next_rescan:
+                self.resolve(); self.hit("rescan")       # safety net: anything inotify missed
+
+
+def watch_once(base, commit=True, connect=True):
+    """One pipeline run: auto-connect new tools, collect, then index + map + git commit if anything is new."""
+    base = pathlib.Path(base).resolve()
+    out = {"new": 0}
+    if connect and is_connected(base):
+        try:
+            lg = autoconnect(base)
+            if lg:
+                out["connect"] = lg
+        except (SystemExit, Exception) as e:              # never let auto-connect block the collect
+            out["error"] = f"auto-connect: {e}"
+    import io, contextlib
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = collect(base, quiet=True)
+    if rc:
+        out["error"] = err.getvalue().strip()[-300:]
+    try:
+        last = json.loads(read(base / ".brain" / "collector.json") or "{}").get("runs", [])[-1]
+    except (json.JSONDecodeError, IndexError):
+        last = {}
+    out["new"] = new = last.get("new", 0)
+    if new or out.get("connect"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_index(base, quiet=True)
+            build_map(base, quiet=True)
+        if commit and (base / ".git").exists():
+            per = ", ".join(f"{k} {v}" for k, v in sorted(last.get("per_source", {}).items()))
+            msg = f"watch: collect {new} new" + (f" ({per})" if per else "") if new else "watch: auto-connect"
+            out["commit"] = git_commit(base, msg)
+    return out
+
+
+WATCH_COMMIT = ("raw/inbox/collected", "wiki/index.md", "maps/brain.canvas", "maps/brain.html",
+                ".brain/collector.json", WATCH_CFG, ".kits.json")
+
+
+def git_commit(base, msg):
+    """Commit only the files the pipeline writes, only if they changed. Never pushes."""
+    def git(*a):
+        return subprocess.run(["git", "-C", str(base), *a], capture_output=True, text=True)
+    paths = [p for p in WATCH_COMMIT if (base / p).exists()]
+    for p in paths:
+        git("add", "-A", "--", p)                         # an ignored path just fails, the others still go in
+    if not paths or git("diff", "--cached", "--quiet", "--", *paths).returncode == 0:
+        return False
+    who = [] if git("config", "user.email").stdout.strip() else \
+        ["-c", "user.name=Skeleton Base watch", "-c", "user.email=watch@localhost"]
+    return git(*who, "commit", "-q", "--no-verify", "-m", msg, "--", *paths).returncode == 0
+
+
+# -- watch --add / --remove / --list / --discover
+def watch_add(base, path, source=None, match=None, depth=8):
+    home = home_dir()
+    p = os.path.abspath(os.path.expanduser(path))
+    if p == str(base) or p.startswith(str(base) + "/"):
+        print("watch: that path is inside the base itself; nothing changed", file=sys.stderr); return 1
+    root = home_rel(p, home)
+    name = pathlib.Path(p)
+    if name.name.lower() in ("memory", "memories") or name.suffix:
+        name = name.parent
+    e = {"source": source or slug(name.name.lstrip(".")), "root": root, "match": match or list(EXTRA_MATCH),
+         "depth": depth}
+    if e["source"] in COLLECT_SOURCES and not source:
+        e["source"] += "-extra"
+    cfg = watch_cfg(base)
+    cfg["extra"] = [x for x in cfg.get("extra", []) if isinstance(x, dict) and x.get("root") != root] + [e]
+    save_watch_cfg(base, cfg)
+    note = "" if os.path.exists(p) else " (missing now: watched from when it appears)"
+    print(f"watch: added {root} as source '{e['source']}'{note}; a running watcher picks it up at once")
+    return 0
+
+
+def watch_remove(base, path):
+    cfg = watch_cfg(base)
+    root = home_rel(path, home_dir())
+    keep = [x for x in cfg.get("extra", []) if isinstance(x, dict) and x.get("root") not in (root, path)]
+    if len(keep) == len(cfg.get("extra", [])):
+        print(f"watch: {root} is not in the list (built-in locations cannot be removed)", file=sys.stderr); return 1
+    cfg["extra"] = keep
+    if not keep:
+        cfg.pop("extra")
+    save_watch_cfg(base, cfg)
+    print(f"watch: removed {root} (items already collected stay in raw/inbox/collected/)")
+    return 0
+
+
+def watch_list(base):
+    home = home_dir()
+    cfg = watch_cfg(base)
+    extra_roots = {expand(e["root"], home) for e in cfg.get("extra", []) if isinstance(e, dict) and e.get("root")}
+    print("Locations (ok = exists now; missing ones are watched until they appear)")
+    for l in watch_locations(base):
+        if l["source"] in ("tools", "kick"):
+            continue
+        kind = "added" if l["root"] in extra_roots or os.path.dirname(l["root"]) in extra_roots else "built-in"
+        print(f"  {l['source']:14} {'ok     ' if os.path.exists(l['root']) else 'missing'} {kind:8} "
+              f"{home_rel(l['root'], home)}  {' '.join(l['match'])}")
+    print(f"  + new tool dirs in ~ and ~/.config, and {KICK} (a hook writes it)")
+    tools = cfg.get("tools", {})
+    print("Tools" + ("" if is_connected(base) else " (base not connected: run `connect --watch` for auto-connect)"))
+    for key, st in sorted(tools.items()):
+        files = ", ".join("~/" + f for f in st.get("files", []))
+        print(f"  {st['state']:10} ~/{key}" + (f"  {files}" if files else "")
+              + (f"\n             why: {st['why']}" if st.get("why") else ""))
+    if not tools:
+        print("  (none yet)")
+    needs = [k for k, s in tools.items() if s["state"] == "needs-user"]
+    if needs:
+        print(f"needs-user: {len(needs)} ({', '.join('~/' + k for k in sorted(needs))}); the pointer text is the "
+              f"block in ~/.claude/CLAUDE.md, or run: python3 tools/brain.py connect --print")
+    return 0
+
+
+DISCOVER_KEY = re.compile(r"(?i)memor|facts?\b|knowledge|recall|remember|journal|^user\.md$|insight")
+DISCOVER_SKIP = re.compile(r"(^|/)(cache|caches|Cache|node_modules|\.git|site-packages|venv|\.venv|__pycache__|logs?|"
+                           r"tmp|Trash|crash\w*|skills|packages|bin|lib|dist|build|extensions|snap|fonts|icons)(/|$)")
+
+
+def watch_discover(base, days=30.0, top=25):
+    """Suggest memory-like stores under HOME that no location covers yet. Suggestions only: changes nothing."""
+    home = home_dir()
+    covered = [(l["root"], l["depth"]) for l in watch_locations(base) if l["source"] not in ("tools", "kick")]
+    cut, found, n, t0 = time.time() - days * 86400, {}, 0, time.time()
+    try:
+        tops = [p for p in home.iterdir() if p.name.startswith(".") and p.is_dir()
+                and p.name not in (".cache", ".local", ".npm", ".cargo", ".rustup", ".nvm", ".pyenv", ".git")]
+    except OSError:
+        tops = []
+    tops += [home / ".local" / "share"]
+    for t in tops:
+        for dp, dns, fns in os.walk(t):
+            r = os.path.relpath(dp, home)
+            if r.count("/") >= 6 or DISCOVER_SKIP.search(r) or dp == str(base) or dp.startswith(str(base) + "/"):
+                dns[:] = []; continue
+            dns[:] = [d for d in dns if not DISCOVER_SKIP.search(d)]
+            for f in fns:
+                n += 1
+                if not f.endswith((".md", ".db", ".sqlite", ".sqlite3", ".jsonl", ".json")) or \
+                        not (DISCOVER_KEY.search(f) or DISCOVER_KEY.search(os.path.basename(dp))):
+                    continue
+                try:
+                    st = os.stat(os.path.join(dp, f))
+                except OSError:
+                    continue
+                if st.st_mtime < cut or not st.st_size or any(
+                        dp == c or (dp.startswith(c + "/") and os.path.relpath(dp, c).count("/") < dep)
+                        for c, dep in covered):
+                    continue
+                d = found.setdefault(dp, {"files": 0, "bytes": 0, "newest": 0, "kinds": set()})
+                d["files"] += 1; d["bytes"] += st.st_size; d["newest"] = max(d["newest"], st.st_mtime)
+                d["kinds"].add(os.path.splitext(f)[1])
+    out = sorted(found.items(), key=lambda kv: -kv[1]["newest"])
+    for dp, d in out[:top]:
+        print(f"  {dt.datetime.fromtimestamp(d['newest']):%Y-%m-%d} {d['files']:4} files {d['bytes'] // 1024:6} KB "
+              f"{','.join(sorted(d['kinds'])):16} {home_rel(dp, home)}")
+    print(f"discover: {n} files scanned in {time.time() - t0:.2f} s, {len(out)} candidate dir(s) not watched yet "
+          f"(suggestions only; add one with: brain.py watch --add PATH [--source NAME])")
+    return 0
+
+
+def watch_main(base, opts):
+    if opts.get("--add"):
+        m = opts.get("--match")
+        return watch_add(base, opts["--add"], opts.get("--source"),
+                         [x for x in m.split(",") if x] if m else None, int(opts.get("--depth", 8)))
+    if opts.get("--remove"):
+        return watch_remove(base, opts["--remove"])
+    if opts.get("--list"):
+        return watch_list(base)
+    if opts.get("--discover"):
+        return watch_discover(base, float(opts.get("--days", 30)))
+    if not (base / "tools" / "brain.py").is_file():
+        print(f"watch: {base} is not a base (no tools/brain.py)", file=sys.stderr); return 1
+    if opts.get("--once"):
+        print(json.dumps(watch_once(base, not opts.get("--no-commit"), not opts.get("--no-connect"))))
+        return 0
+    (base / ".brain").mkdir(exist_ok=True)
+    if __name__ == "__main__" and not os.environ.get("BRAIN_WATCH_NO_EXEC"):
+        # run as a script, brain.py was compiled from source in this process (~5-10 MB that stays). Compile it to
+        # .brain/pycache/ and re-exec from the bytecode without site-packages: the daemon idles at ~19 MB.
+        src = str(pathlib.Path(__file__).resolve())
+        pyc = base / ".brain" / "pycache" / f"brain.{sys.implementation.cache_tag}.pyc"
+        try:
+            import py_compile
+            py_compile.compile(src, cfile=str(pyc), doraise=True)
+            os.execv(sys.executable, [
+                sys.executable, "-S", "-c",
+                "import sys, importlib.util as u; from importlib.machinery import SourcelessFileLoader as L; "
+                f"s = u.spec_from_file_location('brain', {src!r}, loader=L('brain', {str(pyc)!r})); "
+                "m = u.module_from_spec(s); sys.modules['brain'] = m; s.loader.exec_module(m); "
+                "sys.exit(m.main(sys.argv))", "watch", *sys.argv[2:]])
+        except (OSError, py_compile.PyCompileError):
+            pass                                          # run from source then; only uses more memory
+    lock = open(base / ".brain" / "watch.lock", "w")
+    try:
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("watch: another watcher already runs for this base", file=sys.stderr); return 1
+    except (ImportError, OSError):
+        pass
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    once = [a for a in ("--no-commit", "--no-connect") if opts.get(a)]
+    w = Watcher(base, float(opts.get("--quiet-s", 2)), float(opts.get("--max-s", 10)),
+                float(opts.get("--rescan-s", 600)), bool(opts.get("--poll") or os.environ.get("BRAIN_WATCH_POLL")),
+                float(opts.get("--poll-s", 5)), opts.get("--log"), once)
+    if not is_connected(base) and not opts.get("--no-connect"):
+        print("watch: base not connected, so auto-connect is off (run `connect --watch` to turn it on)",
+              file=sys.stderr)
+    try:
+        w.loop(time.time() + float(opts["--for-s"]) if opts.get("--for-s") else None)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    w.emit("stop", **w.stats, mode=w.mode)
+    return 0
 
 
 # ---------------------------------------------------------------- check-public
@@ -1958,17 +2817,27 @@ def main(argv):
         if "--words" in args:
             i = args.index("--words"); wf = args[i + 1]; del args[i:i + 2]
         return check_public(args[0] if args else root_of(), wf)
-    if cmd in ("collect", "connect", "disconnect"):
+    if cmd in ("collect", "connect", "disconnect", "watch"):
         opts, i = {}, 0
+        valued = {"collect": ("--only", "--since"), "connect": (), "disconnect": (),
+                  "watch": ("--add", "--source", "--match", "--depth", "--remove", "--days", "--quiet-s", "--max-s",
+                            "--rescan-s", "--poll-s", "--log", "--for-s")}[cmd] + ("--base",)
+        flags = {"collect": ("--baseline", "--quiet"), "connect": ("--timer", "--watch", "--kick", "--print"),
+                 "disconnect": (), "watch": ("--once", "--list", "--discover", "--poll", "--no-commit",
+                                             "--no-connect")}[cmd]
         while i < len(args):
             a = args[i]
-            if a in ("--base", "--only", "--since") and i + 1 < len(args):
+            if a in valued and i + 1 < len(args):
                 opts[a] = args[i + 1]; i += 2
-            elif a in ("--baseline", "--quiet", "--timer"):
+            elif a in flags:
                 opts[a] = True; i += 1
             else:
                 print(f"{cmd}: unknown argument {a}\n" + __doc__); return 1
         base = pathlib.Path(opts.get("--base") or SRC).expanduser().resolve()
+        if cmd == "watch":
+            return watch_main(base, opts)
+        if cmd == "connect" and opts.get("--print"):
+            print(pointer_block(base)); return 0
         if cmd == "collect":
             since = None
             if "--since" in opts:
@@ -1978,7 +2847,11 @@ def main(argv):
             only = [s.strip() for s in opts["--only"].split(",") if s.strip()] if "--only" in opts else None
             return collect(base, only, bool(opts.get("--baseline")), since, bool(opts.get("--quiet")))
         c = Connector(base)
-        log = c.connect(bool(opts.get("--timer"))) if cmd == "connect" else c.disconnect()
+        log = c.connect(bool(opts.get("--timer")), bool(opts.get("--watch")), bool(opts.get("--kick"))) \
+            if cmd == "connect" else c.disconnect()
+        if cmd == "connect":
+            needs = [k for k, v in c.tools.items() if v["state"] == "needs-user"]
+            log += [f"needs you: ~/{k}: {c.tools[k]['why']}" for k in needs]
         print("\n".join(log) or "nothing to change")
         return 0
     root = root_of()
