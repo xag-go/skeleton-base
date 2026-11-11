@@ -66,6 +66,7 @@ python3 tools/brain.py status          # raw files not yet ingested / changed
 python3 tools/brain.py done raw/docs/x.md wiki/concepts/x.md   # record an ingest
 python3 tools/brain.py lint            # frontmatter, sources, links, orphans, TODO, quotes, board, maps, skills
 python3 tools/brain.py index           # rebuild the page list in wiki/index.md
+python3 tools/brain.py map             # redraw the mind map: maps/brain.canvas and maps/brain.html
 python3 tools/brain.py search "project-a deadline"
 python3 tools/brain.py brief           # paste bundle for chat apps (--short leaves out wiki/me/)
 python3 tools/brain.py check           # AGENTS.md size (warn 24 KiB, fail 32 KiB), pointer files, settings
@@ -131,10 +132,27 @@ For the current user, `connect`:
 Everything written is recorded in `.kits.json` (`kits.base-folder.connect`); `disconnect` (and `uninstall`)
 remove exactly that and give the previous text back, including an older pointer block it replaced.
 
+## See your brain as a map
+
+`python3 tools/brain.py map` draws the whole base as a mind map: you in the middle (`wiki/me/` and `hot.md`), one
+branch per folder (projects, clients, people, decisions, concepts, sops, daily, plus the board and the agents),
+one box or dot per page, and a line for every `[[link]]` between two pages. `init` draws it once; run `map` again
+after you add pages.
+
+- **In Obsidian:** open `maps/brain.canvas`. Each branch is a coloured group, each box shows the page itself.
+  Obsidian's own graph view (Ctrl/Cmd+G) shows the same links as a moving cloud.
+- **In any browser, no internet needed:** double-click `maps/brain.html`. Scroll to zoom, drag to move, click a
+  dot to see its title, folder, last update, first lines and links; type in the search box to light up pages;
+  click a folder in the legend to hide or show it. Everything is inside that one file; it loads nothing from the web.
+
+Both files are generated: do not edit them, `map` rewrites them (it never overwrites a `maps/brain.*` file it did
+not make unless you add `--force`). `lint` does not check them; it only reminds you to run `map` when the canvas
+points to a page that no longer exists.
+
 ## Viewing it in Obsidian
 
 Open the base folder as a vault. Pages, `[[links]]` and the graph work as is; `board/board.base` shows the board
-(core Bases plugin), `maps/*.canvas` open as canvases. To sync to another machine, Syncthing works well; the
+(core Bases plugin), `maps/*.canvas` open as canvases (`maps/brain.canvas` is the mind map, see above). To sync to another machine, Syncthing works well; the
 `.stignore` here keeps `.obsidian`, `.git` and generated folders out of sync.
 
 ## Updating
