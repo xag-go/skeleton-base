@@ -3224,6 +3224,16 @@ class FileTests(FileBase):
         v1 = "The brain tool version 1.5.1 is the one every machine runs."
         v2 = "The brain tool version 2.0.0 is the one every machine runs."
         self.assertEqual(B.clash(B.fnorm(v2).split(), (v1, B.fnorm(v1).split()), v2), "changed value")
+        for small in ("The brain tool version 1.5.2 is the one every machine runs.",
+                      "The brain tool version 1.6.1 is the one every machine runs."):
+            self.assertEqual(B.clash(B.fnorm(small).split(), (v1, B.fnorm(v1).split()), small), "changed value",
+                             "a patch or minor bump is a changed value too")
+        port1, port2 = "The internal API listens on port 8766 on the server.", "The internal API listens on port 8767 on the server."
+        self.assertEqual(B.clash(B.fnorm(port2).split(), (port1, B.fnorm(port1).split()), port2), "changed value")
+        self.assertIsNone(B.clash(B.fnorm(v1).split(), (v1, B.fnorm(v1).split()), v1), "same number: no conflict")
+        added = "The brain tool version 1.5.1 is the one every machine runs since 2026."
+        self.assertIsNone(B.clash(B.fnorm(added).split(), (v1, B.fnorm(v1).split()), added),
+                          "an extra number at the end is no conflict")
 
     def test_secrets_redacted_and_injection_inert(self):
         key = "sk" + "-ant-api03-" + "Z" * 30          # built from pieces: check-public scans this file

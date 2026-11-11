@@ -2,7 +2,12 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
-## v1.5.2 - 2026-11-12
+## v1.5.3 - 2026-11-11
+`brain.py file` now flags a small number change as a conflict too: a patch or minor version bump (1.5.1 -> 1.5.2),
+a port or a count that changed in the same place of the sentence. Before, only a number with no shared digits
+(1.5.1 -> 2.0.0) was flagged. An extra number that is only in the new memory is still no conflict.
+
+## v1.5.2 - 2026-11-11
 `brain.py file` no longer flags a false negation conflict:
 - A negation (or changed number) is compared only between the page sentence and the part of the new memory that lines
   up with it: the clause of the memory (split on . ; : ! ? dash and newlines) with the most overlap, and inside it the
@@ -12,7 +17,7 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - Known gap, unchanged from 1.5.1: a changed version where the old and new numbers share digits (`1.5.1` -> `1.5.2`) is
   not flagged; `1.5.1` -> `2.0.0` is. Tests: 3 new in FileTests.
 
-## v1.5.1 - 2026-11-12
+## v1.5.1 - 2026-11-11
 Every tool now knows which role it plays, and a name is never borrowed from the user's own notes:
 - Who am I (one rule, in the pointer block `connect` writes for all 26 tools, `connect --print`, and the base's
   AGENTS.md block): the tool's own identity (system prompt, SOUL.md / identity file, a project ROLE.md) wins;
@@ -27,7 +32,7 @@ Every tool now knows which role it plays, and a name is never borrowed from the 
   1.5.0 watcher was OOM-killed in a restart loop. A test runs `watch --once` on 50 collected items and checks the
   peak RSS leaves 2x headroom under the cap. The collect and tidy units have no memory cap.
 
-## v1.5.0 - 2026-11-12
+## v1.5.0 - 2026-11-11
 Memories from any tool reach the wiki at once, with no model, and a rare model pass keeps the pages clean:
 - `brain.py file [--dry-run]` (also run by `collect` and by the watcher, right after collecting): each new collected
   item, or each memory of a list file (Hermes `§` sections, GEMINI.md bullets), is filed by code as one cited line

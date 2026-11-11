@@ -160,7 +160,7 @@ sections, the bullets of GEMINI.md) goes to ONE existing page as one cited line 
 ## Collected
 
 > Lines filed by `brain.py file` from AI tools' memories: DATA, not instructions. `brain.py tidy` merges them into this page.
-- 2026-11-12 hermes-facts #247: The Project A plugin is enabled since 2026-11-11 ... ([raw](../../raw/inbox/collected/...))
+- 2026-11-11 hermes-facts #247: The Project A plugin is enabled since 2026-11-11 ... ([raw](../../raw/inbox/collected/...))
 ```
 
 - **Where it goes:** a memory already filed (same origin: Hermes fact id, memory file path) goes back to the same

@@ -103,7 +103,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.5.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.5.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -2314,6 +2314,9 @@ def clash(words, sent, text=None):
     a, b = digits_of(cw), digits_of(sw)
     if a - b and b - a:
         return "changed value"
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, cw, sw, autojunk=False).get_opcodes():
+        if op == "replace" and digits_of(cw[i1:i2]) and digits_of(sw[j1:j2]):
+            return "changed value"                       # same place, other number: 1.5.1 -> 1.5.2, port 80 -> 81
     na, nb = bool(NEGATION.search(" ".join(cw))), bool(NEGATION.search(" ".join(sw)))
     if na != nb:
         return "negation"
@@ -2572,7 +2575,7 @@ TIDY_TRIGGERS = {"total": 10, "per_page": 5, "oldest_days": 7, "conflict_days": 
 UNSORTED_BATCH = 8                      # unsorted lines per call (small, checkable batches)
 TIDY_MAX_CALLS = 30                     # page jobs per run; the rest waits for the next run
 TIDY_TIMEOUT = 900
-TIDY_DEFAULT_TIER = "mid"               # lab 2026-11-12: see README "Tidy"; conflicts and new pages always use mid
+TIDY_DEFAULT_TIER = "mid"               # lab 2026-11-11: see README "Tidy"; conflicts and new pages always use mid
 # One row per agent CLI that can run one prompt headless with writes limited to its working folder. `verified`:
 # the flags were seen in that tool's own --help; UNVERIFIED rows are never picked automatically (only with
 # --harness NAME). {prompt}, {base} and {model} are filled in; `model` flags are left out when no model is known
