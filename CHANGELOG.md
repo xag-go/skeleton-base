@@ -17,6 +17,8 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - `disconnect` and `uninstall`: while Frugal-Bridge uses the base, the user slot is exported back to its
   `USER.md` (old one backed up to `FRUGAL_HOME/backup/skeleton-base-TIME/`) and its `install --global` re-run, so
   it uses its own file again.
+- `collect` / `watch` leave Frugal-Bridge's rules block out of collected rules-file memories (`~/.gemini/GEMINI.md`,
+  `~/.qwen/QWEN.md`, added files), like the base's own block: it is a kit's rules, not something the user taught.
 - 6 new tests with the real Frugal-Bridge setup in a temp HOME and FRUGAL_HOME (81 in total).
 
 ## v1.3.0 - 2026-11-11
