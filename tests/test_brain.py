@@ -1429,3 +1429,250 @@ class NeverTests(HomeBase):
         self.assertEqual((self.home / ".qwen/QWEN.md").read_text(), "q\n")
         self.ok("disconnect")
         self.assertEqual((self.home / ".hermes/SOUL.md").read_text(), "You are calm.\n")
+
+
+# ---------------------------------------------------------------- Frugal-Bridge installed for the user (--global)
+FRUGAL_BLOCK = re.compile(r"<!-- frugal-bridge:start v[^>]*-->.*?<!-- frugal-bridge:end -->", re.S)
+FAKE_USER = ("# USER.md — who the user is and how they want answers\n\n"
+             "- Name of the main agent (any name the user likes): Robin\n\n"
+             "- Language and script: English\n"
+             "- Answer style (length, format, numbers/currency): short, tables\n"
+             "- What the user decides alone (the main agent only proposes): spending\n"
+             "- What the main agent may just do:\n"
+             "- Other preferences: no emojis\n"
+             "- Name: Alex Example\n"
+             "Likes plain files.\n")
+SCRUB = ("HERMES_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "BRAIN_ROOT", "FRUGAL_BRIDGE_KIT")
+
+
+@unittest.skipUnless(HAVE_FRUGAL, "Frugal-Bridge checkout not found (set FRUGAL_BRIDGE_SRC)")
+class FrugalGlobalTests(Base):
+    """Both kits at user level, with the real Frugal-Bridge kit/setup.py (a copy in the fake HOME, found as
+    ~/frugal-bridge). HOME and FRUGAL_HOME are temp dirs; tool-home overrides are removed from the environment."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        self.fh = self.tmp / "elsewhere" / ".frugal-bridge"   # FRUGAL_HOME on purpose (not ~/.frugal-bridge); the
+        # folder keeps the default name: Frugal finds its own hook entries by the ".frugal-bridge/" path part
+        ign = shutil.ignore_patterns("__pycache__", "*.pyc")
+        for part in ("kit", "adapter"):
+            if (FRUGAL_SRC / part).is_dir():
+                shutil.copytree(FRUGAL_SRC / part, self.home / "frugal-bridge" / part, ignore=ign)
+        self.setup_py = self.home / "frugal-bridge" / "kit" / "setup.py"
+        self.base = self.fresh()
+        self.write(self.home, ".claude/CLAUDE.md", "# my global rules\nUse tabs.\n")
+        (self.home / ".codex").mkdir()
+
+    def x(self, *args, extra=None):
+        e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home), FRUGAL_HOME=str(self.fh))
+        for v in SCRUB:
+            e.pop(v, None)
+        e.update(extra or {})
+        r = subprocess.run([sys.executable, *map(str, args)], capture_output=True, text=True, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def fg(self, *a):
+        return self.x(self.setup_py, *a)
+
+    def sb(self, cmd, *a, extra=None):
+        if cmd in ("init", "uninstall"):
+            return self.x(BRAIN, cmd, self.base, *a, extra=extra)
+        return self.x(self.base / "tools" / "brain.py", cmd, "--base", self.base, *a, extra=extra)
+
+    def frugal_install(self, hosts="claude-code,codex"):
+        return self.fg("install", "--global", "--hosts", hosts)
+
+    def snap(self):
+        return tree(self.home, skip=()), tree(self.fh, skip=()), tree(self.base, skip=())
+
+    def rules(self):
+        return [self.home / ".claude/CLAUDE.md", self.home / ".codex/AGENTS.md"]
+
+    def assert_order(self, f):
+        t = f.read_text()
+        self.assertEqual(t.count("<!-- base-folder:start"), 1, f)
+        self.assertEqual(len(FRUGAL_BLOCK.findall(t)), 1, f)
+        self.assertLess(t.index("<!-- base-folder:start"), t.index("<!-- frugal-bridge:start"), f)
+
+    def frugal_first(self):
+        self.frugal_install()
+        (self.fh / "USER.md").write_text(FAKE_USER)
+        self.write(self.base, "wiki/me/how-to-talk-to-me.md", (self.base / "wiki/me/how-to-talk-to-me.md")
+                   .read_text().replace("- Language:\n", "- Language: French\n"))          # a conflict
+        self.write(self.base, "wiki/me/who-i-am.md", (self.base / "wiki/me/who-i-am.md")
+                   .read_text().replace("- Name:\n", "- Name: Alex Example\n"))           # a duplicate
+        return {f: f.read_bytes() for f in self.rules() + [self.home / ".claude/settings.json"]}
+
+    def test_frugal_first_then_base_imports_switches_and_reruns_identical(self):
+        self.frugal_first()
+        self.assertNotIn("knowledge base owns", (self.home / ".claude/CLAUDE.md").read_text())
+        r = self.sb("connect")
+        self.assertIn("1 filled, 4 added, 2 to review", r.stdout)
+        self.assertIn("Frugal-Bridge: now uses this base", r.stdout)
+        talk = (self.base / "wiki/me/how-to-talk-to-me.md").read_text()
+        who = (self.base / "wiki/me/who-i-am.md").read_text()
+        self.assertIn("- Language: French\n", talk)                       # never overwritten
+        self.assertIn("- What I decide alone (agents only propose): spending\n", talk)   # empty field filled
+        for line in ("- Name of the main agent: Robin", "- Answer style: short, tables", "- Other preferences: no emojis"):
+            self.assertIn(line, talk.split("## From Frugal-Bridge USER.md")[1])
+        self.assertIn("## From Frugal-Bridge USER.md\n- Likes plain files.\n", who)
+        self.assertEqual(who.count("Alex Example"), 1)
+        self.assertIn("sources: [interview, frugal-bridge USER.md]", talk)
+        card = (self.base / "board/2026-11-11-review-frugal-user-import.md").read_text()
+        self.assertIn("- conflict: `wiki/me/how-to-talk-to-me.md` has `- Language: French`", card)
+        self.assertIn("`- Language and script: English` (the base kept its line)", card)
+        self.assertIn("- duplicate: `wiki/me/who-i-am.md` has `- Name: Alex Example`", card)
+        # no data lost: every filled USER.md value is in the user slot or on the review card
+        slot = "".join(p.read_text() for p in (self.base / "wiki/me").glob("*.md")) + card
+        for v in ("Robin", "English", "short, tables", "spending", "no emojis", "Alex Example", "Likes plain files."):
+            self.assertIn(v, slot)
+        self.assertEqual((self.fh / "USER.md").read_text(), FAKE_USER, "old USER.md stays in place, unchanged")
+        bk = list((self.base / ".brain/backups").glob("frugal-import-*/frugal-USER.md"))
+        self.assertEqual([b.read_text() for b in bk], [FAKE_USER])
+        self.assertTrue(list((self.base / ".brain/backups").glob("frugal-import-*/wiki/me/who-i-am.md")))
+        rec = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["frugal_user"]
+        self.assertEqual(rec["file"], str(self.fh / "USER.md"))
+        self.assertEqual(len(rec["lines"]), 7)
+        # Frugal switched: its registry names the base, its block says the base owns the user files
+        self.assertEqual(json.loads((self.fh / "global.json").read_text())["base"], str(self.base))
+        for f in self.rules():
+            self.assert_order(f)
+            fb = FRUGAL_BLOCK.search(f.read_text()).group(0)
+            self.assertIn(f"A knowledge base owns the user's files: `{self.base}`", fb)
+            self.assertIn(f"user = `{self.base}/wiki/me/`", fb)
+        cl = (self.home / ".claude/CLAUDE.md").read_text()
+        self.assertTrue(cl.startswith("# my global rules\nUse tabs.\n\n<!-- base-folder:start v2 -->"))
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        self.assertEqual(self.x(BRAIN, "lint", "--root", self.base).returncode, 0)
+        self.assertEqual(self.x(BRAIN, "check", "--root", self.base).returncode, 0)
+        # re-runs: byte-identical, in any order
+        snap = self.snap()
+        self.assertIn("nothing to change", self.sb("connect").stdout)
+        self.assertEqual(snap, self.snap())
+        self.frugal_install()
+        self.assertEqual(snap, self.snap())
+        self.sb("init", "--frugal=no")
+        self.assertEqual(snap[:2], self.snap()[:2])
+        self.assertIn("frugal_user", json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"])
+        # a line added to USER.md later is merged on the next connect (and only that line)
+        with open(self.fh / "USER.md", "a") as f:
+            f.write("- Tone: calm\n")
+        r = self.sb("connect")
+        self.assertIn("1 filled, 0 added, 0 to review", r.stdout)
+        self.assertIn("- Tone: calm\n", (self.base / "wiki/me/how-to-talk-to-me.md").read_text())
+
+    def test_frugal_block_bytes_never_modified_by_the_base(self):
+        """Without Frugal's kit the base only inserts its block in front: Frugal's bytes stay as they were."""
+        self.frugal_install()
+        (self.fh / "USER.md").write_text(FAKE_USER)
+        shutil.rmtree(self.home / "frugal-bridge")
+        kit = self.tmp / "kit-copy"
+        for part in ("kit", "adapter"):
+            shutil.copytree(FRUGAL_SRC / part, kit / part, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        old = {f: f.read_text() for f in self.rules()}
+        home0, fh0 = tree(self.home, skip=()), tree(self.fh, skip=())
+        r = self.sb("connect")
+        self.assertIn("Frugal-Bridge: its kit was not found", r.stdout)
+        for f in self.rules():
+            t = f.read_text()
+            self.assert_order(f)
+            self.assertEqual(FRUGAL_BLOCK.search(t).group(0), FRUGAL_BLOCK.search(old[f]).group(0))
+            self.assertEqual(t[FRUGAL_BLOCK.search(t).start():], old[f][FRUGAL_BLOCK.search(old[f]).start():])
+        self.assertNotIn("base", json.loads((self.fh / "global.json").read_text()))
+        snap = self.snap()
+        self.sb("connect")
+        self.assertEqual(snap, self.snap())
+        self.sb("disconnect")                 # Frugal never switched: nothing exported, files come back exactly
+        self.assertEqual(home0, tree(self.home, skip=()))
+        self.assertEqual(fh0, tree(self.fh, skip=()))
+        # the kit found through FRUGAL_BRIDGE_KIT
+        r = self.sb("connect", extra={"FRUGAL_BRIDGE_KIT": str(kit)})
+        self.assertIn("Frugal-Bridge: now uses this base", r.stdout)
+
+    def test_base_first_then_frugal_uses_base_no_user_md(self):
+        home0 = tree(self.home, skip=())
+        self.sb("connect")
+        self.frugal_install()
+        self.assertFalse((self.fh / "USER.md").exists(), "Frugal made a second user file next to the base")
+        self.assertEqual(json.loads((self.fh / "global.json").read_text())["base"], str(self.base))
+        for f in self.rules():
+            self.assert_order(f)
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        self.sb("connect")                    # settles once: Frugal changed settings.json after us (exact -> False)
+        snap = self.snap()
+        self.sb("connect")
+        self.frugal_install()
+        self.assertEqual(snap, self.snap())
+        # the base leaves: its user slot becomes Frugal's USER.md, Frugal stands alone
+        self.write(self.base, "wiki/me/how-to-talk-to-me.md", (self.base / "wiki/me/how-to-talk-to-me.md")
+                   .read_text().replace("- Language:\n", "- Language: Spanish\n"))
+        self.sb("disconnect")
+        u = (self.fh / "USER.md").read_text()
+        self.assertIn("- Language and script: Spanish\n", u)
+        self.assertNotIn("base", json.loads((self.fh / "global.json").read_text()))
+        self.assertIn(f"The user file is `{self.fh / 'USER.md'}`", (self.home / ".claude/CLAUDE.md").read_text())
+        self.assertNotIn("base-folder:start", (self.home / ".claude/CLAUDE.md").read_text())
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        self.fg("uninstall", "--global")
+        self.assertEqual((self.home / ".claude/CLAUDE.md").read_text(), "# my global rules\nUse tabs.\n")
+        self.assertIn(".claude/CLAUDE.md", home0)
+
+    def test_uninstall_base_exports_back_and_frugal_works_alone(self):
+        before = self.frugal_first()
+        self.sb("connect")
+        p = self.base / "wiki/me/how-to-talk-to-me.md"
+        p.write_text(p.read_text().replace("- Tone:\n", "- Tone: warm\n"))           # learned while in the base
+        r = self.sb("uninstall")
+        self.assertIn("exported the base user slot", r.stdout)
+        self.assertIn("Frugal-Bridge: back on its own user file", r.stdout)
+        u = (self.fh / "USER.md").read_text()
+        for line in ("- Name of the main agent (any name the user likes): Robin\n", "- Language and script: French\n",
+                     "- Answer style (length, format, numbers/currency): short, tables\n",
+                     "- What the user decides alone (the main agent only proposes): spending\n",
+                     "- Other preferences: no emojis\n", "- Tone: warm\n", "- Likes plain files.\n",
+                     "- Name: Alex Example\n"):
+            self.assertIn(line, u)
+        bk = list(self.fh.glob("backup/skeleton-base-*/USER.md"))
+        self.assertEqual([b.read_text() for b in bk], [FAKE_USER], "the old USER.md is backed up")
+        self.assertNotIn("base", json.loads((self.fh / "global.json").read_text()))
+        for f, b in before.items():           # Frugal's files are exactly as before the base came
+            self.assertEqual(f.read_bytes(), b, f)
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
+        snap = (tree(self.home, skip=()), tree(self.fh, skip=()))
+        self.frugal_install()                 # standalone Frugal: re-run changes nothing
+        self.assertEqual(snap, (tree(self.home, skip=()), tree(self.fh, skip=())))
+
+    def test_reconnect_after_disconnect_imports_nothing_new(self):
+        self.frugal_first()
+        self.sb("connect")
+        self.sb("disconnect")
+        pages = tree(self.base / "wiki/me")
+        r = self.sb("connect")
+        self.assertNotIn("merged into", r.stdout)
+        self.assertIn("Frugal-Bridge: now uses this base", r.stdout)
+        self.assertEqual(pages, tree(self.base / "wiki/me"))
+        self.assertEqual(len(list(self.base.glob("board/*review-frugal*"))), 1)
+
+    def test_watch_autoconnect_puts_base_block_before_frugal_block(self):
+        self.sb("connect")
+        self.frugal_install()
+        self.frugal_install("claude-code,codex,gemini")     # Frugal reaches a tool the base has not seen yet
+        g = self.home / ".gemini/GEMINI.md"
+        old = g.read_text()
+        self.assertNotIn("base-folder:start", old)
+        r = self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
+        self.assert_order(g)
+        t = g.read_text()
+        self.assertEqual(t[FRUGAL_BLOCK.search(t).start():], old, "Frugal's bytes untouched, ours in front")
+        self.assertTrue(t.startswith("<!-- base-folder:start v2 -->"))
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"), r.stdout)
+        snap = self.snap()
+        self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
+        self.assertEqual(snap[:2], self.snap()[:2])
+        self.sb("disconnect")
+        t = g.read_text()
+        self.assertEqual(t, FRUGAL_BLOCK.search(t).group(0) + "\n", "only Frugal's block is left, as it wrote it")
+        self.assertIn(f"The user file is `{self.fh / 'USER.md'}`", t)
+        self.assertTrue(self.fg("check", "--global").stdout.startswith("OK"))
