@@ -25,10 +25,29 @@ BASE_SLOTS = {"user": "wiki/me/", "now": "hot.md", "decisions": "wiki/decisions/
 
 
 _ISOLATED_HOME = tempfile.TemporaryDirectory(prefix="skb-home-")    # a test never sees the real home
+_FAKE_BIN = tempfile.TemporaryDirectory(prefix="skb-bin-")          # programs on PATH: only the ones a test makes
+
+
+def fake_bin(d, *names, out=""):
+    """Tiny programs named after a tool (they print `out`); PATH decides which tools look installed."""
+    d = pathlib.Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        p = d / n
+        p.write_text(f"#!/bin/sh\necho {out!r}\n" if out else "#!/bin/sh\nexit 0\n")
+        p.chmod(0o755)
+    return d
+
+
+fake_bin(_FAKE_BIN.name, "gemini")      # the older tests make ~/.gemini and expect Gemini CLI to be there
+TEST_PATH = os.pathsep.join([_FAKE_BIN.name, os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+_FRUGAL_BIN = tempfile.TemporaryDirectory(prefix="skb-fbin-")       # Frugal-Bridge detects tools by program too
+fake_bin(_FRUGAL_BIN.name, "claude", "codex", "gemini")
+FRUGAL_PATH = os.pathsep.join([_FRUGAL_BIN.name, os.path.dirname(sys.executable), "/usr/bin", "/bin"])
 
 
 def run(*args, cwd=None, env=None, inp=None):
-    e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=_ISOLATED_HOME.name)
+    e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=_ISOLATED_HOME.name, PATH=TEST_PATH)
     for v in ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
               "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):   # never the real user's kits or tools
         e.pop(v, None)
@@ -1714,7 +1733,7 @@ class AccessTests(HomeBase):
                 r = self.ok("connect")
                 self.assertIn("sandbox_workspace_write.writable_roots", r.stdout)
                 new = p.read_text()
-                ins = self.access()[".codex/config.toml"]["undo"]["insert"]
+                ins = self.access()[".codex/config.toml"]["edits"][0]["insert"]
                 self.assertEqual(new.replace(ins, "", 1), mine, "only our text was added")
                 d, old = tomllib.loads(new), tomllib.loads(mine)
                 self.assertEqual(d["sandbox_workspace_write"]["writable_roots"][0], str(self.base))
@@ -1763,11 +1782,17 @@ class AccessTests(HomeBase):
         self.ok("disconnect")
         self.assertEqual(g.read_text(), '{"context": {"fileName": ["AGENTS.md"]}, "theme": "x"}')
         self.assertEqual(json.loads(q.read_text()), {"model": {"name": "any"}})   # our empty keys gone too
-        # a settings file with comments (not plain JSON) is left alone, with a note
+        # a settings file with comments (JSONC): merged by a text insert, the comments stay; given back exactly
         g.write_text('// mine\n{"theme": "x"}\n')
-        r = self.ok("connect")
-        self.assertIn("add the base by hand", r.stdout)
+        self.ok("connect")
+        self.assertTrue(g.read_text().startswith('// mine\n{"theme": "x", "context": {"includeDirectories": ['))
+        self.ok("disconnect")
         self.assertEqual(g.read_text(), '// mine\n{"theme": "x"}\n')
+        # not JSON at all: left alone, with a note
+        g.write_text('{"theme": \n')
+        r = self.ok("connect")
+        self.assertIn("add it by hand", r.stdout)
+        self.assertEqual(g.read_text(), '{"theme": \n')
 
     def test_opencode_external_directory_only_where_it_has_rules(self):
         p = self.home / ".config/opencode/opencode.json"
@@ -1803,7 +1828,9 @@ class AccessTests(HomeBase):
         for s in ("permissions.additionalDirectories", "writable_roots", "context.includeDirectories",
                   "external_directory"):
             self.assertIn(s, t)
-        self.assertIn("Hermes: no folder wall", self.ok("connect", "--print").stdout)
+        out = self.ok("connect", "--print").stdout
+        self.assertIn("- Hermes Agent: rules ~/.hermes/SOUL.md", out)
+        self.assertIn("no wall (its file tools reach any path you can)", out)
 
     def test_every_known_tool_is_found_readable_writable_and_collected(self):
         """The README matrix, one row per known tool: (a) rules block, (b/c) its own access setting, (d) memory."""
@@ -1887,7 +1914,7 @@ class FrugalGlobalTests(Base):
         (self.home / ".codex").mkdir()
 
     def x(self, *args, extra=None):
-        e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home), FRUGAL_HOME=str(self.fh))
+        e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home), FRUGAL_HOME=str(self.fh), PATH=FRUGAL_PATH)
         for v in SCRUB:
             e.pop(v, None)
         e.update(extra or {})
@@ -2434,3 +2461,554 @@ class SpacePathTests(Base):
         self.assertEqual(brain.parse_path_line("/srv/base"), "/srv/base")
         with self.assertRaises(SystemExit):
             brain.unit_esc("/a\nb")
+
+
+# ---------------------------------------------------------------- v1.4.0: every known tool, writers, MCP, hooks
+sys.path.insert(0, str(REPO / "tools"))
+import brain as B          # noqa: E402  (the writers are pure functions)
+
+ALL_BINS = ("claude", "codex", "gemini", "qwen", "opencode", "kilo", "grok", "copilot", "openclaw", "hermes", "crush",
+            "goose", "amp", "aider", "droid", "warp", "cursor-agent", "devin", "kiro-cli", "cline", "cn", "zed",
+            "junie")
+ALL_FILES = {     # each tool's own (fake) user config before connect: comments and layouts must survive
+    ".claude/settings.json": '{"model": "x"}',
+    ".claude.json": '{\n  "numStartups": 3,\n  "projects": {}\n}\n',
+    ".codex/config.toml": '# mine\nmodel = "m"\n',
+    ".gemini/settings.json": '{"theme": "x"}',
+    ".qwen/settings.json": '{\n  // qwen\n  "model": {"name": "q"}\n}\n',
+    ".config/opencode/opencode.json": '{"permissions": [{"action": "external_directory", "resource": "*", '
+                                      '"effect": "ask"}]}',
+    ".config/kilo/kilo.jsonc": '{\n  // kilo\n  "$schema": "https://app.kilo.ai/config.json",\n}\n',
+    ".grok/config.toml": '[sandbox]\nprofile = "mine"\n',
+    ".grok/sandbox.toml": '[profiles.mine]\nextends = "workspace"\n',
+    ".copilot/settings.json": "{}",
+    ".openclaw/workspace/AGENTS.md": "# openclaw\n",
+    ".hermes/SOUL.md": "I am the agent.\n",
+    ".hermes/config.yaml": "model:\n  default: x\nmcp_servers:\n  other:\n    command: a\n",
+    ".config/crush/crushrc": "option x\n",
+    ".config/goose/config.yaml": "GOOSE_PROVIDER: x\nextensions:\n  developer:\n    enabled: true\n    type: builtin\n",
+    ".config/amp/settings.json": '{"amp.dial": "medium"}',
+    ".aider.conf.yml": "model: x\n",
+    ".factory/settings.json": '{\n  // droid\n  "sandbox": {"enabled": true}\n}\n',
+    ".config/warp-terminal/cli/settings.toml": "x = 1\n",
+    ".cursor/cli-config.json": '{"permissions": {"allow": ["Shell(ls)"]}}',
+    ".config/devin/config.json": '{"agent": {"model": "x"}}',
+    ".codeium/windsurf/memories/README": "legacy\n",
+    ".kiro/settings/permissions.yaml": 'rules:\n  - capability: shell\n    match: ["git *"]\n    effect: allow\n',
+    ".cline/data/settings/global-settings.json": "{}",
+    "Documents/Cline/Rules/mine.md": "my cline rule\n",
+    ".roo/rules/x.md": "roo rule\n",
+    ".continue/config.yaml": "name: x\n",
+    ".config/zed/settings.json": '// zed\n{\n  "theme": "One Dark", // keep\n}\n',
+    ".junie/allowlist.json": '{\n  "defaultBehavior": "ask", // mine\n  "rules": {}\n}\n',
+    ".config/Claude/claude_desktop_config.json": '{"mcpServers": {"fs": {"command": "npx"}}}',
+}
+ALL_RULES = (".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md", ".qwen/QWEN.md",
+             ".config/opencode/AGENTS.md", ".grok/rules/skeleton-base.md",
+             ".copilot/instructions/skeleton-base.instructions.md", ".openclaw/workspace/AGENTS.md", ".hermes/SOUL.md",
+             ".config/crush/CRUSH.md", ".config/goose/.goosehints", ".config/amp/AGENTS.md", ".agents/AGENTS.md",
+             ".codeium/windsurf/memories/global_rules.md", ".kiro/steering/skeleton-base.md",
+             ".continue/rules/skeleton-base.md", ".config/zed/AGENTS.md", ".junie/AGENTS.md",
+             ".config/skeleton-base/AGENTS.md")
+
+
+class ToolHome(HomeBase):
+    """A fake HOME plus a private PATH: only the programs a test makes look installed."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+
+    def path(self):
+        return os.pathsep.join([str(self.bin), os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+
+    def hb(self, *args, env=None):
+        return run(self.base / "tools" / "brain.py", *args, env={"HOME": str(self.home), "PATH": self.path(),
+                                                                 **(env or {})})
+
+    def bins(self, *names, out=""):
+        fake_bin(self.bin, *names, out=out)
+
+    def every_tool(self):
+        self.bins(*ALL_BINS)
+        self.bins("opencode", out="opencode 2.0.1")
+        for r, text in ALL_FILES.items():
+            self.write(self.home, r, text)
+
+    def blocks(self, r):
+        return (self.home / r).read_text().count("<!-- base-folder:start")
+
+    def j(self, r):
+        return B.jsonc_load((self.home / r).read_text())["v"]
+
+
+class WriterTests(unittest.TestCase):
+    def test_jsonc_insert_keeps_comments_and_layout_and_undo_gives_bytes_back(self):
+        e = {"op": "add", "path": ["sandbox", "filesystem", "allowWrite"], "value": "/b", "same": "path"}
+        s = {"op": "set", "path": ["mcpServers"], "key": "skeleton-base", "value": {"command": "python3"}}
+        for text in ('{\n  // mine\n  "theme": "x", /* c */\n  "a": [1, 2,],\n}\n', "{}", '{"a": 1}', "{\n}\n",
+                     '{"sandbox": {"filesystem": {"allowWrite": ["/x"]}}}', ""):
+            for x in (e, s):
+                with self.subTest(text=text, op=x["op"]):
+                    new, undo, note = B.jsonc_apply(text, x)
+                    self.assertIsNone(note)
+                    v = B.jsonc_load(new)["v"]
+                    if x["op"] == "add":
+                        self.assertIn("/b", v["sandbox"]["filesystem"]["allowWrite"])
+                    else:
+                        self.assertEqual(v["mcpServers"]["skeleton-base"], {"command": "python3"})
+                    if "// mine" in text:
+                        self.assertIn("// mine", new)
+                        self.assertIn("/* c */", new)
+                    back = B.jsonc_undo(new, {**x, **undo})
+                    self.assertEqual(back, text if text else "")
+                    # reformatted since (another program rewrote it): our entry is found and cut by structure
+                    if text.strip():
+                        refmt = json.dumps(v, indent=4)
+                        self.assertEqual(json.loads(B.jsonc_undo(refmt, {**x, **undo})),
+                                         B.jsonc_load(text)["v"])
+                    self.assertEqual(B.jsonc_apply(new, x)[:2], (None, None), "idempotent")
+
+    def test_jsonc_refuses_what_it_cannot_merge(self):
+        s = {"op": "set", "path": ["mcpServers"], "key": "skeleton-base", "value": {"command": "python3"}}
+        self.assertIn("by hand", B.jsonc_apply('{"a": ', s)[2])
+        self.assertIn("by hand", B.jsonc_apply("[1]", s)[2])
+        self.assertIn("by hand", B.jsonc_apply('{"mcpServers": []}', s)[2])
+        self.assertIn("left alone", B.jsonc_apply('{"mcpServers": {"skeleton-base": {"command": "x"}}}', s)[2])
+        # you changed our entry later: it is yours now, undo leaves it
+        new, u, _ = B.jsonc_apply("{}", s)
+        changed = new.replace('"python3"', '"python3.12"')
+        self.assertIsNone(B.jsonc_undo(changed, {**s, **u, "insert": "zz"}))
+
+    def test_toml_table_and_list_inserts(self):
+        items = {"command": "python3", "args": ["a", "b"]}
+        for text in ("", 'model = "m"\n', '[mcp_servers.other]\ncommand = "x"\n', "# c\n[tui]\nx = 1"):
+            new, u, note = B.toml_table_add(text, "mcp_servers.skeleton-base", items)
+            self.assertIsNone(note)
+            self.assertTrue(new.startswith(text))
+            self.assertEqual(B.toml_table_undo(new, {"table": "mcp_servers.skeleton-base", **u}), text)
+            self.assertEqual(B.toml_table_add(new, "mcp_servers.skeleton-base", items), (None, None, None))
+        self.assertIn("by hand", B.toml_table_add("mcp_servers = {}\n", "mcp_servers.skeleton-base", items)[2])
+        self.assertIn("left alone", B.toml_table_add('[mcp_servers.skeleton-base]\ncommand = "z"\n',
+                                                     "mcp_servers.skeleton-base", items)[2])
+        new, u, note = B.toml_list_add('[profiles.mine]\nextends = "workspace" # c\n', "profiles.mine", "read_write",
+                                       "/b")
+        self.assertIn('read_write = ["/b"]', new)
+        self.assertIn("# c", new)
+
+    def test_yaml_minimal_safe_line_edits(self):
+        line = 'skeleton-base: {"command": "python3"}'
+        for text, want in (("", 'mcp_servers:\n  skeleton-base: {"command": "python3"}\n'),
+                           ("a: 1\n", 'a: 1\nmcp_servers:\n  skeleton-base: {"command": "python3"}\n'),
+                           ("mcp_servers:\n    other:\n      command: a\n",
+                            'mcp_servers:\n    skeleton-base: {"command": "python3"}\n    other:\n      command: a\n'),
+                           ("a: 1\nmcp_servers:", 'a: 1\nmcp_servers:\n  skeleton-base: {"command": "python3"}\n')):
+            new, u, note = B.yaml_apply(text, "mcp_servers", line)
+            self.assertEqual(new, want)
+            self.assertEqual(B.yaml_undo(new, {"key": "mcp_servers", "line": line, **u}), text)
+            self.assertEqual(B.yaml_apply(new, "mcp_servers", line), (None, None, None))
+        new, _, _ = B.yaml_apply("rules:\n- capability: shell\n", "rules", '- {"capability": "fs_read"}')
+        self.assertEqual(new, 'rules:\n- {"capability": "fs_read"}\n- capability: shell\n')
+        for bad, word in (("mcp_servers: {}\n", "inline"), ("mcp_servers:\n\tx: 1\n", "tabs"),
+                          ("a: 1\n---\nb: 2\n", "several"), ("mcp_servers:\nmcp_servers:\n", "twice")):
+            self.assertIn(word, B.yaml_apply(bad, "mcp_servers", line)[2])
+
+
+class EveryToolTests(ToolHome):
+    def test_every_known_tool_at_once_finds_reads_writes_mcp_then_disconnect_byte_identical(self):
+        """The README matrix, one row per tool, all tools at once (fake HOME, fake programs on PATH)."""
+        self.every_tool()
+        home0 = tree(self.home)
+        r = self.ok("connect", "--mcp")
+        b, h = str(self.base), self.home
+        for f in ALL_RULES:                                                  # (a) found: one block per file
+            self.assertIn(f"Path: {b}\n", (h / f).read_text(), f)
+            self.assertEqual(self.blocks(f), 1, f)
+        for f in (".factory/AGENTS.md", "Documents/Cline/Rules/skeleton-base.md", ".config/kilo/AGENTS.md",
+                  ".config/devin/AGENTS.md", ".config/AGENTS.md", ".roo/rules/skeleton-base.md"):
+            self.assertFalse((h / f).exists(), f"{f}: that tool already gets the block from another file")
+        self.assertEqual((h / ".roo/rules/x.md").read_text(), "roo rule\n")
+        # (b) read + write: each tool's own setting
+        self.assertIn(b, self.j(".claude/settings.json")["permissions"]["additionalDirectories"])
+        self.assertIn(f"writable_roots = [{json.dumps(b)}]", (h / ".codex/config.toml").read_text())
+        for f in (".gemini/settings.json", ".qwen/settings.json"):
+            self.assertEqual(self.j(f)["context"]["includeDirectories"], [b], f)
+        self.assertIn({"action": "external_directory", "resource": f"{b}/**", "effect": "allow"},
+                      self.j(".config/opencode/opencode.json")["permissions"])
+        self.assertEqual(self.j(".config/kilo/kilo.jsonc")["permission"]["external_directory"], {f"{b}/**": "allow"})
+        self.assertIn(f'read_write = [{json.dumps(b)}]', (h / ".grok/sandbox.toml").read_text())
+        self.assertEqual(self.j(".factory/settings.json")["sandbox"]["filesystem"]["allowWrite"], [b])
+        self.assertEqual(self.j(".cursor/sandbox.json"), {"additionalReadwritePaths": [b], "additionalReadPaths": [b]})
+        self.assertEqual(self.j(".cursor/cli-config.json")["permissions"]["allow"],
+                         ["Shell(ls)", f"Read({b}/**)", f"Write({b}/**)"])
+        self.assertEqual(self.j(".config/devin/config.json")["permissions"]["allow"], [f"Read({b}/**)", f"Write({b}/**)"])
+        kiro = (h / ".kiro/settings/permissions.yaml").read_text()
+        for cap in ("fs_read", "fs_write"):
+            self.assertIn(json.dumps({"capability": cap, "match": [b], "effect": "allow"}), kiro)
+        self.assertIn("capability: shell", kiro)
+        self.assertIn(f'- "Write({b}/**)"', (h / ".continue/permissions.yaml").read_text())
+        j = self.j(".junie/allowlist.json")["rules"]
+        self.assertEqual(j["readOutsideProject"]["rules"], [{"pattern": f"{b}/**", "action": "allow"}])
+        self.assertEqual(j["fileEditing"]["rules"], [{"prefix": b + "/", "action": "allow"}])
+        self.assertIn(json.dumps(str(h / ".config/skeleton-base/AGENTS.md")), (h / ".aider.conf.yml").read_text())
+        # MCP (--mcp): each tool's own config, once (Devin, Grok and Warp import ~/.claude.json)
+        args = [f"{b}/tools/brain.py", "mcp", "--base", b]
+        srv = {"command": "python3", "args": args}
+        self.assertEqual(self.j(".claude.json")["mcpServers"]["skeleton-base"], {"type": "stdio", **srv, "env": {}})
+        self.assertEqual(self.j(".claude.json")["numStartups"], 3)
+        import tomllib
+        self.assertEqual(tomllib.loads((h / ".codex/config.toml").read_text())["mcp_servers"]["skeleton-base"], srv)
+        for f in (".gemini/settings.json", ".qwen/settings.json", ".cursor/mcp.json", ".kiro/settings/mcp.json",
+                  ".junie/mcp/mcp.json", ".config/Claude/claude_desktop_config.json"):
+            self.assertEqual(self.j(f)["mcpServers"]["skeleton-base"], srv, f)
+        self.assertEqual(self.j(".config/Claude/claude_desktop_config.json")["mcpServers"]["fs"], {"command": "npx"})
+        self.assertEqual(self.j(".copilot/mcp-config.json")["mcpServers"]["skeleton-base"],
+                         {"type": "local", **srv, "tools": ["*"]})
+        self.assertEqual(self.j(".factory/mcp.json")["mcpServers"]["skeleton-base"], {"type": "stdio", **srv})
+        self.assertEqual(self.j(".cline/data/settings/cline_mcp_settings.json")["mcpServers"]["skeleton-base"],
+                         {**srv, "disabled": False})
+        self.assertEqual(self.j(".config/amp/settings.json")["amp.mcpServers"]["skeleton-base"], srv)
+        self.assertEqual(self.j(".config/zed/settings.json")["context_servers"]["skeleton-base"], {**srv, "env": {}})
+        self.assertEqual(self.j(".config/kilo/kilo.jsonc")["mcp"]["skeleton-base"],
+                         {"type": "local", "command": ["python3", *args], "enabled": True})
+        self.assertEqual(self.j(".config/opencode/opencode.json")["mcp"]["servers"]["skeleton-base"],
+                         {"type": "local", "command": ["python3", *args]})
+        self.assertIn(f"skeleton-base: {json.dumps(srv)}", (h / ".hermes/config.yaml").read_text())
+        self.assertIn('skeleton-base: {"type": "stdio", "name": "skeleton-base"', (h / ".config/goose/config.yaml")
+                      .read_text())
+        for f in (".config/devin/mcp_config.json", ".grok/config.toml.mcp"):
+            self.assertFalse((h / f).exists(), f)
+        self.assertNotIn("mcp_servers", (h / ".grok/config.toml").read_text())
+        for f, c in ((".qwen/settings.json", "// qwen"), (".config/kilo/kilo.jsonc", "// kilo"),
+                     (".config/zed/settings.json", "// keep"), (".junie/allowlist.json", "// mine"),
+                     (".factory/settings.json", "// droid"), (".codex/config.toml", "# mine")):
+            self.assertIn(c, (h / f).read_text(), f"{f}: comments kept")
+        # skills: once, in ~/.agents/skills
+        for sk in ("base-ingest", "base-lint", "base-home"):
+            t = (h / f".agents/skills/{sk}/SKILL.md").read_text()
+            self.assertTrue(t.startswith(f"---\nname: {sk}\n"), sk)
+            self.assertIn(b, t)
+        self.assertFalse((h / ".claude/skills").exists() or (h / ".cursor/skills").exists())
+        # states: watch.json after one pipeline run
+        self.ok("watch", "--once", "--no-commit")
+        tools = json.loads((self.base / ".brain/watch.json").read_text())["tools"]
+        self.assertEqual({k for k, v in tools.items() if v["state"] == "connected"},
+                         set(B.TOOLS) - {".roo", ".config/Claude"} | {".config/Claude"})
+        self.assertEqual(tools[".roo"]["state"], "detected")
+        self.assertEqual(tools[".config/kilo"]["via"], ".claude/CLAUDE.md")
+        self.assertEqual(tools[".config/devin"]["files"], [".claude/CLAUDE.md"])
+        self.assertEqual(tools[".factory"]["files"], [".agents/AGENTS.md"])
+        self.assertEqual(tools[".cursor"]["files"], [".agents/skills/base-home/SKILL.md"])
+        snap = tree(self.home)
+        self.ok("connect", "--mcp")
+        self.assertEqual(snap, tree(self.home), "second connect changes nothing")
+        self.ok("connect")
+        self.assertEqual(snap, tree(self.home), "MCP stays registered once asked for")
+        self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home), "every tool's files byte-identical again")
+
+    def test_changed_settings_after_connect_lose_only_our_entries(self):
+        self.every_tool()
+        self.ok("connect", "--mcp")
+        z = self.home / ".config/zed/settings.json"
+        z.write_text(z.read_text().replace('"theme": "One Dark"', '"theme": "Light"'))
+        cj = self.home / ".claude.json"                    # Claude Code rewrites its file in its own layout
+        cj.write_text(json.dumps(dict(json.loads(cj.read_text()), numStartups=4), indent=2))
+        k = self.home / ".kiro/settings/permissions.yaml"
+        k.write_text(k.read_text() + "  - capability: web_fetch\n    effect: ask\n")
+        self.ok("disconnect")
+        self.assertEqual(z.read_text(), '// zed\n{\n  "theme": "Light", // keep\n}\n')
+        self.assertEqual(json.loads(cj.read_text()), {"numStartups": 4, "projects": {}})
+        self.assertEqual(k.read_text(), ALL_FILES[".kiro/settings/permissions.yaml"]
+                         + "  - capability: web_fetch\n    effect: ask\n")
+
+    def test_new_memory_stores_are_collected(self):
+        self.every_tool()
+        h = self.home
+        self.write(h, ".qwen/projects/proj-a/memory/MEMORY.md", "token-qwen-auto qwen auto-memory\n")
+        self.write(h, ".qwen/memories/user.md", "token-qwen-user user tier\n")
+        self.write(h, ".local/share/kilo/memory/app-0123456789ab/project.md", "token-kilo project memory\n")
+        self.write(h, ".config/goose/memory/preferences.txt", "token-goose likes tea\n")
+        self.write(h, ".grok/memory/global/notes.md", "token-grok memory\n")
+        self.write(h, ".codex/memories_v2/a/summary.md", "token-codex-v2 memory\n")
+        self.write(h, ".openclaw/workspace/DREAMS.md", "token-openclaw-dreams\n")
+        self.ok("collect")
+        got = "".join(p.read_text() for p in (self.base / "raw/inbox/collected").rglob("*.md"))
+        for s in ("token-qwen-auto", "token-qwen-user", "token-kilo", "token-goose", "token-grok", "token-codex-v2",
+                  "token-openclaw-dreams"):
+            self.assertIn(s, got)
+        srcs = {p.parent.name for p in (self.base / "raw/inbox/collected").rglob("*.md")}
+        self.assertTrue({"qwen", "kilo", "goose", "grok", "codex", "openclaw"} <= srcs, srcs)
+        locs = {(l["source"], l["root"]) for l in B.watch_locations(self.base, h)}
+        for src, root in (("kilo", ".local/share/kilo/memory"), ("goose", ".config/goose/memory"),
+                          ("grok", ".grok/memory"), ("qwen", ".qwen/projects")):
+            self.assertIn((src, str(h / root)), locs)
+
+
+class DetectionTests(ToolHome):
+    def test_a_shared_folder_alone_is_not_a_tool(self):
+        self.write(self.home, ".gemini/antigravity-ide/state.json", "{}")       # Antigravity makes ~/.gemini too
+        (self.home / ".config/crush").mkdir(parents=True)                       # an empty folder
+        self.bins("amp")                                                        # a program, no config folder
+        home0 = tree(self.home)
+        self.ok("connect")
+        self.assertFalse((self.home / ".gemini/GEMINI.md").exists())
+        self.assertFalse((self.home / ".gemini/settings.json").exists())
+        self.assertFalse((self.home / ".config/crush/CRUSH.md").exists())
+        self.assertFalse((self.home / ".config/amp").exists())
+        self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home))
+        self.bins("gemini", "crush")                                            # the programs are there now
+        self.ok("connect")
+        self.assertEqual(self.blocks(".gemini/GEMINI.md"), 1)
+        self.assertEqual(self.blocks(".config/crush/CRUSH.md"), 1)
+        self.ok("disconnect")
+        self.assertEqual(home0, tree(self.home))
+
+    def test_files_we_created_never_count_as_proof(self):
+        self.bins("gemini")
+        (self.home / ".gemini").mkdir()
+        self.ok("connect")                                  # creates ~/.gemini/settings.json (a Gemini mark)
+        self.assertTrue((self.home / ".gemini/settings.json").is_file())
+        os.unlink(self.bin / "gemini")                      # Gemini CLI uninstalled: our own file is no proof
+        r = self.ok("watch", "--once", "--no-commit")
+        tools = json.loads((self.base / ".brain/watch.json").read_text())["tools"]
+        self.assertNotIn(".gemini", tools)
+        self.ok("disconnect")
+        self.assertEqual(sorted(os.listdir(self.home / ".gemini")), [])
+
+
+class SharedFileTests(ToolHome):
+    def test_groups_load_the_block_once_and_move_when_a_member_comes(self):
+        self.bins("crush", "amp", "droid", "cline")
+        self.write(self.home, ".config/AGENTS.md", "# shared by crush and amp\n")
+        for d in (".config/crush", ".config/amp", ".factory", ".cline"):
+            (self.home / d).mkdir(parents=True, exist_ok=True)
+        home0 = tree(self.home)
+        self.ok("connect")
+        self.assertEqual(self.blocks(".config/AGENTS.md"), 1)
+        for f in (".config/crush/CRUSH.md", ".config/amp/AGENTS.md", ".agents/AGENTS.md"):
+            self.assertFalse((self.home / f).exists(), f)
+        self.assertEqual(self.blocks(".factory/AGENTS.md"), 1)              # no Warp: Droid and Cline own files
+        self.assertEqual(self.blocks("Documents/Cline/Rules/skeleton-base.md"), 1)
+        self.bins("warp")                                                    # Warp CLI reads only ~/.agents/AGENTS.md
+        self.write(self.home, ".config/warp-terminal/cli/settings.toml", "x = 1\n")
+        r = self.ok("connect")
+        self.assertEqual(self.blocks(".agents/AGENTS.md"), 1)
+        self.assertFalse((self.home / ".factory/AGENTS.md").exists(), "moved: Droid reads ~/.agents/AGENTS.md")
+        self.assertFalse((self.home / "Documents/Cline/Rules/skeleton-base.md").exists())
+        self.assertIn("loaded once", r.stdout)
+        self.ok("disconnect")
+        self.write(self.home, ".config/warp-terminal/cli/settings.toml", "x = 1\n")
+        exp = dict(home0, **{".config/warp-terminal": "dir", ".config/warp-terminal/cli": "dir",
+                             ".config/warp-terminal/cli/settings.toml": hashlib.sha256(b"x = 1\n").hexdigest()})
+        self.assertEqual(exp, tree(self.home))
+
+    def test_kilo_and_devin_through_claude_md_unless_they_have_their_own(self):
+        self.bins("claude", "kilo", "devin")
+        (self.home / ".claude").mkdir()
+        self.write(self.home, ".config/kilo/kilo.json", "{}")
+        self.write(self.home, ".config/devin/config.json", '{"read_config_from": {"claude": false}}')
+        self.ok("connect")
+        self.assertEqual(self.blocks(".config/devin/AGENTS.md"), 1, "Claude import off: its own file")
+        self.assertFalse((self.home / ".config/kilo/AGENTS.md").exists(), "Kilo loads ~/.claude/CLAUDE.md")
+        self.write(self.home, ".config/kilo/AGENTS.md", "# my kilo rules\n")
+        self.write(self.home, ".config/devin/config.json", "{}")
+        self.ok("connect")
+        self.assertEqual(self.blocks(".config/kilo/AGENTS.md"), 1)
+        self.assertFalse((self.home / ".config/devin/AGENTS.md").exists(), "Claude import on: via CLAUDE.md")
+        self.ok("disconnect")
+        self.assertEqual((self.home / ".config/kilo/AGENTS.md").read_text(), "# my kilo rules\n")
+
+    def test_codex_override_file_wins_and_size_caps_are_checked(self):
+        self.write(self.home, ".codex/AGENTS.override.md", "x" * 17000 + "\n")
+        self.write(self.home, ".hermes/SOUL.md", "s" * 19500 + "\n")
+        r = self.ok("connect")
+        self.assertEqual(self.blocks(".codex/AGENTS.override.md"), 1)
+        self.assertFalse((self.home / ".codex/AGENTS.md").exists(), "hidden by the override: not written")
+        self.assertIn("WARNING ~/.codex/AGENTS.override.md is", r.stdout)
+        self.assertIn("less than half is left", r.stdout)
+        self.assertRegex(r.stdout, r"WARNING ~/.hermes/SOUL.md is \d+ chars: Hermes cuts")
+        self.ok("disconnect")
+
+    def test_opencode_v1_and_v2_keys_by_its_version(self):
+        self.write(self.home, ".config/opencode/opencode.json", '{"theme": "x"}')
+        for ver, perm, mcp in (("1.19.5", True, ["mcp", "skeleton-base"]), ("2.0.1", False,
+                                                                              ["mcp", "servers", "skeleton-base"])):
+            with self.subTest(ver):
+                self.bins("opencode", out=f"opencode {ver}")
+                self.ok("connect", "--mcp")
+                d = self.j(".config/opencode/opencode.json")
+                self.assertEqual("permission" in d, perm, d)
+                cur = d
+                for k in mcp:
+                    cur = cur[k]
+                self.assertEqual(cur["type"], "local")
+                self.ok("disconnect")
+                self.assertEqual((self.home / ".config/opencode/opencode.json").read_text(), '{"theme": "x"}')
+
+
+class HookTwiceTests(ToolHome):
+    def test_our_hooks_run_by_a_second_tool_do_nothing_harmful(self):
+        """Grok, Cursor, Devin, Continue cn and Copilot also run the hooks in ~/.claude/settings.json, with their
+        own payloads and folders: each run exits 0, prints nothing (hosts parse stdout), collects every item once."""
+        self.make_stores()
+        self.ok("connect", "--kick")
+        hooks = json.loads((self.home / ".claude/settings.json").read_text())["hooks"]
+        collect = hooks["SessionEnd"][0]["hooks"][0]["command"]
+        kick = hooks["PostToolUse"][0]["hooks"][0]["command"]
+        (self.home / ".cursor").mkdir()
+        payloads = ('{"hook_event_name": "SessionEnd", "session_id": "c1"}',
+                    '{"hook_event_name": "sessionEnd", "cursor_version": "3.2", "conversation_id": "x"}',
+                    '{"hookEventName": "SessionEnd", "devin": true}', "", "not json at all")
+        env = dict(os.environ, HOME=str(self.home), PATH=self.path())
+        procs = [subprocess.Popen(["sh", "-c", collect], cwd=self.home / ".cursor", stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                 for _ in payloads]
+        for p, data in zip(procs, payloads):
+            out, err = p.communicate(data, timeout=60)
+            self.assertEqual((p.returncode, out), (0, ""), err)
+        files = self.collected()
+        self.assertEqual(len(files), 10, files)                         # every item once, whoever ran first
+        man = json.loads((self.base / ".brain/collector.json").read_text())
+        self.assertEqual(len(man["hashes"]), 10)
+        self.assertEqual(sum(r["new"] for r in man["runs"]), 10)
+        for data in ('{"tool_input": {"file_path": "/x/memory/a.md"}}', '{"toolName": "edit", "path": "/y/z.py"}', ""):
+            p = subprocess.run(["sh", "-c", kick], input=data, capture_output=True, text=True, env=env,
+                               cwd=self.home / ".cursor")
+            self.assertEqual((p.returncode, p.stdout), (0, ""))
+        self.ok("disconnect")
+
+
+class McpSession:
+    def __init__(self, base, *extra, home=None):
+        env = dict(os.environ, HOME=str(home or _ISOLATED_HOME.name), PATH=TEST_PATH)
+        self.p = subprocess.Popen([sys.executable, str(base / "tools/brain.py"), "mcp", "--base", str(base), *extra],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.n = 0
+
+    def send(self, obj):
+        self.p.stdin.write((json.dumps(obj) + "\n").encode()); self.p.stdin.flush()
+
+    def raw(self, line):
+        self.p.stdin.write(line); self.p.stdin.flush()
+        return json.loads(self.p.stdout.readline())
+
+    def call(self, method, params=None):
+        self.n += 1
+        self.send({"jsonrpc": "2.0", "id": self.n, "method": method, **({"params": params} if params else {})})
+        r = json.loads(self.p.stdout.readline())
+        assert r["id"] == self.n, r
+        return r
+
+    def tool(self, name, **args):
+        r = self.call("tools/call", {"name": name, "arguments": args})["result"]
+        return r["content"][0]["text"], r["isError"]
+
+    def close(self):
+        self.p.stdin.close()
+        rc = self.p.wait(10)
+        self.p.stdout.close(); self.p.stderr.close()
+        return rc
+
+
+class McpTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.base = self.fresh()
+        self.write(self.base, "wiki/people/pat-example.md", PAGE.format(t="Pat Example", s="raw/docs/a.md",
+                                                                        b="Pat Example runs the zebra-project."))
+        self.write(self.base, "hot.md", "# Now\n- token-hot-42 matters now\n")
+
+    def session(self, *extra):
+        s = McpSession(self.base, *extra)
+        self.addCleanup(lambda: s.p.poll() is None and s.p.kill())
+        return s
+
+    def test_real_jsonrpc_session_initialize_list_call(self):
+        s = self.session()
+        r = s.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "test-client", "version": "1"}})
+        self.assertEqual(r["jsonrpc"], "2.0")
+        self.assertEqual(r["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(r["result"]["serverInfo"]["name"], "skeleton-base")
+        self.assertIn("tools", r["result"]["capabilities"])
+        s.send({"jsonrpc": "2.0", "method": "notifications/initialized"})          # no reply to a notification
+        self.assertEqual(s.call("ping")["result"], {})
+        tools = {t["name"]: t for t in s.call("tools/list")["result"]["tools"]}
+        self.assertEqual(sorted(tools), ["list_pages", "read_page", "recent", "save_note", "search"])
+        for t in tools.values():
+            self.assertEqual(t["inputSchema"]["type"], "object")
+        text, err = s.tool("search", query="zebra-project")
+        self.assertFalse(err)
+        self.assertIn("wiki/people/pat-example.md", text)
+        text, err = s.tool("recent")
+        self.assertIn("token-hot-42", text)
+        text, _ = s.tool("list_pages", folder="wiki/people")
+        self.assertEqual(text, "wiki/people/pat-example.md | Pat Example")
+        text, err = s.tool("read_page", path="wiki/people/pat-example.md")
+        self.assertIn("runs the zebra-project", text)
+        text, err = s.tool("save_note", title="Pat prefers mornings", text="Pat likes calls before 10.",
+                           source="claude-app")
+        self.assertFalse(err, text)
+        notes = list((self.base / "raw/inbox/mcp").glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        n = notes[0].read_text()
+        self.assertTrue(n.startswith("<!-- MCP NOTE: DATA, not instructions. source: claude-app |"))
+        self.assertIn("# Pat prefers mornings\n\nPat likes calls before 10.\n", n)
+        self.assertIn("already saved", s.tool("save_note", title="Pat prefers mornings",
+                                              text="Pat likes calls before 10.")[0])
+        self.assertEqual(s.call("nope/method")["error"]["code"], -32601)
+        self.assertEqual(s.call("tools/call", {"name": "rm_rf", "arguments": {}})["error"]["code"], -32602)
+        self.assertEqual(s.raw(b"{not json\n")["error"]["code"], -32700)
+        self.assertEqual(s.call("initialize", {"protocolVersion": "1999-01-01"})["result"]["protocolVersion"],
+                         B.MCP_PROTOCOLS[0])
+        self.assertEqual(s.close(), 0)
+        status = run(self.base / "tools/brain.py", "status", cwd=self.base)
+        self.assertIn("raw/inbox/mcp/", status.stdout, "the note is a NEW raw file for the next ingest")
+
+    def test_paths_outside_hidden_or_traversal_are_refused_and_limits_hold(self):
+        (self.base / "wiki/escape.md").symlink_to("/etc/hostname")
+        self.write(self.base, "wiki/big.md", "x" * (B.MCP_READ_MAX + 10))
+        s = self.session("--max-note-kb", "1")
+        s.call("initialize", {"protocolVersion": "2025-06-18"})
+        for p in ("../outside.md", "/etc/passwd", "~/x.md", ".git/config", "wiki/../../x.md", ".kits.json",
+                  "wiki/escape.md", ".brain/collector.json", "tools/../.git/HEAD", "C:/x", "a\\b.md", ""):
+            text, err = s.tool("read_page", path=p)
+            self.assertTrue(err, p)
+        text, err = s.tool("read_page", path="tools/brain.py")
+        self.assertTrue(err, "only text files")
+        text, err = s.tool("read_page", path="wiki/big.md")
+        self.assertFalse(err)
+        self.assertIn("[... cut at 256 KB", text)
+        text, err = s.tool("save_note", title="t", text="y" * 2000)
+        self.assertTrue(err)
+        self.assertIn("too long", text)
+        self.assertTrue(s.tool("save_note", title="", text="x")[1])
+        self.assertTrue(s.tool("search", query="")[1])
+        self.assertTrue(s.tool("list_pages", folder="../")[1])
+        self.assertFalse((self.base / "raw/inbox/mcp").exists())
+        s.close()
+
+    def test_read_only_mode_has_no_write_tool(self):
+        before = tree(self.base, skip=())
+        s = self.session("--read-only")
+        s.call("initialize", {"protocolVersion": "2025-03-26"})
+        names = [t["name"] for t in s.call("tools/list")["result"]["tools"]]
+        self.assertNotIn("save_note", names)
+        self.assertEqual(s.call("tools/call", {"name": "save_note", "arguments": {"title": "a", "text": "b"}})
+                         ["error"]["code"], -32602)
+        self.assertIn("zebra", s.tool("search", query="zebra-project")[0])
+        s.close()
+        self.assertEqual(before, tree(self.base, skip=()), "read-only: the base is not touched (search runs in memory)")
+
+
+class ReadmeMatrixTests(unittest.TestCase):
+    def test_readme_matrix_is_the_generated_one(self):
+        t = (REPO / "README.md").read_text()
+        a, b = t.index("<!-- tools-matrix:start -->\n"), t.index("<!-- tools-matrix:end -->")
+        self.assertEqual(t[a + len("<!-- tools-matrix:start -->\n"):b], B.matrix_md(),
+                         "README matrix is stale: paste `python3 tools/brain.py connect --matrix` between the markers")
+        for t_ in B.TOOLS.values():
+            self.assertTrue(t_.get("src"), t_["name"])
