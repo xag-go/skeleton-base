@@ -3189,6 +3189,42 @@ class FileTests(FileBase):
         self.assertIn("39 tests", self.page("projects/project-alpha.md"), "the page text stays as it was")
         self.lint_ok()
 
+    def test_negation_in_other_clause_is_no_conflict(self):
+        # the real false case: a long memory whose negation sits in a clause the page sentence does not cover
+        page_sent = "#12 (2026-11-03) Wants the server as the primary machine and the Mac only as a window onto it;"
+        item = ("Wants the server as the primary machine and the Mac only as a window onto it; uses everything "
+                "through GUIs (desktop app, web app), not the terminal.")
+        sent = (page_sent, B.fnorm(page_sent).split())
+        self.assertIsNone(B.clash(B.fnorm(item).split(), sent, item), "negation only in the other clause")
+        # the same memory, filed end to end: no conflict flag on the item
+        self.write(self.base / "wiki", "me/work-setup.md", PAGE.format(
+            t="Work setup", s="notes", b="- " + page_sent + "\n\nSee [[goals]]."))
+        self.ok("index")
+        x = collected_item(self.base, "claude-code", "proj/work.md", item + "\n")
+        rep = B.file_items(self.base, quiet=True)
+        d = next(d for d in rep["decisions"] if d["raw"] == x)
+        self.assertFalse([f for f in d.get("flags", []) if "conflict" in f], d)
+        self.assertEqual(rep["conflicts"], 0, rep["decisions"])
+        # (no lint_ok here: the unsorted page is not indexed until the next `index`, which is not what is tested)
+
+    def test_negation_tail_truncated_page_sentence_no_conflict(self):
+        # the page holds a truncated prefix of the item's clause: a negation that only the item's tail has is no flip
+        page_sent = "Uses everything through GUIs (desktop app, web app)"
+        item = "Uses everything through GUIs (desktop app, web app), not the terminal."
+        sent = (page_sent, B.fnorm(page_sent).split())
+        self.assertIsNone(B.clash(B.fnorm(item).split(), sent, item))
+
+    def test_true_negation_and_version_conflicts_still_flagged(self):
+        page = "The release gate is enabled for every project in the workspace."
+        flip = "The release gate is not enabled for every project in the workspace."
+        sent = (page, B.fnorm(page).split())
+        self.assertEqual(B.clash(B.fnorm(flip).split(), sent, flip), "negation")
+        self.assertEqual(B.clash(B.fnorm(page).split(), (flip, B.fnorm(flip).split()), page), "negation",
+                         "the page holds the negation, the item does not")
+        v1 = "The brain tool version 1.5.1 is the one every machine runs."
+        v2 = "The brain tool version 2.0.0 is the one every machine runs."
+        self.assertEqual(B.clash(B.fnorm(v2).split(), (v1, B.fnorm(v1).split()), v2), "changed value")
+
     def test_secrets_redacted_and_injection_inert(self):
         key = "sk" + "-ant-api03-" + "Z" * 30          # built from pieces: check-public scans this file
         collected_item(self.base, "hermes-facts", "~/.hermes/memory_store.db#facts/8", fact(

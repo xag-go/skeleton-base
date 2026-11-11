@@ -87,6 +87,7 @@ Instant and zero-touch
                                suggest memory-like stores not watched yet; run the pipeline once
 """
 import datetime as dt
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -102,7 +103,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.5.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.5.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -2282,15 +2283,38 @@ def similar_on(idx, words):
     return best, bc, sent, sc
 
 
-def clash(words, sent):
-    """Why an item that looks like a page sentence still differs: a changed number or a negation flip."""
+CLAUSE_SPLIT = re.compile(r"(?:[.;:!?\u2014]+(?=\s|$)|\n+)")
+
+
+def clash(words, sent, text=None):
+    """Why an item that looks like a page sentence still differs: a changed number or a negation flip.
+
+    Only the part that lines up with the page sentence is compared: the clause of `text` (split on . ; : ! ?
+    dash and newlines) that overlaps the page sentence most, and inside it the words from the first to the last
+    aligned word. A negation or number that sits only in the item's extra tail is no conflict."""
     if not sent:
         return None
     s_text, sw = sent
-    a, b = digits_of(words), digits_of(sw)
+    cw = words
+    if text:
+        best = None
+        for c in CLAUSE_SPLIT.split(text):
+            c_w = fnorm(c).split()
+            if not c_w:
+                continue
+            score = (len(shingles(c_w) & shingles(sw)), len(set(c_w) & set(sw)))
+            if best is None or score > best[0]:
+                best = (score, c_w)
+        if best and best[0] != (0, 0):
+            cw = best[1]
+    blocks = [m for m in difflib.SequenceMatcher(None, cw, sw, autojunk=False).get_matching_blocks() if m.size]
+    if blocks:
+        cw = cw[blocks[0].a:blocks[-1].a + blocks[-1].size]
+        sw = sw[blocks[0].b:blocks[-1].b + blocks[-1].size]
+    a, b = digits_of(cw), digits_of(sw)
     if a - b and b - a:
         return "changed value"
-    na, nb = bool(NEGATION.search(" ".join(words))), bool(NEGATION.search(" ".join(sw)))
+    na, nb = bool(NEGATION.search(" ".join(cw))), bool(NEGATION.search(" ".join(sw)))
     if na != nb:
         return "negation"
     return None
@@ -2444,7 +2468,7 @@ def _file_items(base, dry_run, variant, quiet, items):
                     prev = None
                     page, why = route_entry(idx, e, variant)
                 sim, sc, sent, ssc = similar_on(idx, words)
-                cl = clash(words, sent) if ssc >= 0.6 else None
+                cl = clash(words, sent, et) if ssc >= 0.6 else None
                 if not prev and sc >= 0.8 and not cl and not INJECTION.search(et):
                     d.update(action="noop", why=f"already on {sim} ({sc:.2f})", page=sim)
                 else:

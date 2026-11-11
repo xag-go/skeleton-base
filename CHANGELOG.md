@@ -2,6 +2,16 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.5.2 - 2026-11-12
+`brain.py file` no longer flags a false negation conflict:
+- A negation (or changed number) is compared only between the page sentence and the part of the new memory that lines
+  up with it: the clause of the memory (split on . ; : ! ? dash and newlines) with the most overlap, and inside it the
+  words from the first to the last aligned word. A "not" in another clause of a long memory is no conflict.
+- A page sentence that is a truncated prefix of the memory's clause: a negation only in the memory's tail is no conflict.
+- Real flips still flagged (`X is enabled` vs `X is not enabled`; a changed number that appears on both sides).
+- Known gap, unchanged from 1.5.1: a changed version where the old and new numbers share digits (`1.5.1` -> `1.5.2`) is
+  not flagged; `1.5.1` -> `2.0.0` is. Tests: 3 new in FileTests.
+
 ## v1.5.1 - 2026-11-12
 Every tool now knows which role it plays, and a name is never borrowed from the user's own notes:
 - Who am I (one rule, in the pointer block `connect` writes for all 26 tools, `connect --print`, and the base's
