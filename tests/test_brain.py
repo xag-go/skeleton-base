@@ -327,6 +327,17 @@ class InitTests(Base):
         self.assertIn("Frugal-Bridge: skipped", r.stdout)
 
 
+class AgentsRulesTests(Base):
+    def test_agents_md_has_saving_knowledge_section(self):
+        a = (REPO / "AGENTS.md").read_text()
+        self.assertIn("\n## Saving knowledge\n", a)
+        for s in ("wiki/clients/", "templates/client.md", "wiki/decisions/", "wiki/people/", "wiki/projects/",
+                  "hot.md", "python3 tools/brain.py index", "progress/agents.log", "Never only in your own memory"):
+            self.assertIn(s, a)
+        self.assertLess(a.index("## Saving knowledge"), a.index("<!-- base-folder:end -->"))
+        self.assertEqual(len((REPO / "AGENTS.md").read_bytes()) < 24 * 1024, True)
+
+
 class ToolTests(Base):
     def test_search_finds_hyphenated_terms(self):
         d = self.fresh()
