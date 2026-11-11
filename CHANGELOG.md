@@ -2,6 +2,45 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.5.0 - 2026-11-12
+Memories from any tool reach the wiki at once, with no model, and a rare model pass keeps the pages clean:
+- `brain.py file [--dry-run]` (also run by `collect` and by the watcher, right after collecting): each new collected
+  item, or each memory of a list file (Hermes `§` sections, GEMINI.md bullets), is filed by code as one cited line
+  under `## Collected` at the end of ONE existing page (source, date, origin id, link to the raw copy). Routing:
+  same origin as an earlier item -> same page (old line struck through and kept); a link to a page; page names,
+  titles and `aliases:` in the item's tags/name/description/title/first sentence, weighted by rarity, with a 2x
+  margin; bm25 (names weighted) only breaks a tie between named pages. Not sure, or instruction-like text ->
+  `wiki/unsorted.md`. Never creates pages, never rewrites prose. Same text -> skipped; text a page already holds
+  -> skipped; a changed number or a negation against a page sentence -> filed and listed under `## Conflicts`.
+  Secrets redacted, `[[`/`<!--`/`TODO` neutralised; the raw item is recorded as done (`status` stops listing
+  it); `index` + `map` after; the wiki lock and atomic writes. Ledger: `.brain/filed.json`.
+- `brain.py tidy [--harness NAME] [--model M] [--tier cheap|mid] [--dry-run] [--force] [--check] [--save]
+  [--harnesses]`: the rare LLM pass. A free trigger check first (10 lines waiting, 5 on a page, a line older than
+  7 days, a conflict older than 2 days, an unsorted line older than 3 days; never with nothing pending; once per
+  24 h unless `--force`). It runs ONE agent CLI the user has (`--harness`, a saved choice, else the first installed
+  of claude, codex, gemini, qwen, hermes; UNVERIFIED rows only when chosen), headless in the base, writes scoped to
+  the base, stdin closed, timeout, nesting markers scrubbed, one page per call (unsorted lines in batches of 8).
+  After each call code checks: only `wiki/` changed (only that page for a page job), frontmatter kept, no new lint
+  problem, no secret, every removed line already said or now on a page. A failed check puts the page back and
+  retries once on the mid model; a page failing on both is skipped until its lines change (NEEDS YOU in
+  `--check`). Mid model by default; conflicts and `wiki/unsorted.md` always mid. Logged in `.brain/tidy.log`
+  (tokens and cost when the tool reports them) and `progress/agents.log`; merged pages are committed in a git base.
+  The table of headless commands (`HEADLESS`) sits next to `TOOLS`; README table generated (`tidy --harnesses`).
+- `connect --timer` (and `--watch`) also writes `skeleton-base-tidy.service` + `.timer` (check every 6 h);
+  `disconnect` removes them. The watcher starts the tidy service when a tidy is due (at most once an hour).
+- `lint` warns when a page has more than 15 filed lines waiting, or `wiki/unsorted.md` has a conflict older than
+  7 days. `search` (and the MCP `search` tool) rank a hit in a page's name, title or aliases above body hits.
+- Lab on a real base (61 hand-labelled memories, incl. Darija aliases, hub pages, duplicates, edits, a
+  contradiction, an injection line and a fake key): 40 right page, 0 wrong page, 13 to unsorted, 8 correctly
+  skipped. Blind judge (Opus, X/Y in random order) on the same 49 items: `file` + `tidy` (mid) 36-39 / 50 against
+  25-31 for one LLM ingest of everything; cheap model 33-35, so mid is the default. Real `tidy` runs: Claude Code
+  and Hermes pass; Codex and Gemini CLI not run (usage limit, daily quota).
+- Tests: 22 new (150): routing cases, dedupe/update/conflict, redaction, injection stays inert, list splitting,
+  collect files at once, dry run, lint warnings, search ranking, tidy triggers, harness pick/override/saved/
+  UNVERIFIED, merge + log + commit + rate limit, put back + mid retry, every failure kind byte-identical, stuck
+  pages skipped, unsorted batches, mid for conflicts, env scrub, no yolo flags, watch starts the tidy service and
+  connect/disconnect leave the home as it was.
+
 ## v1.4.1 - 2026-11-11
 Fixes found by real runs of real tools (Claude Code, Hermes, Qwen Code, each in a fresh temporary home):
 - The pointer block's save step: run the `brain.py index` command on its own (the exact form tools allow) and add

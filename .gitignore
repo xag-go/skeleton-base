@@ -15,6 +15,10 @@ secrets/
 .brain/map.json
 .brain/*.tmp
 .brain/pycache/
+.brain/wiki.lock
+.brain/tidy.json
+.brain/tidy.log
+.brain/.*.tmp*
 .base-folder/
 __pycache__/
 *.pyc

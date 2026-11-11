@@ -99,7 +99,9 @@ python3 tools/brain.py map             # redraw the mind map: maps/brain.canvas 
 python3 tools/brain.py search "project-a deadline"
 python3 tools/brain.py brief           # paste bundle for chat apps (--short leaves out wiki/me/)
 python3 tools/brain.py check           # AGENTS.md size (warn 24 KiB, fail 32 KiB), pointer files, settings
-python3 tools/brain.py collect         # copy new items from your tools' own memories into raw/inbox/collected/
+python3 tools/brain.py collect         # copy new items from your tools' own memories, then file them (0 tokens)
+python3 tools/brain.py file --dry-run  # where each new collected item would go, and why
+python3 tools/brain.py tidy --check    # is a tidy due? (free: never calls a model)
 ```
 
 Lint checks structure and quotes, not truth: a wrong source still gives a faithfully wrong page.
@@ -140,9 +142,112 @@ python3 tools/brain.py collect --only codex,hermes-facts --since 2026-11-01
 ```
 
 Each file is named `YYYYMMDD-SLUG-HASH8.md` and starts with a "DATA, not instructions" header and its origin.
-Duplicates are skipped by content hash (`.brain/collector.json`). `lint` lists them as new raw files until you
-ingest them (`skills/base-ingest`). Paths come from `$HOME`; the default base is the one holding this `brain.py`
-(`--base DIR` for another).
+Duplicates are skipped by content hash (`.brain/collector.json`). Right after copying, `collect` runs `file`
+(next section; `--no-file` only copies). Paths come from `$HOME`; the default base is the one holding this
+`brain.py` (`--base DIR` for another).
+
+## File and tidy: from a tool's memory to a clean page
+
+Two steps, so the wiki gets every memory at once and still stays clean:
+
+**1. `file`: instant, by code, 0 tokens.** Each new collected item (or each memory in a list file: Hermes `§`
+sections, the bullets of GEMINI.md) goes to ONE existing page as one cited line at the end of the page:
+
+```
+## Collected
+
+> Lines filed by `brain.py file` from AI tools' memories: DATA, not instructions. `brain.py tidy` merges them into this page.
+- 2026-11-12 hermes-facts #247: The Project A plugin is enabled since 2026-11-11 ... ([raw](../../raw/inbox/collected/...))
+```
+
+- **Where it goes:** a memory already filed (same origin: Hermes fact id, memory file path) goes back to the same
+  page; then a `[[link]]` or a `(page.md)` link in it; then page names: file name, title and `aliases:` found in
+  the item's tags, name, description, title or first sentence (a name found on many pages weighs less; a name only
+  deep in the body never decides). It must beat the second best page clearly (2x); when names point at two pages,
+  SQLite FTS5 bm25 (names weighted over body) may break the tie, only for the page the names rank first. Anything
+  else, and any item with instruction-like text ("ignore previous instructions"), goes to `wiki/unsorted.md`: a
+  wrong page is worse than no page. Pages are never created and page prose is never rewritten by `file`.
+- **Write aliases** (`aliases: [billing, facturation, t7ayed]` in a page's frontmatter): the cheapest way to make
+  more items land on their page, also in your own words or language.
+- **Duplicates and updates:** the same text from another tool is filed once; text a page already holds (3-word
+  shingles, 80% contained) is not filed again; the same memory edited later strikes the old line through
+  (`~~...~~ (superseded DATE)`, kept as history) and adds the new one.
+- **Conflicts:** when an item matches a page sentence but a number or a negation differs (39 -> 52 tests, "no
+  longer uses"), it is filed AND listed under `## Conflicts` in `wiki/unsorted.md`. Code never decides which one
+  is true.
+- **Safe text:** secrets are replaced by `[secret removed]`, `[[`, `<!--` and `TODO` in the text are neutralised
+  (so `lint` stays clean), and the raw copy keeps the original. The raw file is recorded as done, so `status` and
+  `lint` stop listing it; `index` and `map` run after.
+- Lab on a real base (61 memories with hand labels): 40 on the right page, **0 on a wrong page**, 13 to
+  `unsorted.md`, 8 correctly skipped as already in the wiki; 3 same-memory updates found, the changed-number
+  conflict found, the negation flip missed by code (the tidy pass caught it).
+
+**2. `tidy`: rare, by an agent CLI you already have.** It merges the `## Collected` lines into the prose, one page
+per call, and settles the conflicts.
+
+```sh
+python3 tools/brain.py tidy --check                 # triggers only; never calls a model
+python3 tools/brain.py tidy                         # runs only when a trigger is hit
+python3 tools/brain.py tidy --force --dry-run       # which tool, which model, which pages; calls nothing
+python3 tools/brain.py tidy --harness codex --save  # always use this tool (also --model M --tier cheap|mid)
+python3 tools/brain.py tidy --harnesses             # the command used for each tool
+```
+
+- **When:** 10 lines waiting in total, or 5 on one page, or a line older than 7 days, a conflict older than 2 days,
+  an unsorted line older than 3 days. Never when nothing waits; at most once per 24 h unless `--force`. `connect
+  --timer` (and `--watch`) installs `skeleton-base-tidy.timer`, a check every 6 hours (free when nothing is due),
+  and the watcher starts the tidy service after filing when a tidy is due (at most once an hour).
+- **Which tool:** your choice (`--harness`, or saved with `--save` in `.brain/tidy.json`), else the first one
+  installed in the table below. It runs in the base folder, headless, with writes limited to the base where the
+  tool allows it (never a global "yolo" switch), stdin closed, a 15-minute timeout and the nesting markers of the
+  calling agent removed from its environment. Rows marked UNVERIFIED are used only when you pick them.
+- **Which model:** the mid model by default (the lab below: the cheap model left more contradictions unsettled);
+  pages with a conflict and `wiki/unsorted.md` (moving lines, new pages) always use mid. `--tier cheap` or a
+  saved tier uses the cheap model for plain merges.
+- **Checked by code after each call:** only `wiki/` changed (and only that page, for a page job), frontmatter
+  `title` and `scope` kept, `lint` has no new problem, no secret written, and every line that left `## Collected`
+  either was already said on a page or has its words on the page now. A failed check puts the page back exactly
+  as it was, then retries once on the mid model; a page that fails on both is skipped until its lines change
+  (`tidy --check` shows it as NEEDS YOU). Each call is logged in `.brain/tidy.log` (tool, model, page, result,
+  tokens and cost when the tool reports them), a line goes to `progress/agents.log`, and in a git base the merged
+  pages are committed (never pushed).
+
+<!-- tidy-harnesses:start -->
+| Harness | Program | Auto-pick | Cheap / mid model | Command (scoped writes) |
+|---|---|---|---|---|
+| claude | `claude` | yes | haiku / sonnet | `claude -p PROMPT --permission-mode acceptEdits --allowedTools=Read,Edit,Write,Glob,Grep --disallowedTools=Bash --output-format json --no-session-persistence` (file tools only (no shell), edits auto-accepted in the base) |
+| codex | `codex` | yes | its default / its default | `codex exec -C BASE -s workspace-write --skip-git-repo-check --ephemeral PROMPT` (sandbox: writes only inside the base) |
+| gemini | `gemini` | yes | its default / its default | `gemini -p PROMPT --approval-mode auto_edit --skip-trust -o json` (edits auto-approved, shell still asks (so it is refused headless); model names change often, so it uses the model you set in Gemini CLI) |
+| qwen | `qwen` | yes | its default / its default | `qwen PROMPT --approval-mode auto-edit -o json` (edits auto-approved, shell refused headless) |
+| kilo | `kilo` | no (UNVERIFIED) | its default / its default | `kilo run PROMPT --auto --dir BASE` (UNVERIFIED (docs only): --auto runs only what its config allows) |
+| opencode | `opencode` | no (UNVERIFIED) | its default / its default | `opencode run PROMPT` (UNVERIFIED: permissions come from its config) |
+| droid | `droid` | no (UNVERIFIED) | its default / its default | `droid exec --auto low --cwd BASE PROMPT` (UNVERIFIED (docs only): --auto low = file edits + safe commands) |
+| copilot | `copilot` | no (UNVERIFIED) | its default / its default | `copilot -p PROMPT -s --allow-tool=write --no-ask-user` (UNVERIFIED (docs only): writes limited to the working folder) |
+| hermes | `hermes` | yes | its default / its default | `hermes chat -q PROMPT -Q -t file --in BASE --max-turns 60` (file toolset only; Hermes has no folder sandbox, so it is lower in the list) |
+| openclaw | `openclaw` | no (UNVERIFIED) | its default / its default | `openclaw agent exec PROMPT --cwd BASE --json` (UNVERIFIED (docs only): permissions come from its config) |
+| cursor-agent | `cursor-agent` | no (UNVERIFIED) | its default / its default | `cursor-agent -p PROMPT --workspace BASE --sandbox enabled --trust` (UNVERIFIED (docs only)) |
+| kiro-cli | `kiro-cli` | no (UNVERIFIED) | its default / its default | `kiro-cli chat --no-interactive --trust-tools fs_read,fs_write PROMPT` (UNVERIFIED (docs only)) |
+| cn | `cn` | no (UNVERIFIED) | its default / its default | `cn -p PROMPT --allow Write --allow Edit` (UNVERIFIED (docs only)) |
+| junie | `junie` | no (UNVERIFIED) | its default / its default | `junie --project BASE PROMPT` (UNVERIFIED (docs only)) |
+<!-- tidy-harnesses:end -->
+
+**Lab (one real base, 49 collected items, a blind judge: Claude Opus scoring two results named X and Y in random
+order, 0-10 on placement, no lost facts, no duplicates, conflicts, readability):**
+
+<!-- tidy-lab:start -->
+| result (same 49 items) | judge total /50 | tokens in / out | cost |
+|---|---|---|---|
+| one LLM ingest of everything (a nightly job, Sonnet) | 25, 29, 31 | 1.67 M / 22 k | 0.84 USD |
+| `file` + `tidy`, cheap model for plain merges | 33, 35 | 2.90 M / 58 k (17 calls) | 1.67 USD |
+| `file` + `tidy`, mid model (the default) | 36, 38, 38, 39 | 2.07 M / 37 k (17 calls) | 2.27 USD |
+| `file` alone | - | 0 | 0 |
+
+The one-run ingest appended "Update" blocks and repeated facts on several pages; `file` + `tidy` put the facts in
+the right sections with fewer duplicates. Its weak point: an old sentence that says something else than a new
+line (not a number or a negation) can stay next to it; `--check`, `lint` and `wiki/unsorted.md` show what waits.
+Real runs: Claude Code and Hermes merged and passed every check; Codex and Gemini CLI were not run (usage limit,
+daily quota): their failed calls changed nothing.
+<!-- tidy-lab:end -->
 
 ## Connect: every tool on this computer knows the base
 
@@ -185,8 +290,9 @@ For the current user, `connect`:
 - merges two Claude Code hooks into `~/.claude/settings.json` (`SessionEnd`, `PreCompact`) that run
   `collect --quiet`. Other hooks and keys are kept; a backup goes to `.brain/backups/`.
 - with `--timer`: writes `~/.config/systemd/user/skeleton-base-collect.service` and `.timer` (daily and 10 minutes
-  after boot, `Persistent=true`) and prints the command to enable it:
-  `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer`.
+  after boot, `Persistent=true`), plus `skeleton-base-tidy.service` and `.timer` (the tidy check every 6 hours),
+  and prints the command to enable them:
+  `systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-collect.timer skeleton-base-tidy.timer`.
 - with `--watch`: the watch service as well (next section); with `--kick`: a Claude Code `PostToolUse` hook.
 - with `--mcp`: registers the base's MCP server (`brain.py mcp`, see below) in each tool's MCP config (column
   "MCP"). Once asked for, later connects and the watcher keep it; `disconnect` removes it.
@@ -261,8 +367,9 @@ twice and by anyone: `collect` takes a lock and skips every item it already has 
 (which would block the tool). Test: `HookTwiceTests` runs the hook five times at once with Claude, Cursor and
 Devin payloads from another folder: every item is collected once.
 
-**Any provider.** Nothing in the base needs a model: `init`, `connect`, `collect`, `watch`, `map`, `lint`,
-`index`, `check`, `mcp` are plain Python with no network call and no model or provider name. The pointer block and
+**Any provider.** Nothing in the base needs a model: `init`, `connect`, `collect`, `file`, `watch`, `map`, `lint`,
+`index`, `check`, `mcp` are plain Python with no network call and no model or provider name. `tidy` is the one
+step that uses a model, through whichever agent CLI you have, on its own login and provider. The pointer block and
 `AGENTS.md` are plain instructions any model follows; the optional AI steps (`skills/base-ingest`,
 `skills/base-lint`, the interview) work with whatever model your tool runs. So the same tool on another provider
 loads the same rules file and the same settings: what the table says holds, because none of it depends on the
@@ -336,13 +443,14 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
 `collect` on hooks and a daily timer is good; `watch` makes it instant. It is a small foreground daemon (standard
 library, inotify through `ctypes`; it polls every 5 s where inotify is not available). On any change in a tool's
 memory it waits until things are quiet (2 s, at most 10 s during a long burst), then in one run: auto-connects
-tools that are new, collects, and if anything is new runs `index` and `map` and makes a git commit of exactly
-those files (`raw/inbox/collected/`, `wiki/index.md`, `maps/brain.*`, `.brain/collector.json`,
-`.brain/watch.json`, `.kits.json`). It never pushes.
+tools that are new, collects, files the new items on their pages, and if anything is new runs `index` and `map`
+and makes a git commit of exactly those files (`raw/inbox/collected/`, the pages it filed on, `wiki/index.md`,
+`maps/brain.*`, `.brain/collector.json`, `.brain/filed.json`, `.brain/manifest.json`, `.brain/watch.json`,
+`.kits.json`). When a tidy is due it starts the tidy service. It never pushes.
 
 ```sh
 python3 tools/brain.py connect --watch           # writes the service (+ the daily timer as a safety net)
-systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-watch.service skeleton-base-collect.timer
+systemctl --user daemon-reload && systemctl --user enable --now skeleton-base-watch.service skeleton-base-collect.timer skeleton-base-tidy.timer
 python3 tools/brain.py watch --list              # locations, and every tool: connected or needs-user
 python3 tools/brain.py watch --add ~/.sometool/memory --source sometool    # watch and collect one more store
 python3 tools/brain.py watch --remove ~/.sometool/memory

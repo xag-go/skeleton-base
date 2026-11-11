@@ -18,3 +18,8 @@ Works with any model and any provider: only file reads, file writes and `tools/b
 7. Append one line to `wiki/log.md` and to `progress/agents.log`.
 8. Run `python3 tools/brain.py lint` and fix every problem before you finish.
 9. Never edit or move files inside `raw/`.
+
+Tool memories in `raw/inbox/collected/` need none of this: `brain.py file` (run by `collect` and the watcher)
+already filed each one as a cited line under `## Collected` on its page or in `wiki/unsorted.md`. To merge such
+lines into a page by hand: write the fact into the prose, add the line's `raw/...` path to `sources:`, delete the
+line, then `lint`. `brain.py tidy` does the same with an agent CLI and checks the result.
