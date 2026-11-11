@@ -73,6 +73,16 @@ class Base(unittest.TestCase):
 PAGE = "---\ntitle: {t}\nsources: [{s}]\nupdated: 2026-11-11\nscope: private\n---\n\n# {t}\n\n{b}\n"
 
 
+class ReinstallRespectsDeletes(Base):
+    def test_deleted_example_not_recreated_but_required_is(self):
+        d = self.fresh()
+        ex = sorted((d / "board").glob("2026-*.md"))[0]
+        ex.unlink(); (d / "hot.md").unlink()
+        self.init(d)
+        self.assertFalse(ex.exists(), "deleted example card came back")
+        self.assertTrue((d / "hot.md").exists(), "required hot.md not recreated")
+
+
 class LintTests(Base):
     def lint(self, d):
         return self.brain(d, "lint")

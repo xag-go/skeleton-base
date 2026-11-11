@@ -50,6 +50,7 @@ FRUGAL_DEFAULT = {"user": "USER.md", "now": "PROGRESS.md", "decisions": "DECISIO
 # what init installs (plain files are copied only when missing)
 DIRS = ["wiki/projects", "wiki/clients", "wiki/people", "wiki/decisions", "wiki/concepts", "wiki/daily",
         "wiki/sops", "raw/inbox", "raw/docs", "raw/references", "raw/clients", "raw/videos", "raw/exports"]
+REQUIRED = {"hot.md", "wiki/index.md", "wiki/log.md", "tools/brain.py"}   # recreated if missing
 FILES = ["README.md", "SECURITY.md", "hot.md", "wiki/index.md", "wiki/log.md", "wiki/glossary.md",
          "wiki/me/who-i-am.md", "wiki/me/goals.md", "wiki/me/how-to-talk-to-me.md",
          "board/README.md", "board/board.base", "board/2026-01-01-fill-in-your-profile.md",
@@ -267,6 +268,8 @@ class Installer:
                 continue
             if dst.exists():
                 continue
+            if rel in prev.get("created", {}) and rel not in REQUIRED:
+                continue   # you deleted it after an earlier install: respect that
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             created[rel] = sha(dst.read_bytes())
