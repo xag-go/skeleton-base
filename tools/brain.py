@@ -267,6 +267,8 @@ class Installer:
                 self.log.append(f"updated {rel}")
                 continue
             if dst.exists():
+                if rel in created and dst.is_file() and dst.read_bytes() == src.read_bytes():
+                    created[rel] = sha(dst.read_bytes())   # already identical to the kit: keep it upgradable
                 continue
             if rel in prev.get("created", {}) and rel not in REQUIRED:
                 continue   # you deleted it after an earlier install: respect that
@@ -682,6 +684,7 @@ def lint(root):
             errs.append(f"{rel(p, root)}: 'updated' is not YYYY-MM-DD")
 
     for p, t in texts.items():
+        t_quotes = FENCE.sub("", t)   # quotes may contain inline code; only fenced examples are skipped
         t = prose(t)
         check_links(p, t)
         if p.name in SPECIAL and p.parent == root / "wiki":
@@ -693,7 +696,7 @@ def lint(root):
         for src in re.findall(r"raw/[^\s,\]\[]+", fm.get("sources", "")):
             if not (root / src).exists():
                 errs.append(f"{rel(p, root)}: source {src} does not exist")
-        for q, src in QUOTE.findall(t):
+        for q, src in QUOTE.findall(t_quotes):
             f = root / src
             if not f.is_file():
                 errs.append(f"{rel(p, root)}: quote cites missing {src}")

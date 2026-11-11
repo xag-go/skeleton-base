@@ -3,6 +3,8 @@
 Changes to the skeleton structure and tools (not to anyone's content).
 
 ## v1.0.1 - 2026-11-11
+- lint: quote lines may contain inline code and quotes (only fenced examples are skipped).
+- init: a file already identical to the kit stays upgradable.
 - init re-run no longer recreates files you deleted after an earlier install (except hot.md, wiki/index.md,
   wiki/log.md, tools/brain.py).
 - lint ignores fenced code blocks and inline code (examples in docs are not errors); TODO is caught only as a

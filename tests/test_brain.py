@@ -144,6 +144,15 @@ class LintTests(Base):
         self.planted(lambda d: self.linked(d, "wiki/concepts/t.md", PAGE.format(t="T", s="interview", b="TODO fix")),
                      "unresolved TODO")
 
+    def test_quote_with_inline_code_and_quotes_passes(self):
+        d = self.fresh()
+        line = 'Run `ssh box` then say "go" (see A) now.'
+        self.write(d, "raw/docs/note.md", line + "\n")
+        self.linked(d, "wiki/concepts/q.md", PAGE.format(t="Q", s="raw/docs/note.md",
+                    b=f'> "{line}" - raw/docs/note.md\n\nSee [[who-i-am]].'))
+        r = self.lint(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_todo_marker_forms(self):
         for body in ("- TODO call back", "TODO: fix this", "- [ ] TODO send"):
             self.planted(lambda d, b=body: self.linked(d, "wiki/concepts/t.md", PAGE.format(t="T", s="interview", b=b)),
