@@ -4220,6 +4220,85 @@ class EverythingInBaseTests(ToolHome):
                    "projects/app/main.py", "data/x.bin", "ops/ci.py", "backups/a.tgz"):
             self.assertFalse(synced(no), no)
 
+    def test_sync_all_shares_everything_but_secrets_and_heavy_files(self):
+        pats = [l for l in B.stignore_layout({B.SYNC_ALL: ["all"]}).splitlines() if l and not l.startswith("//")]
+        synced = lambda path: syncthing_allows(pats, path)
+        for ok in ("hot.md", "projects/app/main.py", "projects/app/README.md", "ops/ci.py", "runs/team/r1/out.log",
+                   "scratch/n.md", "engines/claude/skills/s/SKILL.md", "engines/w/team/agents.json",
+                   "engines/w/team/plugins/p/skills/s/SKILL.md", "engines/claude/CLAUDE.md"):
+            self.assertTrue(synced(ok), ok)
+        for no in ("engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/claude/settings.json",
+                   "engines/codex/config.toml", "engines/codex/auth.json", "engines/hermes/config.yaml",
+                   "engines/claude/projects/-k/s.jsonl", "engines/hermes/state.db", "engines/x/api_token",
+                   "projects/app/.env", "projects/app/.env.local", "projects/app/k.pem", "projects/app/a/token.json",
+                   "projects/app/node_modules/x/i.js", "projects/app/.git/config", "projects/app/.venv/bin/py",
+                   "data/x.bin", "backups/a.tgz", "apps/x", "runs/a.zst", "projects/app/db.sqlite3"):
+            self.assertFalse(synced(no), no)
+
+    def test_engine_sync_all_on_and_off_round_trip(self):
+        self.git(self.base, "init", "-q")
+        self.init(self.base)
+        self.write(self.base, ".stignore", "// mine\n")
+        self.init(self.base)
+        before = (self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()
+        self.ok_env("engine", "sync-all", "on", "--base", str(self.base))
+        st = (self.base / ".stignore").read_text()
+        self.assertNotIn("\n/engines\n", st)
+        self.assertIn("\n/data\n", st)
+        self.assertIn(".credentials*", st)
+        self.assertEqual(before[0], (self.base / ".gitignore").read_text())
+        self.ok_env("engine", "sync-all", "off", "--base", str(self.base))
+        self.assertEqual(before, ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
+
+    def test_engine_share_adds_a_safe_subfolder_and_secrets_stay_ignored(self):
+        self.git(self.base, "init", "-q")
+        self.init(self.base)
+        self.hb("layout", "--print")
+        self.write(self.base, "engines/w/CLAUDE.md", "x\n")
+        for f in ("engines/w/team/agents.json", "engines/w/team/plugins/p/skills/s/SKILL.md",
+                  "engines/w/team/config.toml", "engines/w/team/.env", "engines/w/team/auth.json",
+                  "engines/w/team/p/token.json", "engines/w/team/sessions/a.md", "engines/w/other/a.json"):
+            self.write(self.base, f, "{}\n")
+        before = (self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()
+        for bad in ("auth", "sessions/x", "my-token", "credentials", ".git", "a/../b", "*", ""):
+            r = self.hb("engine", "share", "w", bad, "--base", str(self.base))
+            self.assertNotEqual(r.returncode, 0, bad)
+        self.assertEqual(before, ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
+        self.ok_env("engine", "share", "w", "team", "--base", str(self.base))
+        self.assertEqual(json.loads((self.base / "engines.json").read_text())["engines"]["w"]["share"], ["team"])
+        gi, st = (self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()
+        ign = lambda p: subprocess.run(["git", "-C", str(self.base), "check-ignore", "-q", "--no-index", p]
+                                       ).returncode == 0
+        for ok in ("engines/w/team/agents.json", "engines/w/team/plugins/p/skills/s/SKILL.md",
+                   "engines/w/team/config.toml"):
+            self.assertFalse(ign(ok), ok)
+        for no in ("engines/w/team/.env", "engines/w/team/auth.json", "engines/w/team/p/token.json",
+                   "engines/w/team/sessions/a.md", "engines/w/other/a.json"):
+            self.assertTrue(ign(no), no)
+        lines = st.split("// base-folder:end")[0].splitlines()
+        pats = [l for l in lines if l and not l.startswith("//")]
+        synced = lambda path: syncthing_allows(pats, path)
+        self.assertTrue(synced("engines/w/team/agents.json"))
+        self.assertTrue(synced("engines/w/team/plugins/p/skills/s/SKILL.md"))
+        for no in ("engines/w/team/.env", "engines/w/team/auth.json", "engines/w/team/p/token.json",
+                   "engines/w/team/sessions/a.md", "engines/w/other/a.json"):
+            self.assertFalse(synced(no), no)
+        i = pats.index("!/engines/w/team")
+        self.assertLess(pats.index("/engines/**/.env"), i)
+        self.assertLess(i, pats.index("/engines"))
+        self.assertIn(B.stignore_layout({"w": ["team"]}), st)
+        self.ok_env("engine", "share", "w", "team", "--base", str(self.base))          # again: same bytes
+        self.assertEqual((gi, st), ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
+        self.init(self.base)                                                              # an update keeps it
+        self.assertEqual((gi, st), ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
+        self.git(self.base, "add", "-A")
+        self.assertIn("engines/w/team/agents.json", self.git(self.base, "ls-files"))
+        self.assertNotIn("team/.env", self.git(self.base, "ls-files"))
+        self.assertEqual(self.hb("guard").returncode, 0)
+        self.ok_env("engine", "share", "w", "team", "--remove", "--base", str(self.base))
+        self.assertEqual(before, ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
+        self.assertFalse((self.base / "engines.json").exists() and "share" in (self.base / "engines.json").read_text())
+
     def test_mirror_keeps_a_skill_named_like_a_token(self):
         g = self.home / ".gemini"
         self.write(g, "skills/x-token-spend/SKILL.md", "skill\n")

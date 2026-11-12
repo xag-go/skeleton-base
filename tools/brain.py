@@ -76,6 +76,10 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                XDG_CONFIG_HOME/XDG_DATA_HOME for opencode, Kilo, Goose)
 
 Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's git or Syncthing)
+  engine sync-all on|off       Syncthing shares the whole base except secrets, tool config files and heavy files
+                               (node_modules, .git, DBs, archives); data/, apps/, backups/ stay off; git unchanged
+  engine share NAME SUBDIR [--remove]  share one more safe sub-folder of engines/NAME (engines.json "share"); the
+                               secret rules still win inside it; sessions, auth, tokens, .git are refused
   engine adopt TOOL [--force]  move a tool's config dir into engines/<tool>/ and point the tool's own setting
                                there (marked blocks in ~/.config/environment.d, ~/.profile, ~/.bashrc);
                                refuses while a program uses the dir; engines.json records it
@@ -130,7 +134,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.6.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -449,6 +453,8 @@ class Installer:
         # .gitignore block
         existed = self.p(".gitignore").exists()
         body = block_body(".gitignore", GI_START_RE, GI_END)
+        shares = engine_shares(self.d)
+        body = with_layout(body, "# layout (generated", gitignore_layout, shares)
         modes[".gitignore"] = self.put_block(".gitignore", body, modes, GI_START, GI_END, GI_START_RE)
         if not existed:
             created[".gitignore"] = "block"
@@ -458,6 +464,7 @@ class Installer:
         st = self.p(".stignore")
         if st.is_file() and created.get(".stignore") != sha(st.read_bytes()):
             body, cur = block_body(".stignore", ST_START_RE, ST_END), read(st)
+            body = with_layout(body, "// layout (generated", stignore_layout, shares)
             if find_block(cur, ST_START_RE, ST_END):
                 modes[".stignore"] = self.put_block(".stignore", body, modes, ST_START, ST_END, ST_START_RE)
             else:
@@ -6896,6 +6903,14 @@ ENGINE_DENY_DIRS = ("vault", "pairing", "mcp-tokens", "sessions", "projects", "c
 ENGINE_DENY_TOP = ("auth*", "*token*", "*secret*")  # loose names only at the top of a tool folder (a skill named
                                                     # `x-token-spend` or `authoring/` stays allowed)
 LAYOUT_CLOSED = ("projects", "data", "apps", "runs", "scratch", "backups")   # never in git (README.md only)
+SYNC_ALL_CLOSED = ("data", "apps", "backups")    # engines.json "sync": "all" still keeps these off other devices
+SYNC_ALL_DENY_FILES = tuple(g for g in ENGINE_DENY_FILES if g not in ("*.db", "*.db-*", "*.sqlite*", "*.log", "*.jsonl"))
+SYNC_ALL_HEAVY_FILES = ("*.db", "*.db-*", "*.sqlite*", "*.tar", "*.tar.*", "*.tgz", "*.zst", "*.zip", "*.bundle",
+                        "*.7z", "*.iso", "*.whl")
+SYNC_ALL_ENGINE_CONFIG = ("settings.json", "settings.local.json", "config.toml", "config.yaml", "config.yml",
+                          "*.env.json")     # tool config files can hold keys inline: never shared, even in sync all
+SYNC_ALL_HEAVY_DIRS = ("node_modules", ".git", "__pycache__", ".venv", "venv", ".next", ".turbo", ".mypy_cache",
+                       ".pytest_cache", ".ruff_cache")
 
 
 def _glob_rx(g):
@@ -6925,9 +6940,10 @@ def _safe_match(r, pats):
     return False
 
 
-def engine_rule(rel):
+def engine_rule(rel, shares=None):
     """For a path below engines/ ('claude/skills/x/SKILL.md'): 'deny' (a secret or session), 'sync' (git and
-    Syncthing), 'git' (git only, content checked) or 'no' (not on the allow list: stays local)."""
+    Syncthing), 'git' (git only, content checked) or 'no' (not on the allow list: stays local).
+    SHARES = {tool folder: [extra safe sub-folders]} from engines.json (see engine_shares)."""
     parts = rel.split("/")
     if len(parts) < 2:
         return "sync" if rel in ("README.md",) else "no"
@@ -6936,6 +6952,8 @@ def engine_rule(rel):
             any(fnmatch.fnmatchcase(d, g) for d in parts[1:-1] for g in ENGINE_DENY_DIRS) or \
             (len(parts) == 2 and any(fnmatch.fnmatchcase(parts[-1], g) for g in ENGINE_DENY_TOP)):
         return "deny"
+    if any(r.startswith(sub + "/") for sub in (shares or {}).get(tool, ())):
+        return "sync"
     for table, kind in ((ENGINE_SAFE, "sync"), (ENGINE_GIT_ONLY, "git")):
         for k, pats in table.items():
             if fnmatch.fnmatchcase(tool, k) and _safe_match(r, pats):
@@ -6949,7 +6967,7 @@ def _parents(pat):
     return ["/".join(ps[:i + 1]) + "/" for i in range(len(ps))]
 
 
-def gitignore_layout():
+def gitignore_layout(shares=None):
     """The layout part of the base's .gitignore block (deny by default for engines/, hard denies last)."""
     out = ["# layout (generated: brain.py layout --print): code, heavy data and tool folders live in the base, "
            "never in its git"]
@@ -6964,6 +6982,12 @@ def gitignore_layout():
                 out.append(f"!/engines/{k}/{g}")
                 if g.endswith("/"):
                     out.append(f"!/engines/{k}/{g}**")
+    for k, subs in sorted((shares or {}).items()):          # engines.json "share": extra safe sub-folders
+        if k == SYNC_ALL:
+            continue
+        for sub in subs:
+            out += [f"!/engines/{k}/{par}" for par in _parents(sub + "/x")] + [f"!/engines/{k}/{sub}/",
+                                                                            f"!/engines/{k}/{sub}/**"]
     out.append("# hard denies last: they win over every line above")
     out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
     out += [f"/engines/**/{d}/" for d in ENGINE_DENY_DIRS]
@@ -6971,7 +6995,7 @@ def gitignore_layout():
     return "\n".join(dict.fromkeys(out))
 
 
-def stignore_layout():
+def stignore_layout(shares=None):
     """The base's .stignore block: Syncthing takes the FIRST pattern that matches, so the secrets come first, then
     the safe files of each tool folder, then everything else of the layout folders is ignored."""
     out = ["// layout (generated: brain.py layout --print): secrets first (first match wins), then the safe files of",
@@ -6982,8 +7006,118 @@ def stignore_layout():
     out.append("!/engines/README.md")
     for k, pats in ENGINE_SAFE.items():
         out += [f"!/engines/{k}/{g.rstrip('/')}" for g in pats]
+    if (shares or {}).get(SYNC_ALL):                         # engines.json "sync": "all": every other file is
+        out.append("// sync all: everything else of the base is shared, except secrets and heavy files anywhere")
+        out += [f"/engines/*/{g}" for g in SYNC_ALL_ENGINE_CONFIG] + [f"/engines/**/{g}" for g in SYNC_ALL_ENGINE_CONFIG]
+        out += list(SYNC_ALL_DENY_FILES) + list(SYNC_ALL_HEAVY_FILES) + list(SYNC_ALL_HEAVY_DIRS)
+        out += [f"/{d}" for d in SYNC_ALL_CLOSED]
+        return "\n".join(dict.fromkeys(out))
+    for k, subs in sorted((shares or {}).items()):          # after the secret denies, before the deny-all /engines
+        out += [f"!/engines/{k}/{sub}" for sub in subs]
     out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]
     return "\n".join(dict.fromkeys(out))
+
+
+SHARE_REFUSE = re.compile(r"auth|token|credential|secret|session|passw|private|\.git|vault|keychain|\.env", re.I)
+
+
+def share_check(sub):
+    """The normalized sub-folder, or SystemExit when it is not a plain relative path or looks secret."""
+    sub = (sub or "").strip().strip("/")
+    parts = sub.split("/")
+    if not sub or sub.startswith(("!", "#", "~")) or any(p in ("", ".", "..") or re.search(r"[*?\[\]\\]", p)
+                                                         for p in parts):
+        raise SystemExit(f"engine share: '{sub}' is not a plain relative sub-folder")
+    bad = next((p for p in parts if SHARE_REFUSE.search(p) or any(fnmatch.fnmatchcase(p, g) for g in
+                                                                 ENGINE_DENY_DIRS)), None)
+    if bad:
+        raise SystemExit(f"engine share: '{bad}' looks like it holds a secret or session data: refused")
+    return sub
+
+
+SYNC_ALL = "*sync-all*"     # key in engine_shares() output: engines.json "sync": "all" (never a folder name)
+
+
+def engine_shares(base):
+    """{tool folder: [sub-folders]} from engines.json ("share" lists); bad entries are ignored."""
+    out, reg = {}, reg_load(base, ENGINES_REG)
+    if reg.get("sync") == "all":
+        out[SYNC_ALL] = ["all"]
+    for name, e in reg.get("engines", {}).items():
+        subs = []
+        for x in (e.get("share") or []) if isinstance(e, dict) else []:
+            try:
+                subs.append(share_check(x))
+            except SystemExit:
+                pass
+        if subs:
+            out[name] = sorted(set(subs))
+    return out
+
+
+def with_layout(body, mark, gen, shares):
+    """BODY with its generated layout part (from the line starting MARK to the end) made by GEN(shares); BODY
+    unchanged when it has no layout part."""
+    i = body.find(mark)
+    return body if i < 0 else body[:i] + gen(shares)
+
+
+def refresh_ignore_blocks(base):
+    """Regenerate the layout blocks of the base's .gitignore and .stignore for its shares (untouched when the
+    block is missing or already right). Returns the files changed."""
+    base, sh, done = pathlib.Path(base), engine_shares(base), []
+    for rel, sr, en, gen, mark in ((".gitignore", GI_START_RE, GI_END, gitignore_layout, "# layout (generated"),
+                                   (".stignore", ST_START_RE, ST_END, stignore_layout, "// layout (generated")):
+        cur = read(base / rel)
+        r = find_block(cur, sr, en)
+        if not r:
+            continue
+        inner = cur[r[0]:r[1]]
+        first = inner[:inner.index("\n")]
+        body = with_layout(inner[len(first) + 1:inner.rindex("\n")], mark, gen, sh)
+        new = cur[:r[0]] + f"{first}\n{body}\n{en}" + cur[r[1]:]
+        if new != cur:
+            atomic_write(base / rel, new); done.append(rel)
+    return done
+
+
+def engine_sync_all(base, on):
+    """engines.json "sync": "all" on/off: Syncthing shares the whole base except secrets, tool config files and
+    heavy files (git rules do not change). Returns log lines."""
+    reg = reg_load(base, ENGINES_REG)
+    if on:
+        reg["sync"] = "all"
+    else:
+        reg.pop("sync", None)
+    reg_save(base, ENGINES_REG, reg)
+    done = refresh_ignore_blocks(base)
+    return [f"sync all {'on' if on else 'off'}" + (f": {', '.join(done)} updated" if done else "")]
+
+
+def engine_share(base, name, sub, remove=False):
+    sub = share_check(sub) if not remove else (sub or "").strip().strip("/")
+    reg = reg_load(base, ENGINES_REG)
+    if not (pathlib.Path(base) / "engines" / name).is_dir() and name not in reg.get("engines", {}):
+        raise SystemExit(f"engine share: engines/{name} does not exist")
+    e = reg.setdefault("engines", {}).setdefault(name, {})
+    lst = [x for x in e.get("share", []) if x != sub]
+    if remove:
+        if len(lst) == len(e.get("share", [])):
+            raise SystemExit(f"engine share: engines/{name}/{sub} is not shared")
+    else:
+        lst = sorted(set(lst + [sub]))
+    if lst:
+        e["share"] = lst
+    else:
+        e.pop("share", None)
+        if not e:
+            reg["engines"].pop(name)
+            if not reg["engines"]:
+                reg.pop("engines")
+    reg_save(base, ENGINES_REG, reg)
+    ch = refresh_ignore_blocks(base)
+    return [f"engines/{name}/{sub}: {'no longer shared' if remove else 'shared (secrets, sessions and caches inside stay local)'}"
+            + (f"; updated {', '.join(ch)}" if ch else "")]
 
 
 MIRROR_MAX = 5 * 1024 * 1024
@@ -7121,7 +7255,7 @@ def staged_problems(base, paths=None):
         if mode == "160000":
             bad.append((path, "a nested repo (gitlink): keep it in projects/ (ignored) and in projects.json"))
             continue
-        if top == "engines" and rest != "README.md" and engine_rule(rest) in ("deny", "no"):
+        if top == "engines" and rest != "README.md" and engine_rule(rest, engine_shares(base)) in ("deny", "no"):
             bad.append((path, "engines/ file not on the allow list (or a secret, session or cache name)"))
             continue
         if top in LAYOUT_CLOSED and rest not in ("README.md", "projects.json"):
@@ -7307,9 +7441,11 @@ def engine_adopt(base, tool, force=False):
         log.append(f"{dest}: new, empty (the tool fills it on its first run)")
     pairs = [(path_key(src, home), path_key(dest, home)), (str(src), path_key(dest, home))]
     pairs += [(f, path_key(dest / f, home)) for f in moved]
+    old = reg.get("engines", {}).get(name) or {}
     reg.setdefault("engines", {})[name] = {"tool": next((i for i, k in TOOL_IDS.items() if k == key), key),
                                            "mode": "adopted", "env": var, "from": home_rel(src, home),
-                                           "moved": moved, "since": today()}
+                                           "moved": moved, "since": today(),
+                                           **({"share": list(old["share"])} if old.get("share") else {})}
     write_env_files(base, reg, home, log)
     reg_save(base, ENGINES_REG, reg)
     os.environ[var] = str(dest)
@@ -7472,6 +7608,7 @@ def engine_mirror(base, tool, name=None, keep=None):
         raise SystemExit(f"engine mirror: engines/{name} is {e.get('mode')}, not a mirror")
     reg["engines"][name] = {"mode": "mirror", "src": home_rel(src, home), "since": (e or {}).get("since") or today(),
                             **({"keep": list(keep)} if keep else {}),
+                            **({"share": list(e["share"])} if e and e.get("share") else {}),
                             **({"tool": next((i for i, k in TOOL_IDS.items() if k == key), key)} if key else {})}
     reg_save(base, ENGINES_REG, reg)
     mirror_sync(base, home, quiet=False)
@@ -7772,13 +7909,14 @@ def doctor_git(base):
     if not (base / ".git").exists() or not shutil.which("git"):
         return out
     tracked = (git_out("-C", str(base), "ls-files", "-s", "--", *BASE_SKIP) or "").splitlines()
+    shares = engine_shares(base)
     for line in tracked:
         mode, _, rest = line.partition(" ")
         path = rest.split("\t", 1)[-1]
         if mode == "160000":
             out.append(("ERROR", f"gitlink (nested repo added to the base's git): {path}; "
                                  f"`git rm --cached {path}` and keep projects/ ignored"))
-        elif path.startswith("engines/") and engine_rule(path[len("engines/"):]) in ("deny", "no"):
+        elif path.startswith("engines/") and engine_rule(path[len("engines/"):], shares) in ("deny", "no"):
             out.append(("ERROR", f"tracked in git but may hold a secret (not on the engines/ allow list): {path} "
                                  f"(`git rm --cached {path}`)"))
         elif path.split("/")[0] in LAYOUT_CLOSED and path.split("/", 1)[-1] not in ("README.md", "projects.json"):
@@ -7789,7 +7927,7 @@ def doctor_git(base):
             out.append(("ERROR", f".gitignore: {probe} would be {'tracked' if want else 'ignored'} "
                                  "(re-run `brain.py init` on this base to get the layout rules)"))
     st = read(base / ".stignore")
-    if st is not None and "/engines" not in st.split():
+    if st is not None and "/engines" not in st.split() and not shares.get(SYNC_ALL):
         out.append(("WARN", ".stignore: /engines is not excluded: Syncthing would share tool folders"))
     return out
 
@@ -8046,13 +8184,21 @@ def main(argv):
                 log = engine_mirror(base, rest[1], val("--name"), keep)
             elif sub == "unmirror":
                 log = engine_unmirror(base, rest[1])
+            elif sub == "share":
+                if len(rest) != 3:
+                    print("usage: engine share NAME SUBDIR [--remove]"); return 1
+                log = engine_share(base, rest[1], rest[2], "--remove" in flags)
+            elif sub == "sync-all":
+                if len(rest) != 2 or rest[1] not in ("on", "off"):
+                    print("usage: engine sync-all on|off"); return 1
+                log = engine_sync_all(base, rest[1] == "on")
             elif sub == "sync":
                 ch = mirror_sync(base, quiet=False)
                 log = [f"mirrors changed: {', '.join(ch)}" if ch else "mirrors up to date"]
             elif sub == "list":
                 log = engine_list(base)
             else:
-                print("usage: engine adopt|release|mirror|unmirror TOOL | engine sync | engine list"); return 1
+                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine sync | engine list"); return 1
         else:
             if sub == "move" and "--undo" in flags:
                 log = projects_undo(base, rest[1] if len(rest) > 1 else None, force)

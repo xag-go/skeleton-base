@@ -471,6 +471,9 @@ engines.json  projects.json                 what is where (tracked)
   `~/.bashrc`. It refuses while a program uses the folder. `engine release TOOL` is the exact reverse (your shell
   files come back byte for byte). A broken symlink would silently start a tool logged out with an empty folder; a
   missing variable is caught by `doctor` (the old folder came back: "split brain").
+- **Share one more sub-folder** of a tool folder (say a worker's built team in `engines/claude-worker/team`):
+  `brain.py engine share claude-worker team` (`--remove` undoes it). The secret rules still win inside it; names
+  like `auth`, `token`, `sessions` or `.git` are refused.
 - **Tools without such a setting** (Gemini CLI, Qwen, Kilo, Goose, Cursor, desktop apps, ...): `engine mirror TOOL`
   keeps a read-only copy of their rules, agents, skills, memories and hooks in `engines/<tool>/` (a `MIRROR` file
   says so; keys, logins and sessions are never copied; text that looks like a key is left out and listed in

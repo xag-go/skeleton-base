@@ -2,6 +2,14 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.1 - 2026-11-12
+- `engine sync-all on|off`: Syncthing shares the whole base (code, engines, logs, ops) except secrets, tool config files (settings.json, config.toml/yaml) and heavy files (node_modules, .git, venvs, DBs, archives); data/, apps/, backups/ stay on this machine; git rules unchanged.
+- **`engine share NAME SUBDIR [--remove]`**: share one more safe sub-folder of a tool folder (e.g. a team's built
+  agents in `engines/claude-worker/team`). Recorded as `"share": [...]` of that engine in `engines.json`; the
+  `.gitignore` and `.stignore` blocks get `!/engines/NAME/SUBDIR` lines after the secret denies and before the
+  deny-all `/engines` line, so keys, sessions and caches inside it stay local. Names that look secret (auth, token,
+  credentials, secret, sessions, `.git`, ...) are refused. `init` updates keep the lines; `guard` and `doctor` know them.
+
 ## v1.6.0 - 2026-11-12
 Everything can live in the base, for any tool:
 - **Each tool's folder follows its own setting.** `connect`, `collect`, `watch` and the hooks resolve every tool's
