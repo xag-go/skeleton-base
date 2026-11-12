@@ -4,3 +4,14 @@
 graphify-out
 .brain
 .base-folder
+// base-folder:start v1
+// code, tool dirs (secrets, sessions) and heavy data never leave this machine
+/engines
+/projects
+/data
+/apps
+/runs
+/scratch
+/backups
+/ops
+// base-folder:end

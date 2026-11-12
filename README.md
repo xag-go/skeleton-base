@@ -379,10 +379,22 @@ loads the same rules file and the same settings: what the table says holds, beca
 model. Tested here: Claude Code (Anthropic) and Hermes (its configured provider) for real; other providers are not
 tested here, by design they change nothing above.
 
-### Apps that cannot read your files: the MCP server
+### The MCP server: the generic door for any agent
+
+`brain.py mcp` is the one door that works for every agent, whatever the tool or the model provider: any MCP client
+(Claude Code, Codex, Gemini CLI, Qwen Code, opencode, Kilo, Hermes, Goose, Cursor, Copilot, Zed, the Claude app, an
+agent you write yourself) starts it over stdio and gets the same five tools, with the same safety rules. It needs no
+file access, no settings of its own and no trust in the agent: it reads only text inside the base (never
+`engines/`, `projects/` or the other layout folders, never hidden files) and writes only NEW notes into
+`raw/inbox/mcp/` (DATA for the next ingest). `connect --mcp` registers it in every tool it finds. A tool without
+MCP still reaches the base through the plain-file pointer block (`connect`).
+
+Agent Client Protocol (ACP) is something else: an editor-to-agent session protocol (a client starts an agent,
+sends prompts, shows diffs). It drives agents; it gives them no access to your data. So the base's door is MCP; ACP
+is at most a later, optional way for an orchestrator to drive an agent, which then reaches the base through MCP.
 
 The Claude app, ChatGPT, Zed's agent (when the base is not one of its project folders) and Claude Duet keep their
-rules and memory in your account, not in files. They reach the base through its MCP server:
+rules and memory in your account, not in files. They reach the base through its MCP server too:
 
 ```sh
 python3 tools/brain.py mcp                 # stdio, JSON-RPC 2.0 (the MCP stdio transport); --read-only, --max-note-kb N
@@ -440,6 +452,53 @@ Frugal-Bridge is a separate kit. Installed for the user, it keeps one user file 
   again. Every re-run names Frugal-Bridge's own tools (also those waiting for a rules file), never more.
 - Which of these a Frugal-Bridge build supports is read from its setup script (`frugal_caps` in `tools/brain.py`:
   quoted `Path:`, pointer file, systemd units, `--base`, `--no-base`), never from its version or its messages.
+
+## Everything in the base: tool folders, code, heavy data
+
+The base can hold everything AI-related on the computer, so one folder is the whole setup:
+
+```
+engines/<tool>/      each AI tool's own config folder (claude, codex, hermes, a worker's claude, ...)
+projects/<slug>/     one code repository each, with its own git and remote (worktrees in projects/.worktrees/)
+data/ apps/ runs/ scratch/ backups/ ops/    heavy material, toolchains, runs, scratch, local backups, server scripts
+engines.json  projects.json                 what is where (tracked)
+```
+
+- **Each tool's own setting, never a symlink.** `brain.py engine adopt TOOL` moves the tool's folder into
+  `engines/<tool>/` and sets the tool's own variable (Claude Code `CLAUDE_CONFIG_DIR`, with `~/.claude.json` moved
+  inside, as Claude Code expects; Codex `CODEX_HOME`; Hermes `HERMES_HOME`; OpenClaw `OPENCLAW_STATE_DIR`; Copilot CLI
+  `COPILOT_HOME`) in one marked block each in `~/.config/environment.d/` (user services), `~/.profile` and
+  `~/.bashrc`. It refuses while a program uses the folder. `engine release TOOL` is the exact reverse (your shell
+  files come back byte for byte). A broken symlink would silently start a tool logged out with an empty folder; a
+  missing variable is caught by `doctor` (the old folder came back: "split brain").
+- **Tools without such a setting** (Gemini CLI, Qwen, Kilo, Goose, Cursor, desktop apps, ...): `engine mirror TOOL`
+  keeps a read-only copy of their rules, agents, skills, memories and hooks in `engines/<tool>/` (a `MIRROR` file
+  says so; keys, logins and sessions are never copied; text that looks like a key is left out and listed in
+  `SKIPPED.md`). `watch` refreshes it within a second of a change. Older `~/.config/my-setup/sources.d/*.json`
+  registrations (`{"sources": [{"src", "dest"}]}`) are mirrored the same way.
+- **Several folders of one tool** (your Claude Code folder plus a worker's): `connect --tool-dir claude-code=DIR`
+  (or `--claude-config-dir DIR`, repeatable) wires each one like the default one. Any installer can instead drop a
+  file into the shared registry `~/.config/ai-tool-dirs.d/NAME.json` (one object or a list:
+  `{"tool": "claude-code", "dir": "/abs/path", "owner": "...", "purpose": "..."}`; `~/.config/claude-code-dirs.d/`
+  works too, tool = claude-code): `connect`, `collect`, `watch` and Frugal-Bridge read it.
+- **Code**: `projects move PATH` moves a repository into `projects/<slug>/` (a `git bundle` backup first, refuses
+  while a program works in it, linked worktrees moved with `git worktree move` and repaired, the Claude Code project
+  folder renamed so its sessions and memory follow, Codex trust paths updated, units/cron/tool configs that still name
+  the old path listed); `projects move --undo` reverses the last move. `projects.json` (tracked) keeps each repo's
+  remote, branch and worktrees: `projects clone` brings them back on a new machine.
+- **Never in git, GitHub or Syncthing**: the base's `.gitignore` ignores `projects/`, `data/`, `apps/`, `runs/`,
+  `scratch/`, `backups/` and is deny-by-default for `engines/` (only `*.md` at the top of a tool folder, `agents/`,
+  `skills/`, `memories/`, `hooks/`, `scripts/`, Hermes `cron/jobs.json` and profiles' `SOUL.md`/memories/skills;
+  credentials, `.claude.json`, auth, `.env`, tokens, sessions, project transcripts, databases, caches, logs and
+  `node_modules` are denied last, so they always win). `.stignore` keeps all layout folders off Syncthing.
+  `check` proves it (fake secret paths must be ignored, no tracked secret, no nested repo added as a gitlink).
+- **Never walked**: backups (`uninstall`), tidy's snapshot, the MCP server, `check-public` (in a repo it reads only
+  what git could publish) skip the layout folders; `collect` and `watch` find tool memories through each tool's own
+  setting (a moved folder keeps its memories' names, so nothing is collected twice).
+- **`doctor`** lists every AI tool folder (where, set by which setting, in or outside the base), folders configured
+  in user services, profiles or the registry but not wired, unknown AI folders and code repositories outside the
+  base (an allowed list: system folders, plus your own in `.brain/outside.json` `{"allow": ["~/vault"]}`), and the
+  git checks above. `watch --discover` also names configured folders that are not wired yet.
 
 ## Instant and zero-touch
 

@@ -67,8 +67,35 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                install --global so it uses the base; the base block goes before its block
   disconnect [--base DIR]      remove exactly what connect (and auto-connect) wrote; Frugal-Bridge gets the
                                user slot back in its USER.md, forgets the base and is re-run
+  connect ... --tool-dir TOOL=DIR (repeatable; --claude-config-dir DIR = --tool-dir claude-code=DIR)
+                               wire one more config dir of a tool (e.g. a worker's Claude Code dir) exactly like
+                               its default one; recorded, and written to the shared registry
+                               ~/.config/ai-tool-dirs.d/skeleton-base.json that other kits and the watcher read.
+                               Every tool's dir follows its own setting (CLAUDE_CONFIG_DIR, CODEX_HOME,
+                               HERMES_HOME, OPENCLAW_STATE_DIR/OPENCLAW_HOME, COPILOT_HOME, GEMINI_CLI_HOME,
+                               XDG_CONFIG_HOME/XDG_DATA_HOME for opencode, Kilo, Goose)
 
-Apps that cannot read your files (Claude app, ChatGPT, Zed, Claude Duet through a tunnel you set up)
+Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's git or Syncthing)
+  engine adopt TOOL [--force]  move a tool's config dir into engines/<tool>/ and point the tool's own setting
+                               there (marked blocks in ~/.config/environment.d, ~/.profile, ~/.bashrc);
+                               refuses while a program uses the dir; engines.json records it
+  engine release TOOL          the exact reverse (dir back, blocks out, old bytes restored)
+  engine mirror TOOL|PATH [--name N] [--keep GLOB,...] | engine unmirror NAME | engine sync | engine list
+                               a tool without such a setting: a read-only copy of its rules, agents, skills,
+                               memories, hooks in engines/<name>/ (MIRROR file; secrets never copied), kept current
+                               by watch (also every ~/.config/my-setup/sources.d/*.json registration)
+  projects move PATH [--slug S] [--keep-worktrees] [--no-bundle] [--force] | projects move --undo [SLUG]
+                               move a repo into projects/<slug> (git bundle first, refuses while a program works
+                               in it, worktrees moved with git, Claude Code project folder renamed, Codex trust
+                               paths updated, other references listed); --undo reverses the last move
+  projects list|scan|clone [--dry-run]
+                               projects.json (tracked): remote, branch, worktrees; clone brings missing ones back
+  doctor [--strict]            every AI tool dir and code repo: where it lives, set by which setting, split brain
+                               (old dir back while the setting points elsewhere), dirs configured but not wired,
+                               what is outside the base (allowed list + .brain/outside.json), tracked secrets and
+                               gitlinks; exit 2 on errors (--strict: also on anything outside)
+
+The generic door for ANY agent (MCP client), and for apps that cannot read your files (Claude app, ChatGPT, Zed)
   mcp [--base DIR] [--read-only] [--max-note-kb 64]
                                MCP server on stdio (JSON-RPC 2.0): tools recent, search, list_pages,
                                read_page (text files inside the base only), save_note (creates a NEW note in
@@ -103,7 +130,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.5.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -112,6 +139,9 @@ FRUGAL_START_RE = re.compile(r"<!-- frugal-bridge:start v[^>]*-->")
 GI_START = f"# base-folder:start v{VERSION}"
 GI_END = "# base-folder:end"
 GI_START_RE = re.compile(r"# base-folder:start v\S*")
+ST_START = f"// base-folder:start v{VERSION}"     # .stignore (Syncthing): same block, its comment style
+ST_END = "// base-folder:end"
+ST_START_RE = re.compile(r"// base-folder:start v\S*")
 POINTER = "@AGENTS.md"
 SOFT_LIMIT, HARD_LIMIT = 24 * 1024, 32 * 1024
 GEMINI_NAMES = ["AGENTS.md", "GEMINI.md"]
@@ -133,7 +163,8 @@ FILES = ["README.md", "SECURITY.md", "hot.md", "wiki/index.md", "wiki/log.md", "
          "maps/README.md", "maps/start-here.canvas",
          "templates/person.md", "templates/client.md", "templates/project.md", "templates/decision.md",
          "templates/daily.md", "templates/source.md", "templates/card.md",
-         "skills/base-ingest/SKILL.md", "skills/base-lint/SKILL.md", "tools/brain.py", ".stignore"]
+         "skills/base-ingest/SKILL.md", "skills/base-lint/SKILL.md", "tools/brain.py", ".stignore",
+         "engines/README.md", "projects/README.md"]
 
 SPECIAL = ("index.md", "log.md")
 SCOPES = ("private", "workspaces")
@@ -421,6 +452,10 @@ class Installer:
         modes[".gitignore"] = self.put_block(".gitignore", body, modes, GI_START, GI_END, GI_START_RE)
         if not existed:
             created[".gitignore"] = "block"
+        # .stignore (Syncthing): the layout lines also in a copy you changed (an unchanged copy is upgraded above)
+        if self.p(".stignore").is_file() and created.get(".stignore") != sha(self.p(".stignore").read_bytes()):
+            modes[".stignore"] = self.put_block(".stignore", block_body(".stignore", ST_START_RE, ST_END), modes,
+                                                ST_START, ST_END, ST_START_RE)
 
         # Frugal-Bridge already here: import its slot files (contract case 4)
         imported = prev.get("imported")
@@ -559,9 +594,10 @@ class Installer:
         new_slots = self.export_slots(me) if frugal else None
 
         for rel, sr, en in (("AGENTS.md", START_RE, END), ("CLAUDE.md", START_RE, END),
-                            ("GEMINI.md", START_RE, END), (".gitignore", GI_START_RE, GI_END)):
+                            ("GEMINI.md", START_RE, END), (".gitignore", GI_START_RE, GI_END),
+                            (".stignore", ST_START_RE, ST_END)):
             t = read(self.p(rel))
-            if t is None:
+            if t is None or (rel == ".stignore" and created.get(rel) == sha(t.encode())):
                 continue
             if created.get(rel) == sha(t) and t.strip() == POINTER:
                 if frugal:
@@ -785,9 +821,12 @@ def shq(s):
     return s if re.fullmatch(r"[A-Za-z0-9_./:@%+=,-]+", s) else "'" + s.replace("'", "'\\''") + "'"
 
 
-def archive_base(base, dest=None):
+def archive_base(base, dest=None, skip=None):
     """Write the WHOLE base (dotfiles, .git, everything) to DEST/BASENAME-TIME.tar.gz (mode 600, folder 700),
-    outside the base; read it back to prove it is complete. Returns (archive path, files in it)."""
+    outside the base; read it back to prove it is complete. Returns (archive path, files in it). The layout folders
+    (BASE_SKIP: engines/, projects/, data/, ...) keep only their top files (README.md): tool folders, code repos and
+    heavy data have their own backups (each tool's, each repo's remote) and can be tens of GB."""
+    skip = BASE_SKIP if skip is None else skip
     import tarfile, io
     base = pathlib.Path(base).resolve()
     dest = pathlib.Path(dest).expanduser().resolve() if dest else (home_dir() / BACKUPS_DIR).resolve()
@@ -808,6 +847,8 @@ def archive_base(base, dest=None):
     try:
         with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
             for cur, dirs, files in os.walk(base):
+                if os.path.dirname(cur) == str(base) and os.path.basename(cur) in skip:
+                    dirs[:] = []                  # a layout folder: only its own top files (README.md)
                 dirs.sort(); files.sort()
                 for name in [""] + dirs + files if cur == str(base) else dirs + files:
                     p = pathlib.Path(cur) / name if name else base
@@ -1283,6 +1324,8 @@ def check(root):
                 out.append(f"slot {slot} -> {path}: missing"); ok = False
     except json.JSONDecodeError:
         out.append(".kits.json: invalid JSON"); ok = False
+    for lvl, text in doctor_git(root):                     # engines/ and projects/: secrets, gitlinks, ignore rules
+        out.append(f"{lvl}: {text}"); ok &= lvl != "ERROR"
     print(("OK" if ok else "PROBLEMS") + "\n" + "\n".join(out))
     return 0 if ok else 1
 
@@ -1815,6 +1858,165 @@ def home_dir():
     return pathlib.Path(os.environ.get("HOME") or pathlib.Path.home())
 
 
+# ---------------------------------------------------------------- where each AI tool really keeps its files
+# Paths in this file are written as each tool's DEFAULT home-relative path (".claude/CLAUDE.md"). A tool's dir can
+# live anywhere (e.g. BASE/engines/<tool>/) when the tool's OWN setting points there: tool_path() maps the default
+# path to the real one. First variable that is set (to an absolute path) wins. "dir": the variable IS the dir;
+# "home": the dir is VAR/<default name>; "xdg": the dir is VAR/<name after .config/ or .local/share/>.
+TOOL_HOMES = {
+    ".claude": (("CLAUDE_CONFIG_DIR", "dir"),),                 # Claude Code (VERIFIED: .claude.json moves inside)
+    ".codex": (("CODEX_HOME", "dir"),),                         # Codex CLI / IDE / app (VERIFIED)
+    ".hermes": (("HERMES_HOME", "dir"),),                       # Hermes Agent (VERIFIED)
+    ".openclaw": (("OPENCLAW_STATE_DIR", "dir"), ("OPENCLAW_HOME", "home")),   # OpenClaw (docs)
+    ".copilot": (("COPILOT_HOME", "dir"),),                     # GitHub Copilot CLI (docs)
+    ".gemini": (("GEMINI_CLI_HOME", "home"),),                  # Gemini CLI: the parent of .gemini/
+    ".config/opencode": (("XDG_CONFIG_HOME", "xdg"),),
+    ".config/kilo": (("XDG_CONFIG_HOME", "xdg"),),
+    ".config/goose": (("XDG_CONFIG_HOME", "xdg"),),
+    ".local/share/opencode": (("XDG_DATA_HOME", "xdg"),),
+    ".local/share/kilo": (("XDG_DATA_HOME", "xdg"),),
+}
+TOOL_FILES = {".claude.json": ".claude"}   # beside the dir by default, INSIDE it when the dir is relocated
+# tool id (as in agents/*.md `engines:` and the shared registry) -> its default dir
+TOOL_IDS = {"claude-code": ".claude", "codex": ".codex", "gemini": ".gemini", "qwen": ".qwen",
+            "opencode": ".config/opencode", "kilo": ".config/kilo", "goose": ".config/goose", "hermes": ".hermes",
+            "openclaw": ".openclaw", "copilot": ".copilot", "grok": ".grok", "cursor": ".cursor"}
+# shared registry: any installer (a team setup, a scheduler, `connect --tool-dir`) drops a JSON file here, one
+# object or a list: {"tool": "claude-code", "dir": "/abs/path", "owner": "...", "purpose": "..."}
+TOOL_DIRS_REG = (".config/ai-tool-dirs.d", ".config/claude-code-dirs.d")   # the 2nd: tool defaults to claude-code
+TOOL_DIRS_MINE = ".config/ai-tool-dirs.d/skeleton-base.json"
+
+
+def tool_root(key, home, env=None):
+    """(real dir of a tool's default dir, the variable that moved it or None)."""
+    env = os.environ if env is None else env
+    for var, how in TOOL_HOMES.get(key, ()):
+        v = env.get(var)
+        if v and os.path.isabs(v):
+            p = pathlib.Path(v)
+            if how == "home":
+                p = p / key
+            elif how == "xdg":
+                p = p / key.split("/")[-1]
+            return p, var
+    return pathlib.Path(home) / key, None
+
+
+def path_key(p, home):
+    """A path as connect records it: home-relative when it is below HOME, else absolute."""
+    p, h = os.path.normpath(str(p)), os.path.normpath(str(home))
+    return os.path.relpath(p, h) if p.startswith(h + "/") else p
+
+
+def tool_path(r, home, roots=None, env=None):
+    """The key for a tool's default home-relative path R: unchanged while the tool uses its default dir, else the
+    real place (home-relative when below HOME, else absolute). roots = {default dir: real dir} overrides (one more
+    dir of the same tool, e.g. a second Claude Code config dir)."""
+    roots = roots or {}
+    if r.startswith("/"):
+        return r
+    for key in sorted(set(TOOL_HOMES) | set(roots), key=len, reverse=True):
+        if r == key or r.startswith(key + "/"):
+            root = roots.get(key)
+            if root is None:
+                root, var = tool_root(key, home, env)
+                if var is None:
+                    return r
+            return path_key(pathlib.Path(root) / r[len(key) + 1:] if r != key else root, home)
+    if r in TOOL_FILES:
+        key = TOOL_FILES[r]
+        root = roots.get(key)
+        if root is None:
+            root, var = tool_root(key, home, env)
+            if var is None:
+                return r
+        return path_key(pathlib.Path(root) / r, home)
+    return r
+
+
+def tool_virtual(r, home, env=None):
+    """Back from a real key (tool_path) to the tool's default path, when it lies in a relocated tool dir."""
+    p = os.path.normpath(os.path.join(str(home), r))
+    for key in sorted(TOOL_HOMES, key=len, reverse=True):
+        root, var = tool_root(key, home, env)
+        if var is None:
+            continue
+        root = os.path.normpath(str(root))
+        for f, k in TOOL_FILES.items():
+            if k == key and p == os.path.join(root, f):
+                return f
+        if p == root or p.startswith(root + "/"):
+            return key + p[len(root):]
+    return r
+
+
+def tool_tilde(r):
+    return r if r.startswith("/") else "~/" + r
+
+
+def tool_key_of(name):
+    """'claude-code' or '.claude' -> '.claude' (None when unknown)."""
+    name = (name or "").strip()
+    if name in TOOL_IDS:
+        return TOOL_IDS[name]
+    return name if name in TOOL_HOMES or name in TOOL_IDS.values() else None
+
+
+def registered_dirs(home, notes=None):
+    """[(tool key, abs dir, source file)] from the shared registry files; bad files are skipped with a note."""
+    out = []
+    home = pathlib.Path(home)
+    for i, reg in enumerate(TOOL_DIRS_REG):
+        for f in sorted((home / reg).glob("*.json")) if (home / reg).is_dir() else []:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                if notes is not None:
+                    notes.append(f"skipped {f}: {e}")
+                continue
+            for e in data if isinstance(data, list) else [data]:
+                if not isinstance(e, dict) or not isinstance(e.get("dir"), str):
+                    continue
+                key = tool_key_of(e.get("tool") or ("claude-code" if i == 1 else ""))
+                d = os.path.expanduser(e["dir"])
+                if key and os.path.isabs(d):
+                    out.append((key, os.path.normpath(d), str(f)))
+    return out
+
+
+def tool_instances(home, base=None, env=None):
+    """[(tool key, real dir, extra)] for every dir of every relocatable tool: the default one (after its own
+    variable) and each extra dir from the shared registry or `connect --tool-dir` (recorded in .kits.json)."""
+    home = pathlib.Path(home)
+    seen, out = set(), []
+    for key in TOOL_IDS.values():
+        root = tool_root(key, home, env)[0]
+        seen.add(os.path.normpath(str(root)))
+        out.append((key, pathlib.Path(root), False))
+    extra = [(k, d) for k, d, _ in registered_dirs(home)]
+    if base is not None:
+        try:
+            k = json.loads(read(pathlib.Path(base) / ".kits.json") or "{}")
+            rec = (k.get("kits", {}).get("base-folder", {}).get("connect") or {}).get("dirs") or {}
+        except ValueError:
+            rec = {}
+        extra += [(key, d) for key, ds in rec.items() for d in ds if isinstance(d, str)]
+    for key, d in extra:
+        d = os.path.normpath(d)
+        if d not in seen:
+            seen.add(d)
+            out.append((key, pathlib.Path(d), True))
+    return out
+
+
+def tool_glob(home, pattern, roots=None, env=None):
+    """Files for a default home-relative glob pattern, wherever the tool's dir really is."""
+    r = tool_path(pattern, home, roots, env)
+    if r.startswith("/"):
+        return sorted(pathlib.Path("/").glob(r[1:]))
+    return sorted(pathlib.Path(home).glob(r))
+
+
 def slug(s, n=60):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n].strip("-") or "item"
 
@@ -1863,26 +2065,47 @@ def read_md(f, notes):
         return None, None
 
 
-def collect_items(home, notes, cfg=None):
+def collect_items(home, notes, cfg=None, base=None):
     """Yield (source, origin, epoch, content) from every known harness memory store, plus the locations in
-    .brain/watch.json (cfg). Read-only everywhere."""
+    .brain/watch.json (cfg). Read-only everywhere. Each tool's dir is found through its own setting (CLAUDE_CONFIG_DIR,
+    CODEX_HOME, HERMES_HOME, ...; origins keep the default name, so a moved dir is not collected twice) and every
+    extra dir of a tool (shared registry, `connect --tool-dir`) is collected too (origin = its real path)."""
+    yield from _collect_dir(home, notes, {}, None)
+    for key, d, extra in tool_instances(home, base):
+        if extra:
+            yield from _collect_dir(home, notes, {key: d}, key)
+    if cfg:
+        yield from extra_items(home, cfg, notes)
+
+
+def _collect_dir(home, notes, roots, only):
+    def G(pattern):
+        if only and not (pattern == only or pattern.startswith(only + "/")):
+            return []
+        return tool_glob(home, pattern, roots)
+
+    def rel_home(f):
+        k = path_key(f, home)
+        return tool_tilde(k if roots else tool_virtual(k, home))
+
     def files(src, pattern, origin):
-        for f in sorted(home.glob(pattern)):
+        for f in G(pattern):
             if f.is_file():
                 text, ts = read_md(f, notes)
                 if text is not None:
                     yield src, origin(f), ts, text
 
     yield from files("claude-code", ".claude/projects/*/memory/*.md",
-                     lambda f: f"{claude_project_name(f.parent.parent.name, home)}/{f.name}")
-    rel_home = lambda f: "~/" + f.relative_to(home).as_posix()
+                     (lambda f: f"{claude_project_name(f.parent.parent.name, home)}/{f.name}") if not roots else
+                     (lambda f: f"{rel_home(f.parent.parent.parent.parent)}:"
+                                f"{claude_project_name(f.parent.parent.name, home)}/{f.name}"))
     yield from files("codex", ".codex/memories/**/*.md", rel_home)
     yield from files("codex", ".codex/memories_v2/**/*.md", rel_home)
-    for db in sorted(home.glob(".codex/memories_*.sqlite")):
+    for db in G(".codex/memories_*.sqlite"):
         for tid, upd, raw, summ in ro_rows(db, "SELECT thread_id, source_updated_at, raw_memory, rollout_summary "
                                                "FROM stage1_outputs ORDER BY source_updated_at", notes):
             body = (raw or "").rstrip() + (f"\n\n## Rollout summary\n\n{summ.rstrip()}\n" if summ else "\n")
-            yield "codex", f"~/.codex/{db.name}#{tid}", parse_ts(upd), body
+            yield "codex", f"{rel_home(db)}#{tid}", parse_ts(upd), body
     def rules_memory(src, paths):                   # GEMINI.md / QWEN.md: saved memories plus the user's rules
         for f in dict.fromkeys(paths):
             if f.is_file():
@@ -1892,8 +2115,8 @@ def collect_items(home, notes, cfg=None):
                     if text.strip():
                         yield src, rel_home(f), ts, text
 
-    yield from rules_memory("gemini", [home / ".gemini" / "GEMINI.md"] + sorted(home.glob(".gemini/**/memory*.md")))
-    yield from rules_memory("qwen", [home / ".qwen" / "QWEN.md"])
+    yield from rules_memory("gemini", G(".gemini/GEMINI.md") + G(".gemini/**/memory*.md"))
+    yield from rules_memory("qwen", G(".qwen/QWEN.md"))
     yield from files("qwen", ".qwen/projects/*/memory/**/*.md", rel_home)      # its auto-memory (on by default)
     yield from files("qwen", ".qwen/memories/**/*.md", rel_home)               # its user tier
     yield from files("kilo", ".local/share/kilo/memory/*/*.md", rel_home)     # project.md, environment.md, ...
@@ -1902,7 +2125,7 @@ def collect_items(home, notes, cfg=None):
     yield from files("grok", ".grok/memory/**/*.md", rel_home)
     yield from files("hermes", ".hermes/memories/*.md", rel_home)
     yield from files("hermes", ".hermes/profiles/*/memories/*.md", rel_home)
-    for db in [home / ".hermes" / "memory_store.db"] + sorted(home.glob(".hermes/profiles/*/memory_store.db")):
+    for db in G(".hermes/memory_store.db") + G(".hermes/profiles/*/memory_store.db"):
         if not db.is_file():
             continue
         for fid, content, cat, tags, cr, up in ro_rows(db, "SELECT fact_id, content, category, tags, created_at, "
@@ -1913,8 +2136,6 @@ def collect_items(home, notes, cfg=None):
     for pattern in (".openclaw/workspace/MEMORY.md", ".openclaw/workspace/USER.md", ".openclaw/workspace/DREAMS.md",
                     ".openclaw/workspace/memory/*.md"):
         yield from files("openclaw", pattern, rel_home)
-    if cfg:
-        yield from extra_items(home, cfg, notes)
 
 
 def collect(base, only=None, baseline=False, since=None, quiet=False, file=True):
@@ -1944,7 +2165,7 @@ def collect(base, only=None, baseline=False, since=None, quiet=False, file=True)
     hashes = man.setdefault("hashes", {})
     at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     notes, per, new, dupes, old = [], {}, 0, 0, 0
-    for src, origin, ts, content in collect_items(home, notes, cfg):
+    for src, origin, ts, content in collect_items(home, notes, cfg, base):
         if src not in only:
             continue
         if not content.strip():           # an empty store file (e.g. a fresh MEMORY.md index) is not a memory
@@ -2844,7 +3065,7 @@ def usage_of(out):
 def snapshot(base):
     out = {}
     for dp, dns, fns in os.walk(base):
-        dns[:] = [d for d in dns if d not in (".git", ".brain")]
+        dns[:] = [d for d in dns if d not in (".git", ".brain") and not (dp == str(base) and d in BASE_SKIP)]
         for f in fns:
             p = pathlib.Path(dp) / f
             try:
@@ -4231,14 +4452,15 @@ def which(name):
     return shutil.which(name)
 
 
-def tool_installed(home, t, mine=()):
+def tool_installed(home, t, mine=(), roots=None):
     """Installed: a mark exists that we did not create ourselves, or its program is on PATH and its folder exists
-    (a folder that another tool also makes is never enough on its own)."""
+    (a folder that another tool also makes is never enough on its own). Marks follow the tool's own dir setting."""
     for m in t.get("marks", ()):
+        m = tool_path(m, home, roots)
         if m not in mine and (home / m).exists():
             return True
     d = t["dir"] if "dir" in t else t["key"]
-    return any(which(b) for b in t.get("bins", ())) and (d is None or (home / d).is_dir())
+    return any(which(b) for b in t.get("bins", ())) and (d is None or (home / tool_path(d, home, roots)).is_dir())
 
 
 def mcp_args(base):
@@ -4263,6 +4485,11 @@ class Connector:
         self.bdir = None
         self.tools, self.auto_extra = {}, []
         self.needs, self.warn, self._oc_major = {}, {}, None
+        self.roots = {}              # {tool dir: real dir} while one extra dir of a tool is wired
+
+    def L(self, r):
+        """Real key of a tool's default path (its own dir setting, or the extra dir being wired)."""
+        return tool_path(r, self.home, self.roots)
 
     def kits(self):
         return load_json(self.base / ".kits.json", ".kits.json")
@@ -4279,7 +4506,7 @@ class Connector:
             return None
         if not self.bdir:
             self.bdir = self.base / ".brain" / "backups" / f"connect-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
-        dst = self.bdir / r
+        dst = self.bdir / (("abs" + r) if r.startswith("/") else r)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         return rel(dst, self.base)
@@ -4289,13 +4516,13 @@ class Connector:
             return False
         self.backup(r)
         write(self.home / r, text)
-        self.log.append(f"wrote ~/{r}")
+        self.log.append(f"wrote {tool_tilde(r)}")
         return True
 
     def missing_dirs(self, r):
         d, made = (self.home / r).parent, []
         while not d.exists():
-            made.append(rel(d, self.home)); d = d.parent
+            made.append(path_key(d, self.home)); d = d.parent
         return made
 
     def block_into(self, rec, r, may_create=True):
@@ -4333,10 +4560,10 @@ class Connector:
 
     def rules_files(self, pat):
         if "*" not in pat:
-            return [pat]
-        return [rel(f, self.home) for f in sorted(self.home.glob(pat)) if f.is_file()]
+            return [self.L(pat)]
+        return [path_key(f, self.home) for f in tool_glob(self.home, pat, self.roots) if f.is_file()]
 
-    def connect(self, timer=False, watch=False, kick=False, unknown=False, mcp=False):
+    def connect(self, timer=False, watch=False, kick=False, unknown=False, mcp=False, tool_dirs_opt=()):
         if not (self.base / "tools" / "brain.py").is_file():
             raise SystemExit(f"connect: {self.base} is not a base (no tools/brain.py)")
         k = self.kits()
@@ -4349,12 +4576,15 @@ class Connector:
                "blocks": dict(prev.get("blocks", {})), "hooks": dict(prev.get("hooks", {})),
                "timer": dict(prev.get("timer", {})), "watch": dict(prev.get("watch", {})),
                "pointer": dict(prev.get("pointer", {})), "access": dict(prev.get("access", {})),
-               "skills": dict(prev.get("skills", {})), "mcp": bool(mcp or prev.get("mcp"))}
+               "skills": dict(prev.get("skills", {})), "mcp": bool(mcp or prev.get("mcp")),
+               "dirs": {k: list(v) for k, v in (prev.get("dirs") or {}).items()},
+               "dir_hooks": dict(prev.get("dir_hooks", {})), "registry": dict(prev.get("registry", {}))}
 
         never = [x.removeprefix("~/") for x in watch_cfg(self.base).get("never", []) if isinstance(x, str)]
         skip = lambda r: any(fnmatch.fnmatchcase(r, g) or r.startswith(g.rstrip("/") + "/") for g in never)
         mine = self.created_files(rec)
         found = [key for key, t in TOOLS.items() if not skip(key) and tool_installed(self.home, t, mine)]
+        extra = self.extra_dirs(rec, tool_dirs_opt)
         plan, drop, via = self.rules_plan(found, skip, rec)
         for r in sorted(drop):
             self.drop_block(rec, r)
@@ -4401,8 +4631,10 @@ class Connector:
                                        "why": "looks like an AI tool (it has a memory store, now watched) but no "
                                               "rules file we know: add the pointer in its settings by hand"}
 
-        if (self.home / ".claude").is_dir():
+        if (self.home / self.L(".claude")).is_dir():
             self.merge_hooks(rec, kick)
+        for key, d in extra:                            # every extra dir of a tool: same block, settings, hooks
+            self.connect_extra(rec, key, d, kick, found)
 
         if timer or watch:
             self.units(rec["timer"], {**unit_texts(self.base), **tidy_unit_texts(self.base)})
@@ -4419,25 +4651,78 @@ class Connector:
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.save_kits(k)
         before = set(prev.get("blocks") or {})
-        self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [])
+        self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [],
+                              new_dirs=[d for _, d in extra if d not in set(prev.get("dir_hooks") or {}) and
+                                        not any(r.startswith(path_key(d, self.home) + "/") for r in before)])
         return self.log
+
+    # -- more than one dir of one tool (e.g. your Claude Code dir and a worker's): each gets the same wiring
+    def extra_dirs(self, rec, opt=()):
+        """[(tool key, abs dir)] wired besides each tool's default dir: `--tool-dir` (recorded in .kits.json and in
+        our own shared-registry file, so other kits and the watcher see it too) and every shared-registry file."""
+        for key, d in opt:
+            lst = rec["dirs"].setdefault(key, [])
+            if d not in lst:
+                lst.append(d)
+        if rec["dirs"]:
+            ids = {v: k for k, v in TOOL_IDS.items()}
+            entries = [{"tool": ids.get(key, key), "dir": d, "owner": "skeleton-base",
+                        "purpose": "connect --tool-dir"} for key, ds in sorted(rec["dirs"].items()) for d in ds]
+            self.units(rec["registry"], {TOOL_DIRS_MINE: dump_json(entries)})
+        notes, out, seen = [], [], set()
+        for key, d in ([(k, d) for k, ds in rec["dirs"].items() for d in ds]
+                       + [(k, d) for k, d, _ in registered_dirs(self.home, notes)]):
+            d = os.path.normpath(d)
+            if d == os.path.normpath(str(tool_root(key, self.home)[0])) or (key, d) in seen or key not in TOOLS:
+                continue
+            seen.add((key, d)); out.append((key, d))
+        self.log += [f"tool dirs registry: {n}" for n in notes]
+        return out
+
+    def connect_extra(self, rec, key, d, kick, found):
+        t = TOOLS[key]
+        if not pathlib.Path(d).is_dir():
+            self.tools[d] = {"state": "needs-user", "tool": key,
+                             "why": f"{d} does not exist yet: start {t['name']} once with its own setting pointing "
+                                    "there, then connect again (the watcher does it)"}
+            return
+        self.roots = {key: pathlib.Path(d)}
+        try:
+            cands = [(r, how) for pat, how in t["rules"] for r in self.rules_files(pat)]
+            if t.get("pick") == "first":
+                hit = next(((r, how) for r, how in cands if (read(self.home / r) or "").strip()), None)
+                chosen = [hit] if hit else [c for c in cands if c[1] == "create"][:1]
+            else:
+                chosen = cands
+            wrote = [r for r, how in chosen if self.block_into(rec, r, how == "create")]
+            files = {}
+            for r, e in self.tool_edits(key, rec["mcp"], found):
+                files.setdefault(r, []).append(e)
+            for r, edits in files.items():
+                self.apply_edits(rec, r, edits)
+            if key == ".claude":
+                self.merge_hooks(rec, kick, rec["dir_hooks"].setdefault(d, {}))
+            self.tools[d] = {"state": "connected", "tool": key, "files": wrote} if wrote else \
+                {"state": "needs-user", "tool": key, "why": NEEDS_USER.get(key, "no rules file found")}
+        finally:
+            self.roots = {}
 
     # -- which tools are here, and which rules file each one gets (loaded ONCE per tool)
     def created_files(self, rec):
         """Files our own connect created: never taken as proof that a tool is installed."""
         mine = {r for r, b in rec["blocks"].items() if b.get("created")}
         mine |= {r for r, a in rec["access"].items() if a.get("created")}
-        for store in ("timer", "watch", "pointer", "skills"):
+        for store in ("timer", "watch", "pointer", "skills", "registry"):
             mine |= {r for r, t in rec.get(store, {}).items() if not t.get("previous")}
         return mine
 
     def claude_reaches(self, key, rec, plan):
         """Kilo (no AGENTS.md of its own) and Devin (Claude import on) also load ~/.claude/CLAUDE.md."""
-        r = ".claude/CLAUDE.md"
+        r = self.L(".claude/CLAUDE.md")
         if r not in plan and not (r in rec["blocks"] and find_block(read(self.home / r) or "")):
             return False
         if key == ".config/kilo":
-            own = ".config/kilo/AGENTS.md"
+            own = self.L(".config/kilo/AGENTS.md")
             return not ((self.home / own).is_file() and not rec["blocks"].get(own, {}).get("created"))
         if key == ".config/devin":
             return self.devin_reads_claude()
@@ -4445,7 +4730,7 @@ class Connector:
 
     def devin_reads_claude(self):
         try:
-            cfg = jsonc_load(read(self.home / ".config/devin/config.json") or "{}")["v"]
+            cfg = jsonc_load(read(self.home / self.L(".config/devin/config.json")) or "{}")["v"]
         except JsoncError:
             return True
         rc = cfg.get("read_config_from") if isinstance(cfg, dict) else None
@@ -4477,7 +4762,7 @@ class Connector:
                 drop |= set(own)
                 continue
             if t.get("via") == "claude" and self.claude_reaches(key, rec, plan):
-                via[key] = ".claude/CLAUDE.md"
+                via[key] = self.L(".claude/CLAUDE.md")
                 drop |= set(own)
                 continue
             cands = [(r, how) for pat, how in t["rules"] for r in self.rules_files(pat) if not skip(r)]
@@ -4508,7 +4793,7 @@ class Connector:
                     (self.home / d).rmdir()
         else:
             write(self.home / r, new)
-        self.log.append(f"~/{r}: base block removed (the tool gets it from another file now, loaded once)")
+        self.log.append(f"{tool_tilde(r)}: base block removed (the tool gets it from another file now, loaded once)")
 
     def check_caps(self, plan):
         for r, p in plan.items():
@@ -4522,7 +4807,7 @@ class Connector:
                 n = len(t.encode()) if cap[1] == "bytes" else len(t)
                 over = n > cap[0]
                 if over or (k == ".codex" and n > cap[0] // 2):
-                    msg = (f"~/{r} is {n} {cap[1]}: {cap[2]}" + (", so its end (the base block) may not load: "
+                    msg = (f"{tool_tilde(r)} is {n} {cap[1]}: {cap[2]}" + (", so its end (the base block) may not load: "
                            "shorten your own text there" if over else "; less than half is left for project "
                            "AGENTS.md files"))
                     self.log.append("WARNING " + msg)
@@ -4534,7 +4819,12 @@ class Connector:
         srv = {"command": "python3", "args": mcp_args(self.base)}
 
         def add(r, kind, **e):
-            out.append((r, {"kind": kind, "tool": key, **e}))
+            out.append((self.L(r), {"kind": kind, "tool": key, **e}))
+
+        class _H:                                         # h / ".codex/config.toml": the tool's real file
+            def __truediv__(_, r):
+                return self.home / self.L(r)
+        h = _H()
 
         def mcp_set(r, path, value):
             if mcp:
@@ -4636,7 +4926,7 @@ class Connector:
     def grok_profile(self):
         import tomllib
         try:
-            cfg = tomllib.loads(read(self.home / ".grok/config.toml") or "")
+            cfg = tomllib.loads(read(self.home / self.L(".grok/config.toml")) or "")
         except tomllib.TOMLDecodeError:
             return None
         p = (cfg.get("sandbox") or {}).get("profile") if isinstance(cfg.get("sandbox"), dict) else None
@@ -4647,7 +4937,7 @@ class Connector:
         if ".claude" not in found:
             return False
         try:
-            cfg = tomllib.loads(read(self.home / ".grok/config.toml") or "")
+            cfg = tomllib.loads(read(self.home / self.L(".grok/config.toml")) or "")
         except tomllib.TOMLDecodeError:
             return True
         c = (cfg.get("compat") or {}).get("claude") if isinstance(cfg.get("compat"), dict) else None
@@ -4670,13 +4960,13 @@ class Connector:
         """opencode v2: `permissions` (ordered list) and `mcp.servers`; v1: `permission` (object) and `mcp`.
         The file says which one it is; else `opencode --version`. v2 lets agents out by default."""
         h, b = self.home, str(self.base)
-        r = ".config/opencode/opencode.jsonc" if (h / ".config/opencode/opencode.jsonc").is_file() and \
-            not (h / ".config/opencode/opencode.json").is_file() else ".config/opencode/opencode.json"
-        text = read(h / r)
+        r = ".config/opencode/opencode.jsonc" if (h / self.L(".config/opencode/opencode.jsonc")).is_file() and \
+            not (h / self.L(".config/opencode/opencode.json")).is_file() else ".config/opencode/opencode.json"
+        text = read(h / self.L(r))
         try:
             data = jsonc_load(text)["v"] if text and text.strip() else {}
         except JsoncError:
-            self.need(".config/opencode", f"opencode: ~/{r} is not valid JSON: add the base by hand")
+            self.need(".config/opencode", f"opencode: {tool_tilde(r)} is not valid JSON: add the base by hand")
             return
         if not isinstance(data, dict):
             return
@@ -4725,13 +5015,13 @@ class Connector:
                 except tomllib.TOMLDecodeError:
                     prof = None
                 if prof:
-                    self.need(e["tool"], f"{name}: ~/{r} uses the permission profile {prof!r} (writable_roots is "
+                    self.need(e["tool"], f"{name}: {tool_tilde(r)} uses the permission profile {prof!r} (writable_roots is "
                                          f"then ignored): add {json.dumps(str(self.base))} = \"write\" to its "
                                          "[permissions.NAME.filesystem]")
                     continue
             t2, undo, note = edit_apply(new, e)
             if note:
-                self.need(e["tool"], f"{name}: ~/{r} {note}")
+                self.need(e["tool"], f"{name}: {tool_tilde(r)} {note}")
                 continue
             if t2 is None:
                 continue
@@ -4754,7 +5044,7 @@ class Connector:
             for n in sorted({TOOLS[x["tool"]]["name"] for x in done if x["kind"] == kind}):
                 where = ", ".join(dict.fromkeys(self.setting(x) for x in done if x["kind"] == kind
                                                 and TOOLS[x["tool"]]["name"] == n))
-                self.log.append(f"{n}: {what} (~/{r}: {where})")
+                self.log.append(f"{n}: {what} ({tool_tilde(r)}: {where})")
 
     @staticmethod
     def setting(e):
@@ -4773,27 +5063,27 @@ class Connector:
             return
         if a.get("exact") and sha(cur) == a.get("sha"):
             if a.get("previous"):
-                shutil.copy2(self.base / a["previous"], p); self.log.append(f"restored ~/{r}")
+                shutil.copy2(self.base / a["previous"], p); self.log.append(f"restored {tool_tilde(r)}")
             else:
-                p.unlink(); self.log.append(f"removed ~/{r}")
+                p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
             return
         new = cur
         for e in reversed(a.get("edits", [])):
             t2 = edit_undo(new, e)
             if t2 is None:
-                self.log.append(f"~/{r}: remove our {e['kind']} entry by hand (it changed in a way we do not edit)")
+                self.log.append(f"{tool_tilde(r)}: remove our {e['kind']} entry by hand (it changed in a way we do not edit)")
             else:
                 new = t2
         if "kind" in a:                                   # recorded by connect 1.3.5
             t2 = self.legacy_undo(new, a)
             if t2 is None:
-                self.log.append(f"~/{r}: remove {self.base} from it by hand (it changed in a way we do not edit)")
+                self.log.append(f"{tool_tilde(r)}: remove {self.base} from it by hand (it changed in a way we do not edit)")
             else:
                 new = t2
         if a.get("created") and new.strip() in ("", "{}"):
-            p.unlink(); self.log.append(f"removed ~/{r}")
+            p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
         elif new != cur:
-            write(p, new); self.log.append(f"removed our entries from ~/{r}")
+            write(p, new); self.log.append(f"removed our entries from {tool_tilde(r)}")
 
     def legacy_undo(self, cur, a):
         u, b = a.get("undo") or {}, str(self.base)
@@ -4854,10 +5144,10 @@ class Connector:
         for r, text in self.skill_texts().items():
             cur, t = read(self.home / r), store.get(r)
             if t is None and cur is not None and cur != text:
-                self.log.append(f"kept your ~/{r} (not ours; the base's copy was not installed)")
+                self.log.append(f"kept your {tool_tilde(r)} (not ours; the base's copy was not installed)")
                 continue
             if t is not None and cur is not None and sha(cur) != t.get("sha"):
-                self.log.append(f"kept ~/{r} (changed since connect)")
+                self.log.append(f"kept {tool_tilde(r)} (changed since connect)")
                 continue
             if t is None:
                 t = {"previous": self.backup(r), "dirs": self.missing_dirs(r)}
@@ -4899,12 +5189,12 @@ class Connector:
             t["sha"] = sha(text)
             store[r] = t
 
-    def merge_hooks(self, rec, kick=False):
-        r = ".claude/settings.json"
+    def merge_hooks(self, rec, kick=False, h=None):
+        r = self.L(".claude/settings.json")
         p = self.home / r
-        data = load_json(p, "~/" + r)
+        data = load_json(p, tool_tilde(r))
         cmd = collect_cmd(self.base)
-        h = rec["hooks"]
+        h = rec["hooks"] if h is None else h
         if not h:
             h.update({"file": r, "command": cmd, "created": not p.exists(), "previous": self.backup(r),
                       "had_hooks_key": "hooks" in data, "events": [], "exact": True})
@@ -5035,7 +5325,7 @@ class Connector:
                             + "\n  ".join((r.stdout + r.stderr).strip().splitlines()[-6:]))
         return True
 
-    def frugal_take_over(self, new_files=()):
+    def frugal_take_over(self, new_files=(), new_dirs=()):
         user = frugal_home(self.home) / "USER.md"
         if user.is_file():
             self.frugal_import(user)
@@ -5044,6 +5334,10 @@ class Connector:
             return                                   # not installed for this user
         if same_dir(reg.get("base"), self.base):     # already on this base: only tools connected just now
             self.frugal_new_tools(reg, new_files)
+            if new_dirs:                             # one more dir of a tool: its re-run reads the shared registry
+                if self.run_frugal(reg):
+                    self.log.append("Frugal-Bridge: re-run for the new dir(s) " + ", ".join(new_dirs))
+                    self.hooks_settled()
             return
         self.run_frugal(reg)
         if not frugal_points_here(self.base, self.home):
@@ -5061,10 +5355,11 @@ class Connector:
 
     def hooks_settled(self):
         k = self.kits()                              # its re-run may have re-ordered its own hooks: that is the
-        h = k["kits"]["base-folder"].get("connect", {}).get("hooks")   # state disconnect gives back
-        if h and h.get("exact"):
-            h["sha"] = sha(read(self.home / h["file"]) or "")
-            self.save_kits(k)
+        c = k["kits"]["base-folder"].get("connect", {})                 # state disconnect gives back
+        for h in [c.get("hooks")] + list((c.get("dir_hooks") or {}).values()):
+            if h and h.get("exact"):
+                h["sha"] = sha(read(self.home / h["file"]) or "")
+        self.save_kits(k)
 
     def frugal_new_tools(self, reg, new_files):
         """A tool connected just now (installed after Frugal-Bridge) gets Frugal's block too, after ours: its own
@@ -5074,7 +5369,7 @@ class Connector:
         have = set(reg.get("tools") or {})
         hosts = []
         for r in new_files:
-            host = FRUGAL_HOSTS.get(r)
+            host = FRUGAL_HOSTS.get(tool_virtual(r, self.home))
             if not host or host in have or host in hosts:
                 continue
             if kit and not re.search(rf'^\s*"{re.escape(host)}"\s*:', kit_text, re.M):
@@ -5255,28 +5550,32 @@ class Connector:
             else:
                 new, _ = Installer.strip_block(t, b.get("mode", "append"))
             if b.get("created") and not new:
-                (self.home / r).unlink(); self.log.append(f"removed ~/{r}")
+                (self.home / r).unlink(); self.log.append(f"removed {tool_tilde(r)}")
             elif new != t:
-                write(self.home / r, new); self.log.append(f"restored ~/{r}")
+                write(self.home / r, new); self.log.append(f"restored {tool_tilde(r)}")
         h = rec.get("hooks")
         if h:
             self.unmerge_hooks(h)
+        for h in rec.get("dir_hooks", {}).values():
+            if h:
+                self.unmerge_hooks(h)
         for r, a in reversed(list(rec.get("access", {}).items())):
             self.undo_file(r, a)
             dirs |= set(a.get("dirs", []))
         # everything Frugal-Bridge could find this base from goes first (blocks, units, pointer file), then it is
         # re-run (frugal_give_back below), so it really goes back to its own user file
         for r, t in (list(rec.get("timer", {}).items()) + list(rec.get("watch", {}).items())
-                     + list(rec.get("pointer", {}).items()) + list(rec.get("skills", {}).items())):
+                     + list(rec.get("pointer", {}).items()) + list(rec.get("skills", {}).items())
+                     + list(rec.get("registry", {}).items())):
             p = self.home / r
             dirs |= set(t.get("dirs", []))
             if p.is_file() and sha(p.read_bytes()) == t.get("sha"):
                 if t.get("previous"):
-                    shutil.copy2(self.base / t["previous"], p); self.log.append(f"restored ~/{r}")
+                    shutil.copy2(self.base / t["previous"], p); self.log.append(f"restored {tool_tilde(r)}")
                 else:
-                    p.unlink(); self.log.append(f"removed ~/{r}")
+                    p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
             elif p.exists():
-                self.log.append(f"kept ~/{r} (changed since connect)")
+                self.log.append(f"kept {tool_tilde(r)} (changed since connect)")
         for d in sorted(dirs, key=lambda x: -x.count("/")):
             d = self.home / d
             if d.is_dir() and not any(d.iterdir()):
@@ -5297,12 +5596,12 @@ class Connector:
             return
         if h.get("exact") and sha(cur) == h.get("sha"):       # untouched since connect: give back the exact old bytes
             if h.get("previous"):
-                shutil.copy2(self.base / h["previous"], p); self.log.append(f"restored ~/{r}")
+                shutil.copy2(self.base / h["previous"], p); self.log.append(f"restored {tool_tilde(r)}")
             else:
-                p.unlink(); self.log.append(f"removed ~/{r}")
+                p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
             return
         ours = {h["command"], h.get("kick")} - {None}
-        data = load_json(p, "~/" + r)      # changed since: remove only our entries, keep the rest
+        data = load_json(p, tool_tilde(r))      # changed since: remove only our entries, keep the rest
         hooks = data.get("hooks")
         if isinstance(hooks, dict):
             for ev in h.get("events", []):
@@ -5321,9 +5620,9 @@ class Connector:
                 data.pop("hooks")
         self.unmerge_access(data, h)
         if not data and h.get("created"):
-            p.unlink(); self.log.append(f"removed ~/{r}")
+            p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
         else:
-            write(p, dump_json(data)); self.log.append(f"removed our hooks and base folder entry from ~/{r}")
+            write(p, dump_json(data)); self.log.append(f"removed our hooks and base folder entry from {tool_tilde(r)}")
 
 
 # ---------------------------------------------------------------- watch (instant collect, zero-touch connect)
@@ -5548,7 +5847,28 @@ def autoconnect(base):
 # -- locations
 def watch_locations(base, home=None):
     home = pathlib.Path(home or home_dir())
-    locs = [dict(source=s, root=os.path.join(str(home), r), match=list(m), depth=d) for s, r, m, d in WATCH_BUILTIN]
+    locs = [dict(source=s, root=os.path.join(str(home), tool_path(r, home)), match=list(m), depth=d)
+            for s, r, m, d in WATCH_BUILTIN]
+    for key, d, extra in tool_instances(home, base):         # every extra dir of a tool (registry, --tool-dir)
+        if extra:
+            locs += [dict(source=s, root=os.path.join(str(home), tool_path(r, home, {key: d})), match=list(m),
+                          depth=dd) for s, r, m, dd in WATCH_BUILTIN if r == key or r.startswith(key + "/")]
+    for reg in TOOL_DIRS_REG:                                 # a new registry file: connect wires that dir
+        locs.append(dict(source="tools", root=str(home / reg), match=["*.json"], depth=0))
+    try:
+        mirrors = mirror_sources(base, home)
+    except SystemExit:
+        mirrors = []
+    for name, src, keep in mirrors:                           # a mirrored tool's files: refresh its copy
+        if src.is_file():
+            locs.append(dict(source="mirror", root=str(src.parent), match=[src.name], depth=0))
+        else:
+            pats = [g if not g.endswith("/**") else g[:-3] + "/*" * (i + 1) for g in (keep or ["**"])
+                    for i in range(4 if g.endswith("/**") else 1)]
+            locs.append(dict(source="mirror", root=str(src), match=pats if keep else ["*", "*/*", "*/*/*", "*/*/*/*"],
+                             depth=4))
+    sd = pathlib.Path(os.environ.get("MY_SETUP_SOURCES_DIR") or (home / SOURCES_D)).expanduser()
+    locs.append(dict(source="mirror", root=str(sd), match=["*.json"], depth=0))
     for e in watch_cfg(base).get("extra", []):
         if not isinstance(e, dict) or not e.get("root"):
             continue
@@ -5852,6 +6172,12 @@ def watch_once(base, commit=True, connect=True):
                 out["connect"] = lg
         except (SystemExit, Exception) as e:              # never let auto-connect block the collect
             out["error"] = f"auto-connect: {e}"
+    try:                                                  # tools without a dir setting: their copy in engines/
+        mirrored = mirror_sync(base)
+        if mirrored:
+            out["mirror"] = mirrored
+    except (SystemExit, Exception) as e:
+        mirrored, out["error"] = [], f"mirror: {e}"
     import io, contextlib
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -5880,15 +6206,17 @@ def watch_once(base, commit=True, connect=True):
             with contextlib.redirect_stdout(io.StringIO()):
                 build_index(base, quiet=True)
                 build_map(base, quiet=True)
-        if (new or out.get("connect") or touched or filed_any) and commit and (base / ".git").exists():
+        if (new or out.get("connect") or touched or filed_any or mirrored) and commit and (base / ".git").exists():
             per = ", ".join(f"{k} {v}" for k, v in sorted(last.get("per_source", {}).items()))
             msg = f"watch: collect {new} new" + (f" ({per})" if per else "") if new else \
-                ("watch: file" if touched else "watch: file (already known)" if filed_any else "watch: auto-connect")
+                ("watch: file" if touched else "watch: file (already known)" if filed_any else
+                 "watch: auto-connect" if out.get("connect") else "watch: mirror " + ", ".join(mirrored))
             if touched:
                 msg += f", filed on {len(touched)} page(s)"
             # the bookkeeping of already-known items (filed.json, manifest) is committed too, or a fresh clone
             # would see those raw files as NEW again
-            out["commit"] = git_commit(base, msg, touched + [FILED, ".brain/manifest.json"] if filed_any else ())
+            out["commit"] = git_commit(base, msg, (touched + [FILED, ".brain/manifest.json"] if filed_any else [])
+                                       + [f"engines/{m}" for m in mirrored])
     finally:
         if wl is not None:
             wl.close()
@@ -5998,10 +6326,13 @@ def watch_discover(base, days=30.0, top=25):
     except OSError:
         tops = []
     tops += [home / ".local" / "share"]
+    inside = [d for _, d, _ in tool_instances(home, base) if d.is_dir() and in_dir(d, base)]   # engines/<tool>
+    tops += inside
     for t in tops:
         for dp, dns, fns in os.walk(t):
             r = os.path.relpath(dp, home)
-            if r.count("/") >= 6 or DISCOVER_SKIP.search(r) or dp == str(base) or dp.startswith(str(base) + "/"):
+            if r.count("/") >= 6 or DISCOVER_SKIP.search(r) or \
+                    (in_dir(dp, base) and not any(in_dir(dp, x) for x in inside)):
                 dns[:] = []; continue
             dns[:] = [d for d in dns if not DISCOVER_SKIP.search(d)]
             for f in fns:
@@ -6026,6 +6357,12 @@ def watch_discover(base, days=30.0, top=25):
               f"{','.join(sorted(d['kinds'])):16} {home_rel(dp, home)}")
     print(f"discover: {n} files scanned in {time.time() - t0:.2f} s, {len(out)} candidate dir(s) not watched yet "
           f"(suggestions only; add one with: brain.py watch --add PATH [--source NAME])")
+    wired = {os.path.normpath(str(x)) for _, x, _ in tool_instances(home, base)}
+    for key, d, where in configured_dirs(home):          # AI tool dirs set up anywhere (units, profiles, registry)
+        if d not in wired:
+            tid = next((i for i, k in TOOL_IDS.items() if k == key), key)
+            print(f"  tool dir {home_rel(d, home)} ({TOOLS.get(key, {}).get('name', key)}, set in {where}) is not "
+                  f"wired: brain.py connect --tool-dir {tid}={d}")
     return 0
 
 
@@ -6184,6 +6521,8 @@ class McpServer:
         parts = pathlib.PurePosixPath(p).parts
         if any(x in ("..", ".") or x.startswith(".") for x in parts):
             raise ToolError("'..' and hidden files or folders are not allowed")
+        if parts and parts[0] in BASE_SKIP:
+            raise ToolError(f"{parts[0]}/ is not served (tool folders, code repos or heavy data)")
         f = (self.base / p).resolve()
         if f != self.base and self.base not in f.parents:
             raise ToolError("that path leaves the base (a link pointing outside): not allowed")
@@ -6453,10 +6792,22 @@ def check_public(target, words_file):
                 words.append((line, word_rx(line)))
     hits, n = [], 0
     skip_dirs = {".git", ".brain", "__pycache__", ".base-folder"}
-    for dirpath, dirnames, filenames in os.walk(target):
+    listed = None
+    if (target / ".git").exists():        # a repo: what git could publish (tracked + not ignored); never walks
+        out = subprocess.run(["git", "-C", str(target), "ls-files", "-co", "--exclude-standard", "-z"],
+                             capture_output=True)                   # ignored tool dirs, code or heavy data
+        if out.returncode == 0:
+            listed = sorted({x for x in out.stdout.decode(errors="replace").split("\0") if x})
+    walk = ((str(target / os.path.dirname(x)), [], [os.path.basename(x)]) for x in listed) if listed is not None \
+        else os.walk(target)
+    for dirpath, dirnames, filenames in walk:
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        if listed is not None and set(pathlib.Path(rel(dirpath, target)).parts) & skip_dirs:
+            continue
         for fn in filenames:
             f = pathlib.Path(dirpath) / fn
+            if listed is not None and not f.is_file():
+                continue
             r = rel(f, target)
             n += 1
             hits += scan_text(f"path {r}", r, words)
@@ -6487,6 +6838,795 @@ def check_public(target, words_file):
     print(f"check-public: {n} files, {len(words)} blocked word(s): {'FAIL' if seen else 'PASS'} ({len(seen)} hit(s))",
           file=sys.stderr)
     return 1 if seen else 0
+
+
+# ---------------------------------------------------------------- layout: engines/, projects/, heavy folders
+# Everything can live in the base: each AI tool's own config dir in engines/<tool>/ (pointed to by the tool's OWN
+# setting), code repos in projects/<slug>/ (own git, ignored by the base's git), heavy material in data/ etc.
+# None of these are walked by the base's own tools (archive, tidy snapshot, check-public of a live base, discover).
+BASE_SKIP = ("engines", "projects", "data", "apps", "runs", "scratch", "backups", "ops")
+ENGINES_REG, PROJECTS_REG, MOVES_LOG = "engines.json", "projects.json", ".brain/moves.json"
+ENGINE_NAMES = {".claude": "claude", ".codex": "codex", ".hermes": "hermes", ".openclaw": "openclaw",
+                ".copilot": "copilot"}
+ADOPT_WARN = {".hermes": "Hermes keeps absolute paths to its home in its launcher and venv (bin/hermes, "
+                         "pyvenv.cfg): it must be re-bootstrapped at the new home; rehearse on a copy first"}
+ENV_START, ENV_END = "# skeleton-base engines:start", "# skeleton-base engines:end"
+ENV_FILES = (".config/environment.d/60-base-engines.conf", ".profile", ".bashrc")   # services, logins, shells
+MIRROR_KEEP = ("*.md", "agents/**", "skills/**", "memories/**", "hooks/**", "scripts/**", "commands/**",
+               "rules/**", "cron/jobs.json")
+SECRET_NAMES = (".credentials*", ".claude.json*", "auth*", ".env", ".env.*", "*token*", "*secret*", "*.pem", "*.key",
+                "*.p12", "vault", "pairing", "mcp-tokens", "sessions", "projects", "*.db", "*.db-*", "*.sqlite*",
+                "cache", "caches", "logs", "*.log", "node_modules", "*.jsonl", "telegram_*", "browser-profile",
+                ".git", "__pycache__", ".venv", "venv", "shell-snapshots", "session-env", "file-history", "todos",
+                "statsig", "history*", "backups", "plugins", "frugal-bridge", "outputs", "state", "runtime")
+MIRROR_MAX = 5 * 1024 * 1024
+SOURCES_D = ".config/my-setup/sources.d"          # older mirror registrations: {"name", "sources": [{src, dest}]}
+SECRET_TEXT = re.compile(
+    r"(?<![A-Za-z0-9_-])(sk-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}"
+    r"|AIza[0-9A-Za-z_-]{30,}|xox[abp]-[A-Za-z0-9-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|\b\d{8,10}:AA[A-Za-z0-9_-]{30,})")
+ALLOWED_OUTSIDE = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos", "Public", "Templates", "snap",
+                   ".cache", ".local", ".config", ".ssh", ".gnupg", ".nvm", ".cargo", ".rustup", ".npm", ".pki",
+                   ".mozilla", ".pyenv", ".dotnet", ".vscode-server", "go", ".git", ".agents", ".agent",
+                   BACKUPS_DIR)
+GIT_PROBES = (("engines/x/.credentials.json", True), ("engines/x/.claude.json", True), ("engines/x/auth.json", True),
+              ("engines/x/.env", True), ("engines/x/sessions/a.jsonl", True), ("engines/x/projects/k/a.jsonl", True),
+              ("engines/x/state.db", True), ("engines/x/cache/a.md", True), ("engines/x/api_token.txt", True),
+              ("engines/x/settings.json", True), ("engines/x/config.toml", True), ("projects/x/main.py", True),
+              ("data/x.bin", True), ("engines/x/CLAUDE.md", False), ("engines/x/skills/s/SKILL.md", False),
+              ("engines/x/memories/MEMORY.md", False))
+
+
+def looks_secret(text):
+    for m in SECRET_TEXT.finditer(text):
+        v = m.group(0)
+        if "PRIVATE KEY" in v or sum(c.isdigit() for c in v) >= 3:      # placeholders have no digits
+            return True
+    return False
+
+
+def secret_name(r):
+    return any(fnmatch.fnmatchcase(part, g) for part in r.split("/") for g in SECRET_NAMES)
+
+
+def keep_match(r, pat):
+    if pat.endswith("/**"):
+        return r.startswith(pat[:-2])
+    if "/" not in pat:
+        return "/" not in r and fnmatch.fnmatchcase(r, pat)
+    return fnmatch.fnmatchcase(r, pat)
+
+
+def in_dir(p, d):
+    p, d = os.path.realpath(str(p)), os.path.realpath(str(d))
+    return p == d or p.startswith(d + "/")
+
+
+def reg_load(base, name):
+    try:
+        data = json.loads(read(pathlib.Path(base) / name) or "{}")
+    except ValueError:
+        raise SystemExit(f"{name}: not valid JSON; fix it by hand first")
+    return data if isinstance(data, dict) else {}
+
+
+def reg_save(base, name, data):
+    atomic_write(pathlib.Path(base) / name, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def procs_using(path):
+    """[(pid, command)] of processes with their working folder or an open file below PATH (Linux /proc; elsewhere
+    nothing is found, so the caller says it could not check)."""
+    path, me, out = os.path.realpath(str(path)), os.getpid(), []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit() and int(p) != me]
+    except OSError:
+        return out
+    for pid in pids:
+        links = []
+        try:
+            links.append(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            pass
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    links.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        if any(l and (l == path or l.startswith(path + "/")) for l in links):
+            try:
+                cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                cmd = "?"
+            out.append((int(pid), cmd.strip()[:120]))
+    return out
+
+
+# -- engines: adopt (move + the tool's own setting), release (exact reverse), mirror (tools without a setting)
+def engine_var(key):
+    return next((v for v, how in TOOL_HOMES.get(key, ()) if how == "dir"), None)
+
+
+def env_lines(base, reg):
+    return {name: (e["env"], str(pathlib.Path(base) / "engines" / name)) for name, e in
+            sorted(reg.get("engines", {}).items()) if e.get("mode") == "adopted" and e.get("env")}
+
+
+def env_block(path, vals):
+    if path.endswith(".conf"):                        # systemd environment.d: plain VAR=value
+        body = "\n".join(f"{var}={val}" for var, val in vals.values())
+    else:
+        body = "\n".join(f"export {var}={shq(val)}" for var, val in vals.values())
+    return f"{ENV_START}\n# each tool's own setting points to its folder in the base (brain.py engine adopt)\n" \
+           f"{body}\n{ENV_END}"
+
+
+ENV_STORE = ".brain/backups/engines-env.json"      # local only (ignored): the old bytes of your shell files
+
+
+def write_env_files(base, reg, home, log):
+    """One marked block per file (environment.d for user services, .profile for logins, .bashrc for shells) with
+    every adopted tool's variable; the old bytes come back exactly when the last tool is released (kept in
+    .brain/backups/, never in the tracked engines.json)."""
+    vals = env_lines(base, reg)
+    store = reg_load(base, ENV_STORE)
+    blk = re.compile(re.escape(ENV_START) + r".*?" + re.escape(ENV_END) + r"\n?", re.S)
+    for r in ENV_FILES:
+        p = pathlib.Path(home) / r
+        cur = read(p)
+        rec = store.get(r)
+        if not vals:
+            if rec is None or cur is None:
+                continue
+            if sha(cur) == rec.get("sha"):
+                if rec.get("previous") is None:
+                    p.unlink(); log.append(f"removed ~/{r}")
+                    for d in rec.get("dirs", []):
+                        if (pathlib.Path(home) / d).is_dir() and not any((pathlib.Path(home) / d).iterdir()):
+                            (pathlib.Path(home) / d).rmdir()
+                else:
+                    write(p, rec["previous"]); log.append(f"restored ~/{r}")
+            else:
+                write(p, blk.sub("", cur)); log.append(f"removed the engines block from ~/{r}")
+            store.pop(r)
+            continue
+        block = env_block(r, vals) + "\n"
+        if rec is None:
+            made, d = [], p.parent
+            while not d.exists():
+                made.append(path_key(d, home)); d = d.parent
+            rec = {"previous": cur, "dirs": made}
+        if cur and blk.search(cur):
+            new = blk.sub(lambda m: block, cur, count=1)
+        elif cur:
+            new = cur + ("" if cur.endswith("\n") else "\n") + "\n" + block
+        else:
+            new = block
+        if new != cur:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write(p, new); log.append(f"wrote ~/{r} (engines block)")
+        rec["sha"] = sha(new)
+        store[r] = rec
+    if store:
+        reg_save(base, ENV_STORE, store)
+    elif (pathlib.Path(base) / ENV_STORE).is_file():
+        (pathlib.Path(base) / ENV_STORE).unlink()
+
+
+def rekey(obj, pairs):
+    """Rename recorded paths (connect's records) after a tool dir moved: keys and string values."""
+    def one(v):
+        for old, new in pairs:
+            if v == old or v.startswith(old + "/"):
+                return new + v[len(old):]
+        return v
+    if isinstance(obj, dict):
+        return {one(k) if isinstance(k, str) else k: rekey(v, pairs) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [rekey(v, pairs) for v in obj]
+    return one(obj) if isinstance(obj, str) else obj
+
+
+def rekey_connect(base, pairs):
+    p = pathlib.Path(base) / ".kits.json"
+    k = load_json(p, ".kits.json")
+    me = k.get("kits", {}).get("base-folder", {})
+    if not me.get("connect"):
+        return False
+    c = me["connect"]
+    for store in ("blocks", "access", "hooks", "dir_hooks", "dirs"):
+        if store in c:
+            c[store] = rekey(c[store], pairs)
+    write(p, dump_json(k))
+    return True
+
+
+def reconnect(base, log):
+    if is_connected(base):
+        c = Connector(base)
+        log += c.connect()
+    return log
+
+
+def engine_adopt(base, tool, force=False):
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    key = tool_key_of(tool)
+    var = engine_var(key) if key else None
+    if not var:
+        names = ", ".join(sorted(k for k, v in TOOL_IDS.items() if engine_var(v)))
+        raise SystemExit(f"engine adopt: {tool} has no setting that moves its folder ({names} have one): "
+                         f"use `engine mirror {tool}`")
+    name = ENGINE_NAMES.get(key, key.strip(".").replace("/", "-"))
+    dest = base / "engines" / name
+    src, set_by = tool_root(key, home)
+    reg = reg_load(base, ENGINES_REG)
+    if set_by and in_dir(src, dest):
+        return [f"{tool}: already in the base ({dest}, {var})"]
+    if dest.exists() and any(dest.iterdir()):
+        raise SystemExit(f"engine adopt: {dest} exists and is not empty")
+    if key in ADOPT_WARN and not force:
+        raise SystemExit(f"engine adopt: {ADOPT_WARN[key]}. Stop it, back it up, then run again with --force")
+    moved = []
+    if src.is_dir():
+        busy = procs_using(src)
+        if busy and not force:
+            raise SystemExit("engine adopt: these programs use " + str(src) + " now (stop them first):\n" +
+                             "\n".join(f"  {pid} {cmd}" for pid, cmd in busy[:10]))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.rmdir()
+        try:
+            os.rename(src, dest)
+        except OSError as e:
+            raise SystemExit(f"engine adopt: could not move {src} -> {dest} ({e}); a different disk needs a copy "
+                             "with the tool stopped: do it by hand, then run again")
+        log.append(f"moved {home_rel(src, home)} -> {dest}")
+        for f, k in TOOL_FILES.items():               # Claude Code: ~/.claude.json lives INSIDE a moved dir
+            if k == key and not set_by and (home / f).is_file() and not (dest / f).exists():
+                os.rename(home / f, dest / f); moved.append(f); log.append(f"moved ~/{f} -> {dest / f}")
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+        log.append(f"{dest}: new, empty (the tool fills it on its first run)")
+    pairs = [(path_key(src, home), path_key(dest, home)), (str(src), path_key(dest, home))]
+    pairs += [(f, path_key(dest / f, home)) for f in moved]
+    reg.setdefault("engines", {})[name] = {"tool": next((i for i, k in TOOL_IDS.items() if k == key), key),
+                                           "mode": "adopted", "env": var, "from": home_rel(src, home),
+                                           "moved": moved, "since": today()}
+    write_env_files(base, reg, home, log)
+    reg_save(base, ENGINES_REG, reg)
+    os.environ[var] = str(dest)
+    if rekey_connect(base, pairs):
+        reconnect(base, log)
+    log.append(f"{var}={dest}: new shells and logins get it; user services after `systemctl --user daemon-reload` "
+               "and a restart of each service; running sessions still use the old path: restart them")
+    return log
+
+
+def engine_release(base, tool, force=False):
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    reg = reg_load(base, ENGINES_REG)
+    key = tool_key_of(tool)
+    name = ENGINE_NAMES.get(key, tool) if key else tool
+    e = reg.get("engines", {}).get(name)
+    if not e or e.get("mode") != "adopted":
+        raise SystemExit(f"engine release: {tool} was not adopted into this base")
+    dest, back = base / "engines" / name, pathlib.Path(expand(e["from"], home))
+    if back.exists():
+        raise SystemExit(f"engine release: {back} exists again (a launcher without {e['env']} made a fresh one?): "
+                         "move it away first")
+    busy = procs_using(dest) if dest.is_dir() else []
+    if busy and not force:
+        raise SystemExit("engine release: these programs use " + str(dest) + " now (stop them first):\n" +
+                         "\n".join(f"  {pid} {cmd}" for pid, cmd in busy[:10]))
+    back.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(dest, back)
+    log.append(f"moved {dest} -> {home_rel(back, home)}")
+    for f in e.get("moved", []):
+        if (back / f).is_file() and not (home / f).exists():
+            os.rename(back / f, home / f); log.append(f"moved {back / f} -> ~/{f}")
+    pairs = [(path_key(dest / f, home), f) for f in e.get("moved", [])] + [(path_key(dest, home),
+                                                                             path_key(back, home))]
+    reg["engines"].pop(name)
+    if not reg["engines"]:
+        reg.pop("engines")
+    write_env_files(base, reg, home, log)
+    if reg:
+        reg_save(base, ENGINES_REG, reg)
+    elif (base / ENGINES_REG).is_file():
+        (base / ENGINES_REG).unlink()
+    if os.environ.get(e["env"]) and in_dir(os.environ[e["env"]], dest):
+        os.environ.pop(e["env"])
+    if rekey_connect(base, pairs):
+        reconnect(base, log)
+    log.append(f"unset {e['env']} in running shells (`unset {e['env']}`) and restart sessions and services")
+    return log
+
+
+def mirror_sources(base, home):
+    """[(mirror name, source path, keep globs or None = whole folder)]: engines.json mirrors plus the older
+    my-setup sources.d registrations ($MY_SETUP_SOURCES_DIR or ~/.config/my-setup/sources.d/*.json)."""
+    out = []
+    for name, e in sorted(reg_load(base, ENGINES_REG).get("engines", {}).items()):
+        if e.get("mode") == "mirror" and e.get("src"):
+            out.append((name, pathlib.Path(expand(e["src"], home)), e.get("keep") or list(MIRROR_KEEP)))
+    d = pathlib.Path(os.environ.get("MY_SETUP_SOURCES_DIR") or (pathlib.Path(home) / SOURCES_D)).expanduser()
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            entries = json.loads(f.read_text(encoding="utf-8")).get("sources") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        for x in entries:
+            src, dest = (x or {}).get("src"), (x or {}).get("dest")
+            parts = pathlib.PurePosixPath(dest).parts if isinstance(dest, str) else ()
+            if isinstance(src, str) and parts and not pathlib.PurePosixPath(dest).is_absolute() and ".." not in parts:
+                out.append(("/".join(parts), pathlib.Path(expand(src, home)), None))
+    return out
+
+
+def mirror_files(src, keep):
+    """{relative path: file} to copy: keep globs (None = all), never secret names, links or big files."""
+    if src.is_file():
+        return {} if secret_name(src.name) else {src.name: src}
+    out = {}
+    for dp, dns, fns in os.walk(src):
+        r0 = os.path.relpath(dp, src)
+        r0 = "" if r0 == "." else r0 + "/"
+        dns[:] = sorted(d for d in dns if not secret_name(d) and not os.path.islink(os.path.join(dp, d)))
+        for f in sorted(fns):
+            r, p = r0 + f, pathlib.Path(dp) / f
+            if secret_name(r) or p.is_symlink() or (keep and not any(keep_match(r, g) for g in keep)):
+                continue
+            try:
+                if p.stat().st_size > MIRROR_MAX:
+                    continue
+            except OSError:
+                continue
+            out[r] = p
+    return out
+
+
+def mirror_sync(base, home=None, quiet=True):
+    """Bring every mirror up to date (copy changed files, drop removed ones, leave out secret-looking text).
+    Returns the names of the mirrors that changed."""
+    base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
+    changed = []
+    for name, src, keep in mirror_sources(base, home):
+        dst = base / "engines" / name
+        if in_dir(src, base):
+            continue                                    # never mirror the base into itself
+        want = mirror_files(src, keep) if src.exists() else {}
+        n, skipped = 0, []
+        dst.mkdir(parents=True, exist_ok=True)
+        marker = (f"MIRROR: read-only copy kept by `brain.py watch` (engine mirror).\nsource: {home_rel(src, home)}\n"
+                  "Edit the original, never this copy: changes here are overwritten.\n")
+        if read(dst / "MIRROR") != marker:
+            write(dst / "MIRROR", marker); n += 1
+        for r, p in want.items():
+            try:
+                data = p.read_bytes()
+            except OSError:
+                continue
+            if b"\0" not in data[:4096] and looks_secret(data.decode("utf-8", errors="replace")):
+                skipped.append(r)
+                continue
+            t = dst / r
+            if t.is_file() and t.read_bytes() == data:
+                continue
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.write_bytes(data); n += 1
+        keep_names = set(want) - set(skipped) | {"MIRROR", "SKIPPED.md"}
+        for dp, dns, fns in os.walk(dst, topdown=False):
+            for f in fns:
+                r = os.path.relpath(os.path.join(dp, f), dst)
+                if r not in keep_names:
+                    os.unlink(os.path.join(dp, f)); n += 1
+            if dp != str(dst) and not os.listdir(dp):
+                os.rmdir(dp)
+        sk = "# Left out because they look like they hold a secret\n\n" + \
+             ("".join(f"- {s}\n" for s in sorted(skipped)) or "- none\n")
+        if read(dst / "SKIPPED.md") != sk:
+            write(dst / "SKIPPED.md", sk); n += 1
+        if n:
+            changed.append(name)
+            if not quiet:
+                print(f"mirror {name}: {n} change(s) from {home_rel(src, home)}")
+    return changed
+
+
+def engine_mirror(base, tool, name=None, keep=None):
+    base, home = pathlib.Path(base).resolve(), home_dir()
+    key = tool_key_of(tool)
+    if key:
+        src = tool_root(key, home)[0]
+        name = name or ENGINE_NAMES.get(key, key.split("/")[-1].strip("."))
+    else:
+        src = pathlib.Path(os.path.abspath(os.path.expanduser(tool)))
+        name = name or src.name.strip(".") or "tool"
+    if not src.exists():
+        raise SystemExit(f"engine mirror: {src} does not exist")
+    if in_dir(src, base):
+        raise SystemExit(f"engine mirror: {src} is inside the base already")
+    reg = reg_load(base, ENGINES_REG)
+    e = reg.setdefault("engines", {}).get(name)
+    if e and e.get("mode") != "mirror":
+        raise SystemExit(f"engine mirror: engines/{name} is {e.get('mode')}, not a mirror")
+    reg["engines"][name] = {"mode": "mirror", "src": home_rel(src, home), "since": (e or {}).get("since") or today(),
+                            **({"keep": list(keep)} if keep else {}),
+                            **({"tool": next((i for i, k in TOOL_IDS.items() if k == key), key)} if key else {})}
+    reg_save(base, ENGINES_REG, reg)
+    mirror_sync(base, home, quiet=False)
+    return [f"engines/{name}: mirror of {home_rel(src, home)} (kept current by brain.py watch; edit the original)"]
+
+
+def engine_unmirror(base, name):
+    reg = reg_load(base, ENGINES_REG)
+    e = reg.get("engines", {}).get(name)
+    if not e or e.get("mode") != "mirror":
+        raise SystemExit(f"engine unmirror: engines/{name} is not a mirror")
+    reg["engines"].pop(name)
+    reg_save(base, ENGINES_REG, reg)
+    shutil.rmtree(pathlib.Path(base) / "engines" / name, ignore_errors=True)
+    return [f"engines/{name}: mirror removed (the original is untouched)"]
+
+
+def engine_list(base):
+    home = home_dir()
+    rows = []
+    for key, d, extra in tool_instances(home, base):
+        var = tool_root(key, home)[1]
+        if d.exists() or var or extra:
+            where = "in the base" if in_dir(d, base) else "outside the base"
+            rows.append(f"{TOOLS.get(key, {}).get('name', key)}: {home_rel(d, home)} ({where}"
+                        f"{', ' + var if var and not extra else ''}{', extra dir' if extra else ''})")
+    for name, src, keep in mirror_sources(base, home):
+        rows.append(f"mirror engines/{name} <- {home_rel(src, home)}")
+    return rows or ["no AI tool folders found"]
+
+
+# -- projects: one repo per folder, registry for a new machine, safe moves with undo
+def git_out(*args, cwd=None):
+    r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def worktrees_of(repo):
+    """Linked worktrees (not the main one) of the repo at REPO: [(path, branch or None)]."""
+    out, cur = [], {}
+    txt = git_out("-C", str(repo), "worktree", "list", "--porcelain") or ""
+    for line in txt.splitlines() + [""]:
+        if not line:
+            if cur.get("worktree"):
+                out.append((cur["worktree"], cur.get("branch", "").removeprefix("refs/heads/") or None))
+            cur = {}
+        else:
+            k, _, v = line.partition(" ")
+            cur[k] = v
+    return out[1:]
+
+
+def project_info(repo):
+    return {"remote": git_out("-C", str(repo), "remote", "get-url", "origin"),
+            "branch": git_out("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"),
+            "worktrees": [{"name": pathlib.Path(p).name, "branch": b} for p, b in worktrees_of(repo)]}
+
+
+def projects_scan(base):
+    base = pathlib.Path(base).resolve()
+    reg = reg_load(base, PROJECTS_REG)
+    ps = reg.setdefault("projects", {})
+    for d in sorted((base / "projects").iterdir()) if (base / "projects").is_dir() else []:
+        if d.is_dir() and not d.name.startswith(".") and (d / ".git").exists():
+            ps[d.name] = project_info(d)
+    reg_save(base, PROJECTS_REG, reg)
+    return [f"{s}: {p.get('remote') or 'local only (no remote)'} [{p.get('branch')}]"
+            + (f", {len(p['worktrees'])} worktree(s)" if p.get("worktrees") else "") for s, p in sorted(ps.items())]
+
+
+def projects_clone(base, dry_run=False):
+    base, log = pathlib.Path(base).resolve(), []
+    for slug, p in sorted(reg_load(base, PROJECTS_REG).get("projects", {}).items()):
+        d = base / "projects" / slug
+        if d.exists():
+            continue
+        if not p.get("remote"):
+            log.append(f"{slug}: local only (no remote): restore it from your backup"); continue
+        cmd = ["git", "clone", p["remote"], str(d)] + (["--branch", p["branch"]] if p.get("branch") and
+                                                         p["branch"] != "HEAD" else [])
+        if dry_run:
+            log.append("would run: " + " ".join(shq(c) for c in cmd)); continue
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            log.append(f"{slug}: clone failed: {(r.stderr or r.stdout).strip()[-200:]}"); continue
+        log.append(f"{slug}: cloned")
+        for w in p.get("worktrees") or []:
+            if not w.get("branch"):
+                continue
+            wt = base / "projects" / ".worktrees" / slug / w["name"]
+            ok = git_out("-C", str(d), "worktree", "add", str(wt), w["branch"]) is not None or \
+                git_out("-C", str(d), "worktree", "add", "-b", w["branch"], str(wt), f"origin/{w['branch']}") is not None
+            log.append(f"{slug}: worktree {w['name']} ({w['branch']}) " + ("added" if ok else "not on the remote"))
+    return log or ["every project in projects.json is here"]
+
+
+def claude_key(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def path_refs(home, path):
+    """Text files of user services, timers, cron and tool configs that name PATH (to fix by hand)."""
+    home, hits = pathlib.Path(home), []
+    cands = list((home / ".config/systemd/user").glob("*.service")) + \
+        list((home / ".config/systemd/user").glob("*.timer")) + \
+        list((home / ".config/environment.d").glob("*.conf"))
+    for key, d, _ in tool_instances(home):
+        for n in ("settings.json", "config.toml", "config.yaml", "cron/jobs.json", ".env"):
+            if (d / n).is_file() and n != ".env":
+                cands.append(d / n)
+    for f in cands:
+        try:
+            if str(path) in f.read_text(encoding="utf-8", errors="replace"):
+                hits.append(home_rel(f, home))
+        except OSError:
+            pass
+    try:
+        ct = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10).stdout
+        if str(path) in ct:
+            hits.append("crontab -l")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return hits
+
+
+def move_paths_in_tools(home, pairs, log, undo=False):
+    """Claude Code project folders (path-encoded names) and Codex trust paths follow a moved repo."""
+    done = []
+    for key, d, _ in tool_instances(home):
+        if key == ".claude" and (d / "projects").is_dir():
+            for old, new in pairs:
+                a, b = d / "projects" / claude_key(old), d / "projects" / claude_key(new)
+                if a.is_dir() and not b.exists():
+                    os.rename(a, b); done.append(["claude", str(a), str(b)])
+                    log.append(f"Claude Code sessions and memory: {a.name} -> {b.name}")
+        if key == ".codex" and (d / "config.toml").is_file():
+            t = (d / "config.toml").read_text(encoding="utf-8")
+            n = t
+            for old, new in pairs:
+                n = n.replace(json.dumps(str(old)), json.dumps(str(new)))
+            if n != t:
+                write(d / "config.toml", n); done.append(["codex", str(d / "config.toml")])
+                log.append(f"Codex: trust paths updated in {home_rel(d / 'config.toml', home)}")
+    return done
+
+
+def projects_move(base, path, slug=None, force=False, keep_worktrees=False, bundle=True):
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    src = pathlib.Path(os.path.abspath(os.path.expanduser(path)))
+    if not (src / ".git").is_dir():
+        raise SystemExit(f"projects move: {src} is not the main folder of a git repository")
+    if in_dir(src, base):
+        raise SystemExit(f"projects move: {src} is inside the base already")
+    slug = slug or src.name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", slug):
+        raise SystemExit(f"projects move: bad slug {slug!r}")
+    dest = base / "projects" / slug
+    if dest.exists():
+        raise SystemExit(f"projects move: {dest} exists")
+    wts = [] if keep_worktrees else [(pathlib.Path(p), b) for p, b in worktrees_of(src)]
+    for p in [src] + [w for w, _ in wts if w.exists()]:
+        busy = procs_using(p)
+        if busy and not force:
+            raise SystemExit(f"projects move: these programs use {p} now (stop them first):\n" +
+                             "\n".join(f"  {pid} {cmd}" for pid, cmd in busy[:10]))
+    if bundle:
+        bdir = home / BACKUPS_DIR / "moves"
+        bdir.mkdir(parents=True, exist_ok=True)
+        bf = bdir / f"{slug}-{dt.datetime.now():%Y%m%d-%H%M%S}.bundle"
+        if git_out("-C", str(src), "bundle", "create", str(bf), "--all") is None:
+            raise SystemExit(f"projects move: git bundle failed for {src}; nothing moved (or pass --no-bundle)")
+        log.append(f"backup: {bf}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, dest)
+    except OSError as e:
+        raise SystemExit(f"projects move: {e}")
+    log.append(f"moved {home_rel(src, home)} -> {dest}")
+    pairs, moved_wt = [(str(src), str(dest))], []
+    if wts:
+        git_out("-C", str(dest), "worktree", "repair", *[str(w) for w, _ in wts if w.exists()])
+    for w, b in wts:
+        if not w.exists():
+            continue
+        if in_dir(w, dest):
+            continue                                       # a worktree inside the repo moved with it
+        nw = base / "projects" / ".worktrees" / slug / w.name
+        nw.parent.mkdir(parents=True, exist_ok=True)
+        if git_out("-C", str(dest), "worktree", "move", str(w), str(nw)) is None:
+            log.append(f"worktree {w}: git worktree move failed; it stays (run `git worktree repair` there)")
+            continue
+        moved_wt.append([str(w), str(nw)]); pairs.append((str(w), str(nw)))
+        log.append(f"worktree {home_rel(w, home)} -> {nw}")
+    git_out("-C", str(dest), "worktree", "repair")
+    tools = move_paths_in_tools(home, pairs, log)
+    refs = sorted(set(path_refs(home, src)))
+    if refs:
+        log.append(f"still naming {home_rel(src, home)} (fix by hand): " + ", ".join(refs))
+    moves = reg_load(base, MOVES_LOG)
+    moves.setdefault("moves", []).append({"slug": slug, "from": str(src), "to": str(dest), "worktrees": moved_wt,
+                                          "tools": tools, "at": dt.datetime.now().isoformat(timespec="seconds")})
+    reg_save(base, MOVES_LOG, moves)
+    projects_scan(base)
+    return log
+
+
+def projects_undo(base, slug=None, force=False):
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    moves = reg_load(base, MOVES_LOG)
+    lst = moves.get("moves", [])
+    i = next((j for j in range(len(lst) - 1, -1, -1) if slug is None or lst[j]["slug"] == slug), None)
+    if i is None:
+        raise SystemExit("projects move --undo: no move recorded" + (f" for {slug}" if slug else ""))
+    m = lst[i]
+    src, dest = pathlib.Path(m["from"]), pathlib.Path(m["to"])
+    if src.exists():
+        raise SystemExit(f"projects move --undo: {src} exists again: move it away first")
+    for p in [dest] + [pathlib.Path(n) for _, n in m["worktrees"]]:
+        busy = procs_using(p) if p.exists() else []
+        if busy and not force:
+            raise SystemExit(f"projects move --undo: these programs use {p} now:\n" +
+                             "\n".join(f"  {pid} {cmd}" for pid, cmd in busy[:10]))
+    for old, new in reversed(m["worktrees"]):
+        if git_out("-C", str(dest), "worktree", "move", new, old) is None:
+            log.append(f"worktree {new}: could not move back")
+        else:
+            log.append(f"worktree {new} -> {old}")
+    os.rename(dest, src)
+    log.append(f"moved {dest} -> {home_rel(src, home)}")
+    git_out("-C", str(src), "worktree", "repair", *[o for o, _ in m["worktrees"]])
+    for t in m.get("tools", []):
+        if t[0] == "claude" and pathlib.Path(t[2]).is_dir() and not pathlib.Path(t[1]).exists():
+            os.rename(t[2], t[1]); log.append(f"Claude Code project folder back: {pathlib.Path(t[1]).name}")
+    pairs = [(m["to"], m["from"])] + [(n, o) for o, n in m["worktrees"]]
+    for t in m.get("tools", []):
+        if t[0] == "codex" and pathlib.Path(t[1]).is_file():
+            x = pathlib.Path(t[1]).read_text(encoding="utf-8")
+            y = x
+            for a, b in pairs:
+                y = y.replace(json.dumps(a), json.dumps(b))
+            if y != x:
+                write(pathlib.Path(t[1]), y); log.append(f"Codex: trust paths back in {home_rel(t[1], home)}")
+    wtd = base / "projects" / ".worktrees" / m["slug"]
+    if wtd.is_dir() and not any(wtd.iterdir()):
+        wtd.rmdir()
+    lst.pop(i)
+    reg_save(base, MOVES_LOG, moves)
+    reg = reg_load(base, PROJECTS_REG)
+    if reg.get("projects", {}).pop(m["slug"], None) is not None:
+        reg_save(base, PROJECTS_REG, reg)
+    return log
+
+
+# -- doctor: every AI tool dir and code repo, where it lives, what is outside the base, git safety
+def configured_dirs(home):
+    """[(tool key, dir, where it was set)] from systemd user units, environment.d, the shell profiles, the shared
+    registry, and Claude Code dirs found under ~/.config (a .claude.json beside settings or credentials)."""
+    home, out = pathlib.Path(home), []
+    var_key = {v: k for k, vs in TOOL_HOMES.items() for v, how in vs if how == "dir"}
+    rx = re.compile(r"(?:^|[\s\"'=])(?:export\s+)?(" + "|".join(map(re.escape, var_key)) + r")=[\"']?([^\"'\s]+)")
+    files = sorted((home / ".config/systemd/user").glob("*.service")) + \
+        sorted((home / ".config/environment.d").glob("*.conf")) + [home / ".profile", home / ".bashrc"]
+    for f in files:
+        t = read(f) or ""
+        for m in rx.finditer(t):
+            d = os.path.expanduser(m.group(2).replace("%h", str(home)))
+            if os.path.isabs(d):
+                out.append((var_key[m.group(1)], os.path.normpath(d), home_rel(f, home)))
+    out += [(k, d, home_rel(f, home)) for k, d, f in registered_dirs(home)]
+    cfg = home / ".config"
+    for dp, dns, fns in os.walk(cfg) if cfg.is_dir() else []:
+        if os.path.relpath(dp, cfg).count("/") >= 3:
+            dns[:] = []
+        dns[:] = [d for d in dns if d not in ("node_modules", "Cache", "cache", ".git")]
+        if ".claude.json" in fns and (".credentials.json" in fns or "settings.json" in fns):
+            out.append((".claude", os.path.normpath(dp), "found under ~/.config"))
+    return out
+
+
+def doctor_git(base):
+    """[(level, text)]: tracked secrets or gitlinks under the layout dirs, ignore rules that do not hold."""
+    base, out = pathlib.Path(base), []
+    if not (base / ".git").exists():
+        return out
+    tracked = (git_out("-C", str(base), "ls-files", "-s", "--", *BASE_SKIP) or "").splitlines()
+    for line in tracked:
+        mode, _, rest = line.partition(" ")
+        path = rest.split("\t", 1)[-1]
+        if mode == "160000":
+            out.append(("ERROR", f"gitlink (nested repo added to the base's git): {path}; "
+                                 f"`git rm --cached {path}` and keep projects/ ignored"))
+        elif path.startswith("engines/") and secret_name(path.split("/", 2)[-1]):
+            out.append(("ERROR", f"tracked in git but may hold a secret: {path} (`git rm --cached {path}`)"))
+    for probe, want in GIT_PROBES:
+        r = subprocess.run(["git", "-C", str(base), "check-ignore", "-q", "--no-index", probe], capture_output=True)
+        if (r.returncode == 0) != want:
+            out.append(("ERROR", f".gitignore: {probe} would be {'tracked' if want else 'ignored'} "
+                                 "(re-run `brain.py init` on this base to get the layout rules)"))
+    st = read(base / ".stignore")
+    if st is not None and "/engines" not in st.split():
+        out.append(("WARN", ".stignore: /engines is not excluded: Syncthing would share tool folders"))
+    return out
+
+
+def doctor(base, strict=False):
+    base, home = pathlib.Path(base).resolve(), home_dir()
+    rows = []                                          # (level, text)
+    allow = set(ALLOWED_OUTSIDE) | {x.removeprefix("~/") for x in
+                                    reg_load(base, ".brain/outside.json").get("allow", []) if isinstance(x, str)}
+    mirrors = {os.path.normpath(str(s)) for _, s, _ in mirror_sources(base, home)}
+    for key, d, extra in tool_instances(home, base):
+        name = TOOLS.get(key, {}).get("name", key)
+        root, var = tool_root(key, home)
+        if not d.exists():
+            if extra:
+                rows.append(("WARN", f"{name}: registered dir {d} does not exist"))
+            continue
+        tag = "in the base" if in_dir(d, base) else "OUTSIDE the base"
+        lvl = "OK" if in_dir(d, base) else ("OUTSIDE" if os.path.normpath(str(d)) not in mirrors else "OK")
+        how = f"set by {var}" if var and not extra else ("extra dir" if extra else "default place")
+        hint = ""
+        if lvl == "OUTSIDE":
+            hint = f" -> brain.py engine adopt {next((i for i, k in TOOL_IDS.items() if k == key), key)}" \
+                if engine_var(key) and not extra else " -> brain.py engine mirror " + home_rel(d, home)
+        rows.append((lvl, f"{name}: {home_rel(d, home)} ({how}, {tag}){hint}"))
+        default = pathlib.Path(home) / key
+        if var and not extra and default.is_dir() and not in_dir(default, d):
+            rows.append(("WARN", f"{name}: {var} points to {home_rel(d, home)} but {home_rel(default, home)} exists "
+                                 "too (split brain: a launcher without the variable made or kept it)"))
+    for key, d, where in configured_dirs(home):
+        if not any(os.path.normpath(str(x)) == d for _, x, _ in tool_instances(home, base)):
+            rows.append(("WARN", f"{TOOLS.get(key, {}).get('name', key)}: dir {home_rel(d, home)} configured in "
+                                 f"{where} is not wired by connect (add it: connect --tool-dir "
+                                 f"{next((i for i, k in TOOL_IDS.items() if k == key), key)}={d})"))
+    known = {k.split("/")[0] for k in TOOLS} | set(TOOL_HOMES)
+    for key in sorted(TOOLS):                          # tools without a relocation setting, at their default place
+        if key in TOOL_IDS.values() or key.split("/")[0] in TOOL_HOMES:
+            continue
+        p = home / key
+        if p.is_dir() and not p.is_symlink() and not in_dir(p, base) and os.path.normpath(str(p)) not in mirrors \
+                and key not in allow:
+            rows.append(("OUTSIDE", f"{TOOLS[key]['name']}: ~/{key} (no setting moves it) -> brain.py engine mirror "
+                                    f"~/{key}"))
+    for key, d in tool_dirs(home, base):
+        rules, mem = ai_signals(d)
+        if (rules or mem) and os.path.normpath(str(d)) not in mirrors:
+            rows.append(("OUTSIDE", f"unknown AI tool dir ~/{key} -> brain.py engine mirror ~/{key}"))
+    try:
+        tops = sorted(home.iterdir())
+    except OSError:
+        tops = []
+    for t in tops:
+        if not t.is_dir() or t.is_symlink() or t.name in allow or t.name in known or in_dir(t, base):
+            continue
+        subs = [t]
+        if not (t / ".git").exists():
+            try:
+                subs += sorted(x for x in t.iterdir() if x.is_dir() and not x.is_symlink())
+            except OSError:
+                pass
+        for d in subs:
+            if (d / ".git").exists() and not in_dir(d, base):
+                kind = "worktree" if (d / ".git").is_file() else "repo"
+                rows.append(("OUTSIDE", f"code {kind} {home_rel(d, home)} -> brain.py projects move "
+                                        f"{home_rel(d, home)}"))
+    rows += doctor_git(base)
+    for lvl, text in rows:
+        print(f"{lvl:8} {text}")
+    n = {l: sum(1 for x, _ in rows if x == l) for l in ("ERROR", "WARN", "OUTSIDE")}
+    print(f"doctor: {n['ERROR']} error(s), {n['WARN']} warning(s), {n['OUTSIDE']} outside the base "
+          f"(allowed outside: .brain/outside.json \"allow\")", file=sys.stderr)
+    return 2 if n["ERROR"] or (strict and n["OUTSIDE"]) else 0
 
 
 # ---------------------------------------------------------------- main
@@ -6533,6 +7673,9 @@ def main(argv):
             except OSError as e:
                 print(f"backup failed, nothing was uninstalled: {e}"); return 1
             print(f"backup: {archive} ({n} files, mode 600, includes .git and dotfiles)")
+            out = [d + "/" for d in BASE_SKIP if (inst.d / d).is_dir() and any((inst.d / d).iterdir())]
+            if out:
+                print(f"  not in it (they stay in place, untouched by uninstall): {', '.join(out)}")
             print(f"  restore: {restore_line(archive, inst.d)}")
         print("\n".join(inst.uninstall()) or "nothing to change")
         print("\n".join(kept_report(inst.d, [k for k in inst.kept])))
@@ -6580,16 +7723,24 @@ def main(argv):
                          bool(opts.get("--quiet")), opts.get("--tier"))
     if cmd in ("collect", "connect", "disconnect", "watch"):
         opts, i = {}, 0
-        valued = {"collect": ("--only", "--since"), "connect": (), "disconnect": (),
+        valued = {"collect": ("--only", "--since"), "connect": ("--tool-dir", "--claude-config-dir"), "disconnect": (),
                   "watch": ("--add", "--source", "--match", "--depth", "--remove", "--days", "--quiet-s", "--max-s",
                             "--rescan-s", "--poll-s", "--log", "--for-s")}[cmd] + ("--base",)
         flags = {"collect": ("--baseline", "--quiet", "--no-file"), "connect": ("--timer", "--watch", "--kick", "--print",
                                                                    "--mcp", "--matrix"),
                  "disconnect": (), "watch": ("--once", "--list", "--discover", "--poll", "--no-commit",
                                              "--no-connect")}[cmd]
+        tdirs = []
         while i < len(args):
             a = args[i]
-            if a in valued and i + 1 < len(args):
+            if a in ("--tool-dir", "--claude-config-dir") and i + 1 < len(args):
+                v = args[i + 1] if a == "--tool-dir" else "claude-code=" + args[i + 1]
+                name, _, d = v.partition("=")
+                key, d = tool_key_of(name), os.path.abspath(os.path.expanduser(d))
+                if not key or not _ or key not in TOOLS:
+                    print(f"connect: --tool-dir TOOL=DIR, TOOL one of {', '.join(sorted(TOOL_IDS))}"); return 1
+                tdirs.append((key, d)); i += 2
+            elif a in valued and i + 1 < len(args):
                 opts[a] = args[i + 1]; i += 2
             elif a in flags:
                 opts[a] = True; i += 1
@@ -6616,11 +7767,64 @@ def main(argv):
                            not opts.get("--no-file"))
         c = Connector(base)
         log = c.connect(bool(opts.get("--timer")), bool(opts.get("--watch")), bool(opts.get("--kick")),
-                        mcp=bool(opts.get("--mcp"))) \
+                        mcp=bool(opts.get("--mcp")), tool_dirs_opt=tdirs) \
             if cmd == "connect" else c.disconnect()
         if cmd == "connect":
             needs = [k for k, v in c.tools.items() if v["state"] == "needs-user"]
-            log += [f"needs you: ~/{k}: {c.tools[k]['why']}" for k in needs]
+            log += [f"needs you: {tool_tilde(k)}: {c.tools[k]['why']}" for k in needs]
+        print("\n".join(log) or "nothing to change")
+        return 0
+    if cmd in ("engine", "projects", "doctor"):
+        base, i, rest, flags = SRC, 0, [], set()
+        while i < len(args):
+            if args[i] in ("--base", "--slug", "--name", "--keep") and i + 1 < len(args):
+                if args[i] == "--base":
+                    base = pathlib.Path(args[i + 1]).expanduser().resolve()
+                else:
+                    flags.add((args[i], args[i + 1]))
+                i += 2
+            elif args[i].startswith("--"):
+                flags.add(args[i]); i += 1
+            else:
+                rest.append(args[i]); i += 1
+        val = lambda k: next((v for x in flags if isinstance(x, tuple) and x[0] == k for v in [x[1]]), None)
+        force = "--force" in flags
+        if cmd == "doctor":
+            return doctor(base, "--strict" in flags)
+        sub = rest[0] if rest else "list"
+        if cmd == "engine":
+            if sub in ("adopt", "release", "mirror", "unmirror") and len(rest) != 2:
+                print(f"usage: engine {sub} TOOL"); return 1
+            if sub == "adopt":
+                log = engine_adopt(base, rest[1], force)
+            elif sub == "release":
+                log = engine_release(base, rest[1], force)
+            elif sub == "mirror":
+                keep = [g for g in (val("--keep") or "").split(",") if g] or None
+                log = engine_mirror(base, rest[1], val("--name"), keep)
+            elif sub == "unmirror":
+                log = engine_unmirror(base, rest[1])
+            elif sub == "sync":
+                ch = mirror_sync(base, quiet=False)
+                log = [f"mirrors changed: {', '.join(ch)}" if ch else "mirrors up to date"]
+            elif sub == "list":
+                log = engine_list(base)
+            else:
+                print("usage: engine adopt|release|mirror|unmirror TOOL | engine sync | engine list"); return 1
+        else:
+            if sub == "move" and "--undo" in flags:
+                log = projects_undo(base, rest[1] if len(rest) > 1 else None, force)
+            elif sub == "move":
+                if len(rest) != 2:
+                    print("usage: projects move PATH [--slug S] [--keep-worktrees] [--no-bundle] [--force]"); return 1
+                log = projects_move(base, rest[1], val("--slug"), force, "--keep-worktrees" in flags,
+                                    "--no-bundle" not in flags)
+            elif sub in ("list", "scan"):
+                log = projects_scan(base) if (base / "projects").is_dir() else ["no projects/ folder"]
+            elif sub == "clone":
+                log = projects_clone(base, "--dry-run" in flags)
+            else:
+                print("usage: projects list|scan|clone [--dry-run]|move PATH|move --undo [SLUG]"); return 1
         print("\n".join(log) or "nothing to change")
         return 0
     root = root_of()

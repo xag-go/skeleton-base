@@ -49,7 +49,8 @@ FRUGAL_PATH = os.pathsep.join([_FRUGAL_BIN.name, os.path.dirname(sys.executable)
 def run(*args, cwd=None, env=None, inp=None):
     e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=_ISOLATED_HOME.name, PATH=TEST_PATH)
     for v in ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
-              "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):   # never the real user's kits or tools
+              "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR",
+              "COPILOT_HOME", "GEMINI_CLI_HOME"):   # never the real user's kits or tools
         e.pop(v, None)
     e.update(env or {})
     return subprocess.run([sys.executable, *map(str, args)], capture_output=True, text=True, cwd=cwd, env=e,
@@ -2013,6 +2014,21 @@ class FrugalGlobalTests(Base):
                    .read_text().replace("- Name:\n", "- Name: Alex Example\n"))           # a duplicate
         return {f: f.read_bytes() for f in self.rules() + [self.home / ".claude/settings.json"]}
 
+    def test_second_claude_dir_gets_both_blocks_base_first(self):
+        if "tool_dirs" not in brain_caps_text(self.setup_py):
+            self.skipTest("this Frugal-Bridge build cannot wire more than one dir of a tool")
+        self.frugal_install()
+        self.sb("connect")
+        w = self.tmp / "worker-claude"
+        w.mkdir()
+        self.sb("connect", "--claude-config-dir", w)
+        t = (w / "CLAUDE.md").read_text()
+        self.assertIn("<!-- base-folder:start", t)
+        self.assertTrue(FRUGAL_BLOCK.search(t), t)
+        self.assertLess(t.index("<!-- base-folder:start"), FRUGAL_BLOCK.search(t).start())
+        self.sb("disconnect")
+        self.assertNotIn("<!-- base-folder:start", read_or(w / "CLAUDE.md"))
+
     def test_frugal_first_then_base_imports_switches_and_reruns_identical(self):
         self.frugal_first()
         self.assertNotIn("knowledge base owns", (self.home / ".claude/CLAUDE.md").read_text())
@@ -3773,3 +3789,403 @@ class WatchMemoryCapTests(FileBase):
                            0, "the run filed the items")
         print(f"\nwatch --once, 50 items: peak RSS {kb // 1024} MB (cap {cap}M)", file=sys.stderr)
         self.assertLess(kb * 1024, cap * 1024 * 1024 // 2, f"peak {kb} KB must leave 2x headroom under {cap}M")
+
+
+def brain_caps_text(setup_py):
+    t = pathlib.Path(setup_py).read_text()
+    return "tool_dirs" if ("--tool-dir" in t and "ai-tool-dirs.d" in t) else ""
+
+
+def read_or(p, default=""):
+    return p.read_text() if p.is_file() else default
+
+
+class ResolverTests(unittest.TestCase):
+    """Each tool's dir follows its own setting; paths stay home-relative below HOME."""
+
+    def test_tool_path_follows_each_setting(self):
+        h = pathlib.Path("/h")
+        self.assertEqual(B.tool_path(".claude/CLAUDE.md", h, env={}), ".claude/CLAUDE.md")
+        env = {"CLAUDE_CONFIG_DIR": "/h/base/engines/claude", "CODEX_HOME": "/srv/codex",
+               "OPENCLAW_HOME": "/oc", "GEMINI_CLI_HOME": "/g", "XDG_CONFIG_HOME": "/x"}
+        self.assertEqual(B.tool_path(".claude/CLAUDE.md", h, env=env), "base/engines/claude/CLAUDE.md")
+        self.assertEqual(B.tool_path(".claude.json", h, env=env), "base/engines/claude/.claude.json")
+        self.assertEqual(B.tool_path(".codex/config.toml", h, env=env), "/srv/codex/config.toml")
+        self.assertEqual(B.tool_path(".openclaw/workspace/AGENTS.md", h, env=env), "/oc/.openclaw/workspace/AGENTS.md")
+        self.assertEqual(B.tool_path(".gemini/GEMINI.md", h, env=env), "/g/.gemini/GEMINI.md")
+        self.assertEqual(B.tool_path(".config/opencode/AGENTS.md", h, env=env), "/x/opencode/AGENTS.md")
+        self.assertEqual(B.tool_path(".agents/skills/a/SKILL.md", h, env=env), ".agents/skills/a/SKILL.md")
+        self.assertEqual(B.tool_path(".config/skeleton-base/base", h, env=env), ".config/skeleton-base/base")
+        self.assertEqual(B.tool_path(".hermes/SOUL.md", h, {".hermes": pathlib.Path("/w/hermes2")}, env={}),
+                         "/w/hermes2/SOUL.md")
+        self.assertEqual(B.tool_path(".claude/x", h, env={"CLAUDE_CONFIG_DIR": "relative/not/used"}), ".claude/x")
+
+    def test_virtual_maps_back(self):
+        h = pathlib.Path("/h")
+        os.environ["CLAUDE_CONFIG_DIR"] = "/h/base/engines/claude"
+        try:
+            self.assertEqual(B.tool_virtual("base/engines/claude/CLAUDE.md", h), ".claude/CLAUDE.md")
+            self.assertEqual(B.tool_virtual("base/engines/claude/.claude.json", h), ".claude.json")
+            self.assertEqual(B.tool_virtual(".codex/AGENTS.md", h), ".codex/AGENTS.md")
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR")
+
+
+class EverythingInBaseTests(ToolHome):
+    """Relocated tool dirs, several dirs of one tool, engines/ and projects/ in the base (fake HOME)."""
+
+    def setUp(self):
+        super().setUp()
+        self.bins("claude", "codex", "hermes")
+        self.eng = self.base / "engines"
+
+    def git(self, d, *a):
+        r = subprocess.run(["git", "-C", str(d), "-c", "user.name=T", "-c", "user.email=t@example.invalid", *a],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_connect_into_relocated_dirs_never_makes_home_dirs(self):
+        cl, cx = self.eng / "claude", self.tmp / "elsewhere" / "codex"
+        self.write(cl, "CLAUDE.md", "# mine\n")
+        self.write(cx, "config.toml", 'model = "x"\n')
+        before = tree(self.tmp)
+        env = {"CLAUDE_CONFIG_DIR": str(cl), "CODEX_HOME": str(cx)}
+        r = self.hb("connect", "--mcp", env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertFalse((self.home / ".claude.json").exists())
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertIn("<!-- base-folder:start", (cl / "CLAUDE.md").read_text())
+        self.assertIn("skeleton-base", json.loads((cl / ".claude.json").read_text())["mcpServers"])
+        s = json.loads((cl / "settings.json").read_text())
+        self.assertIn(str(self.base), s["permissions"]["additionalDirectories"])
+        self.assertIn("SessionEnd", s["hooks"])
+        self.assertIn(str(self.base), (cx / "config.toml").read_text())
+        self.assertTrue((cx / "AGENTS.md").is_file())
+        r = self.hb("disconnect", env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        after = {k: v for k, v in tree(self.tmp).items() if not k.startswith("base/.brain/backups")}
+        self.assertEqual({k: v for k, v in after.items() if not k.startswith("base/")},
+                         {k: v for k, v in before.items() if not k.startswith("base/")})
+
+    def test_second_claude_dir_by_option_and_by_registry(self):
+        main, worker, team = self.home / ".claude", self.tmp / "w" / "claude-worker", self.tmp / "t" / "team"
+        self.write(main, "CLAUDE.md", "# owner\n")
+        worker.mkdir(parents=True); team.mkdir(parents=True)
+        self.write(self.home, ".config/claude-code-dirs.d/team.json",
+                   json.dumps({"dir": str(team), "owner": "team-installer", "purpose": "workers"}))
+        home0 = tree(self.home)
+        self.ok_env("connect", "--claude-config-dir", str(worker))
+        for d in (main, worker, team):
+            self.assertEqual((d / "CLAUDE.md").read_text().count("<!-- base-folder:start"), 1, d)
+            self.assertIn("SessionEnd", json.loads((d / "settings.json").read_text())["hooks"])
+        reg = json.loads((self.home / ".config/ai-tool-dirs.d/skeleton-base.json").read_text())
+        self.assertEqual(reg, [{"dir": str(worker), "owner": "skeleton-base", "purpose": "connect --tool-dir",
+                                "tool": "claude-code"}])
+        self.ok_env("connect")                                    # idempotent: recorded dir kept, no 2nd block
+        self.assertEqual((worker / "CLAUDE.md").read_text().count("<!-- base-folder:start"), 1)
+        cfg = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"]
+        self.assertEqual(cfg["dirs"], {".claude": [str(worker)]})
+        self.ok_env("disconnect")
+        self.assertEqual(tree(self.home), home0)
+        self.assertFalse((worker / "CLAUDE.md").exists())
+        self.assertEqual(sorted(p.name for p in team.iterdir()), [])
+
+    def ok_env(self, *args, env=None):
+        r = self.hb(*args, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def test_bad_tool_dir_option_and_bad_registry_file(self):
+        r = self.hb("connect", "--tool-dir", "nosuchtool=/x")
+        self.assertEqual(r.returncode, 1)
+        self.write(self.home, ".config/ai-tool-dirs.d/broken.json", "{not json")
+        self.write(self.home, ".claude/CLAUDE.md", "x\n")
+        r = self.ok_env("connect")
+        self.assertIn("tool dirs registry: skipped", r.stdout)
+
+    def test_collect_follows_relocated_and_extra_dirs(self):
+        cl, wk, cx, hm = self.eng / "claude", self.tmp / "wk", self.eng / "codex", self.eng / "hermes"
+        self.write(cl, "projects/-p-a/memory/MEMORY.md", "- relocated claude memory\n")
+        self.write(wk, "projects/-p-b/memory/MEMORY.md", "- worker claude memory\n")
+        self.write(cx, "memories/topic.md", "relocated codex memory\n")
+        self.write(hm, "memories/MEMORY.md", "relocated hermes memory\n")
+        self.write(self.home, ".config/ai-tool-dirs.d/w.json", json.dumps([{"tool": "claude-code", "dir": str(wk)}]))
+        env = {"CLAUDE_CONFIG_DIR": str(cl), "CODEX_HOME": str(cx), "HERMES_HOME": str(hm)}
+        r = self.hb("collect", "--no-file", env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        texts = {p.read_text() for p in (self.base / "raw/inbox/collected").rglob("*.md")}
+        body = "\n".join(texts)
+        for want in ("relocated claude memory", "worker claude memory", "relocated codex memory",
+                     "relocated hermes memory"):
+            self.assertIn(want, body)
+        self.assertIn("origin: ~/.codex/memories/topic.md", body)      # the default name: a moved dir is not new
+        self.assertIn("origin: ~/.hermes/memories/MEMORY.md", body)
+        self.assertIn(f"origin: {wk}:p-b/MEMORY.md".replace(str(self.home) + "/", "~/"), body)
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_adopt_release_round_trip_byte_identical(self):
+        self.write(self.home, ".claude/CLAUDE.md", "# owner rules\n")
+        self.write(self.home, ".claude/projects/-k/memory/MEMORY.md", "- m\n")
+        self.write(self.home, ".claude.json", '{"x": 1}')
+        self.write(self.home, ".bashrc", "alias ll='ls -l'\n")
+        self.ok_env("connect")
+        home0 = tree(self.home)
+        r = self.ok_env("engine", "adopt", "claude-code", "--base", str(self.base))
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertFalse((self.home / ".claude.json").exists())
+        self.assertEqual((self.eng / "claude/.claude.json").read_text(), '{"x": 1}')
+        self.assertIn(f"export CLAUDE_CONFIG_DIR={self.eng / 'claude'}", (self.home / ".bashrc").read_text())
+        self.assertIn(f"CLAUDE_CONFIG_DIR={self.eng / 'claude'}",
+                      (self.home / ".config/environment.d/60-base-engines.conf").read_text())
+        reg = json.loads((self.base / "engines.json").read_text())
+        self.assertEqual(reg["engines"]["claude"]["env"], "CLAUDE_CONFIG_DIR")
+        self.assertNotIn("alias", (self.base / "engines.json").read_text())   # your shell files never tracked
+        blocks = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"]["blocks"]
+        self.assertTrue(any(k.endswith("engines/claude/CLAUDE.md") for k in blocks), blocks)
+        self.assertFalse(any(k.startswith(".claude/") for k in blocks), blocks)
+        self.assertEqual((self.eng / "claude/CLAUDE.md").read_text().count("<!-- base-folder:start"), 1)
+        r = self.hb("engine", "adopt", "claude-code", "--base", str(self.base),
+                    env={"CLAUDE_CONFIG_DIR": str(self.eng / "claude")})
+        self.assertIn("already in the base", r.stdout)
+        self.ok_env("engine", "release", "claude-code", "--base", str(self.base),
+                    env={"CLAUDE_CONFIG_DIR": str(self.eng / "claude")})
+        self.assertEqual(tree(self.home), home0)
+        self.assertFalse((self.base / "engines.json").exists())
+        self.ok_env("disconnect")
+        self.assertEqual((self.home / ".claude/CLAUDE.md").read_text(), "# owner rules\n")
+
+    def test_adopt_refuses_hermes_without_force_and_unknown_tools(self):
+        self.write(self.home, ".hermes/SOUL.md", "x\n")
+        r = self.hb("engine", "adopt", "hermes", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("re-bootstrapped", r.stdout + r.stderr)
+        self.assertTrue((self.home / ".hermes/SOUL.md").is_file())
+        r = self.hb("engine", "adopt", "qwen", "--base", str(self.base))
+        self.assertIn("engine mirror", r.stdout + r.stderr)
+
+    def test_adopt_refuses_while_a_program_uses_the_dir(self):
+        self.write(self.home, ".codex/AGENTS.md", "x\n")
+        p = subprocess.Popen(["sleep", "30"], cwd=self.home / ".codex")
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        r = self.hb("engine", "adopt", "codex", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("stop them first", r.stdout + r.stderr)
+        self.assertTrue((self.home / ".codex/AGENTS.md").is_file())
+
+    def test_git_keeps_only_safe_engine_files_and_check_proves_it(self):
+        self.git(self.base, "init", "-q")
+        keep = ["engines/claude/CLAUDE.md", "engines/claude/skills/s/SKILL.md", "engines/claude/agents/a.md",
+                "engines/hermes/memories/MEMORY.md", "engines/hermes/profiles/p/SOUL.md", "engines/codex/AGENTS.md",
+                "engines/README.md", "projects/README.md"]
+        deny = ["engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/claude/settings.json",
+                "engines/claude/projects/-k/s.jsonl", "engines/codex/auth.json", "engines/codex/config.toml",
+                "engines/hermes/.env", "engines/hermes/state.db", "engines/hermes/cache/x.md",
+                "engines/hermes/skills/x/api_token.txt", "engines/hermes/sessions/a.json",
+                "projects/app/main.py", "data/big.bin", "scratch/n.md", "backups/b.tgz", "apps/tool/bin"]
+        for r in keep + deny:
+            if not (self.base / r).exists():
+                self.write(self.base, r, "x\n")
+        self.git(self.base, "add", "-A")
+        tracked = set(self.git(self.base, "ls-files").split())
+        for r in keep:
+            self.assertIn(r, tracked)
+        self.assertEqual(sorted(set(deny) & tracked), [])
+        r = self.hb("check", "--root", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.git(self.base, "add", "-f", "engines/codex/auth.json")
+        r = self.hb("check", "--root", str(self.base))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("may hold a", r.stdout)
+        self.assertIn("engines/codex/auth.json (`git rm --cached", r.stdout)
+        st = (self.base / ".stignore").read_text().split()
+        for d in ("/engines", "/projects", "/data", "/ops"):
+            self.assertIn(d, st)
+
+    def test_archive_and_tidy_snapshot_skip_layout_dirs(self):
+        self.write(self.base, "engines/hermes/cache/big.bin", "x" * 1000)
+        self.write(self.base, "projects/app/main.py", "print(1)\n")
+        out, n = B.archive_base(self.base, self.tmp / "bk")
+        import tarfile
+        with tarfile.open(out) as t:
+            names = t.getnames()
+        self.assertFalse(any("/engines/hermes" in x or "/projects/app" in x for x in names), names)
+        self.assertIn("base/engines/README.md", names)
+        self.assertTrue(any(x.endswith("/hot.md") for x in names))
+        snap = B.snapshot(self.base)
+        self.assertFalse(any(k.startswith(("engines/", "projects/")) for k in snap))
+
+    def test_mirror_for_a_tool_without_a_setting(self):
+        g = self.home / ".gemini"
+        self.write(g, "GEMINI.md", "gemini rules\n")
+        self.write(g, "skills/s/SKILL.md", "skill\n")
+        self.write(g, "oauth_creds.json", '{"t": 1}')
+        self.write(g, "tmp/sessions/a.json", "{}")
+        self.write(g, "skills/s/leak.md", "key " + "sk-" + "ant-api03-abcdefghij1234567890XYZabc\n")
+        r = self.ok_env("engine", "mirror", "gemini", "--base", str(self.base))
+        m = self.eng / "gemini"
+        self.assertEqual(sorted(p.relative_to(m).as_posix() for p in m.rglob("*") if p.is_file()),
+                         ["GEMINI.md", "MIRROR", "SKIPPED.md", "skills/s/SKILL.md"])
+        self.assertIn("skills/s/leak.md", (m / "SKIPPED.md").read_text())
+        self.write(g, "GEMINI.md", "gemini rules v2\n")
+        (g / "skills/s/SKILL.md").unlink()
+        r = self.ok_env("watch", "--once", "--no-commit", "--base", str(self.base))
+        self.assertEqual((m / "GEMINI.md").read_text(), "gemini rules v2\n")
+        self.assertFalse((m / "skills/s/SKILL.md").exists())
+        locs = [l for l in B.watch_locations(self.base, self.home) if l["source"] == "mirror"]
+        self.assertTrue(any(l["root"] == str(g) for l in locs))
+        r = self.ok_env("engine", "unmirror", "gemini", "--base", str(self.base))
+        self.assertFalse(m.exists())
+        self.assertTrue((g / "GEMINI.md").is_file())
+
+    def test_my_setup_sources_d_registrations_are_mirrored(self):
+        src = self.tmp / "team-claude"
+        self.write(src, "CLAUDE.md", "team rules\n")
+        self.write(src, ".credentials.json", "{}")
+        self.write(src, "projects/x/s.jsonl", "{}")
+        self.write(self.home, ".config/my-setup/sources.d/team.json",
+                   json.dumps({"name": "team", "sources": [{"src": str(src), "dest": "teams/t1/claude"},
+                                                           {"src": "/x", "dest": "../escape"}]}))
+        self.ok_env("engine", "sync", "--base", str(self.base))
+        m = self.eng / "teams/t1/claude"
+        self.assertTrue((m / "CLAUDE.md").is_file())
+        self.assertFalse((m / ".credentials.json").exists())
+        self.assertFalse((m / "projects").exists())
+        self.assertFalse((self.base / "escape").exists())
+
+    def test_projects_move_with_worktree_claude_key_and_undo(self):
+        repo, wt = self.home / "code" / "app", self.home / "code" / "app-feature"
+        repo.mkdir(parents=True)
+        self.git(repo, "init", "-q", "-b", "main")
+        self.write(repo, "a.py", "print(1)\n")
+        self.git(repo, "add", "-A"); self.git(repo, "commit", "-qm", "one")
+        self.git(repo, "worktree", "add", "-q", "-b", "feature", str(wt))
+        ck = self.home / ".claude/projects" / B.claude_key(repo)
+        self.write(ck, "memory/MEMORY.md", "- app memory\n")
+        self.write(self.home, ".codex/config.toml", f'[projects.{json.dumps(str(repo))}]\ntrust_level = "trusted"\n')
+        self.write(self.home, ".config/systemd/user/app.service", f"[Service]\nWorkingDirectory={repo}\n")
+        self.git(self.base, "init", "-q")
+        r = self.ok_env("projects", "move", str(repo), "--base", str(self.base), "--no-bundle")
+        dest, nwt = self.base / "projects/app", self.base / "projects/.worktrees/app/app-feature"
+        self.assertTrue((dest / "a.py").is_file())
+        self.assertTrue((nwt / "a.py").is_file())
+        self.assertFalse(repo.exists())
+        wl = self.git(dest, "worktree", "list")
+        self.assertIn(str(nwt), wl)
+        self.assertNotIn("prunable", wl)
+        self.assertEqual(self.git(nwt, "rev-parse", "--abbrev-ref", "HEAD").strip(), "feature")
+        self.assertTrue((self.home / ".claude/projects" / B.claude_key(dest) / "memory/MEMORY.md").is_file())
+        self.assertIn(json.dumps(str(dest)), (self.home / ".codex/config.toml").read_text())
+        self.assertIn("app.service", r.stdout)
+        reg = json.loads((self.base / "projects.json").read_text())
+        self.assertEqual(reg["projects"]["app"]["worktrees"], [{"branch": "feature", "name": "app-feature"}])
+        st = subprocess.run(["git", "-C", str(self.base), "check-ignore", "-q", "--no-index", "projects/app/a.py"])
+        self.assertEqual(st.returncode, 0)
+        self.ok_env("projects", "move", "--undo", "--base", str(self.base))
+        self.assertTrue((repo / "a.py").is_file())
+        self.assertTrue((wt / "a.py").is_file())
+        self.assertNotIn("prunable", self.git(repo, "worktree", "list"))
+        self.assertTrue((ck / "memory/MEMORY.md").is_file())
+        self.assertIn(json.dumps(str(repo)), (self.home / ".codex/config.toml").read_text())
+        self.assertFalse((self.base / "projects/app").exists())
+
+    def test_projects_move_refuses_a_busy_repo(self):
+        repo = self.home / "busy"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        p = subprocess.Popen(["sleep", "30"], cwd=repo)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        r = self.hb("projects", "move", str(repo), "--base", str(self.base), "--no-bundle")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(repo.is_dir())
+
+    def test_projects_clone_from_registry(self):
+        remote = self.tmp / "remote.git"
+        src = self.tmp / "src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        self.write(src, "r.md", "x\n")
+        self.git(src, "add", "-A"); self.git(src, "commit", "-qm", "one")
+        self.git(src, "branch", "dev")
+        subprocess.run(["git", "clone", "-q", "--bare", str(src), str(remote)], check=True)
+        (self.base / "projects.json").write_text(json.dumps({"projects": {
+            "lib": {"remote": str(remote), "branch": "main", "worktrees": [{"name": "lib-dev", "branch": "dev"}]},
+            "local": {"remote": None, "branch": "main", "worktrees": []}}}))
+        r = self.ok_env("projects", "clone", "--base", str(self.base))
+        self.assertTrue((self.base / "projects/lib/r.md").is_file())
+        self.assertTrue((self.base / "projects/.worktrees/lib/lib-dev/r.md").is_file())
+        self.assertIn("local: local only", r.stdout)
+
+    def test_doctor_reports_outside_split_brain_and_unwired_dirs(self):
+        (self.home / "repo1").mkdir()
+        self.git(self.home / "repo1", "init", "-q")
+        (self.home / "Downloads" / "x").mkdir(parents=True)
+        self.git(self.home / "Downloads" / "x", "init", "-q")
+        self.write(self.home, ".claude/CLAUDE.md", "old\n")             # split brain: var points elsewhere
+        cl = self.eng / "claude"
+        cl.mkdir(parents=True)
+        team = self.tmp / "teamdir"
+        team.mkdir()
+        self.write(self.home, ".config/systemd/user/team.service",
+                   f"[Service]\nEnvironment=CLAUDE_CONFIG_DIR={team}\nExecStart=/bin/true\n")
+        r = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(cl)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("code repo ~/repo1 -> brain.py projects move ~/repo1", r.stdout)
+        self.assertNotIn("Downloads", r.stdout)
+        self.assertIn("split brain", r.stdout)
+        self.assertIn(f"connect --tool-dir claude-code={team}", r.stdout)
+        self.assertRegex(r.stdout, r"OK +Claude Code: .*engines/claude \(set by CLAUDE_CONFIG_DIR, in the base\)")
+        r = self.hb("doctor", "--strict", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(cl)})
+        self.assertEqual(r.returncode, 2)
+        self.write(self.base, ".brain/outside.json", json.dumps({"allow": ["~/repo1"]}))
+        r = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(cl)})
+        self.assertNotIn("repo1", r.stdout)
+
+    def test_watch_discover_lists_configured_dirs_not_wired(self):
+        team = self.tmp / "teamdir2"
+        team.mkdir()
+        self.write(self.home, ".profile", f'export CODEX_HOME="{team}"\n')
+        r = self.ok_env("watch", "--discover", "--base", str(self.base))
+        self.assertIn(f"--tool-dir codex={team}", r.stdout)
+
+    def test_mcp_never_serves_layout_dirs(self):
+        self.write(self.base, "engines/claude/CLAUDE.md", "secret-ish rules\n")
+        self.write(self.base, "projects/app/README.md", "code\n")
+        s = McpSession(self.base, home=self.home)
+        self.addCleanup(lambda: s.p.poll() is None and s.p.kill())
+        s.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "t", "version": "1"}})
+        for p in ("engines/claude/CLAUDE.md", "projects/app/README.md"):
+            text, err = s.tool("read_page", path=p)
+            self.assertTrue(err, text)
+            self.assertIn("not served", text)
+        s.close()
+
+    def test_check_public_reads_only_what_git_could_publish(self):
+        repo = self.tmp / "pub"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        self.write(repo, ".gitignore", "/projects/\n")
+        self.write(repo, "README.md", "hello\n")
+        self.write(repo, "projects/x/notes.md", "blockedname here\n")
+        self.git(repo, "add", "-A"); self.git(repo, "commit", "-qm", "one")
+        words = self.write(self.tmp, "words.txt", "blockedname\n")
+        r = run(BRAIN, "check-public", "--words", words, repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.write(repo, "new.md", "blockedname too\n")                  # untracked, not ignored: counted
+        r = run(BRAIN, "check-public", "--words", words, repo)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("new.md", r.stdout)
+
+    def test_init_adds_layout_rules_to_a_changed_stignore(self):
+        d = self.tmp / "old"
+        d.mkdir()
+        (d / ".stignore").write_text("// mine\n.git\n")
+        self.init(d)
+        t = (d / ".stignore").read_text()
+        self.assertTrue(t.startswith("// mine\n.git\n"))
+        self.assertIn("/engines\n", t)
+        r = run(d / "tools/brain.py", "uninstall", d, "--no-backup")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((d / ".stignore").read_text(), "// mine\n.git\n")
