@@ -453,9 +453,20 @@ class Installer:
         if not existed:
             created[".gitignore"] = "block"
         # .stignore (Syncthing): the layout lines also in a copy you changed (an unchanged copy is upgraded above)
-        if self.p(".stignore").is_file() and created.get(".stignore") != sha(self.p(".stignore").read_bytes()):
-            modes[".stignore"] = self.put_block(".stignore", block_body(".stignore", ST_START_RE, ST_END), modes,
-                                                ST_START, ST_END, ST_START_RE)
+        # Syncthing takes the FIRST matching line, so the block goes on top: a broader line of yours (or an older
+        # "/engines" line) can then not hide the safe files from the other devices
+        st = self.p(".stignore")
+        if st.is_file() and created.get(".stignore") != sha(st.read_bytes()):
+            body, cur = block_body(".stignore", ST_START_RE, ST_END), read(st)
+            if find_block(cur, ST_START_RE, ST_END):
+                modes[".stignore"] = self.put_block(".stignore", body, modes, ST_START, ST_END, ST_START_RE)
+            else:
+                self.change(".stignore", f"{ST_START}\n{body}\n{ST_END}\n" + cur)
+                modes[".stignore"] = "new"
+                for line in cur.splitlines():
+                    if line.strip() in ("/engines", "engines", "/engines/"):
+                        self.log.append(".stignore: your line `" + line.strip() + "` comes after the base block now "
+                                        "(first match wins): the safe files of engines/ are shared")
 
         # Frugal-Bridge already here: import its slot files (contract case 4)
         imported = prev.get("imported")

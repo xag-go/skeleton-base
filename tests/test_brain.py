@@ -4188,8 +4188,11 @@ class EverythingInBaseTests(ToolHome):
         (d / ".stignore").write_text("// mine\n.git\n")
         self.init(d)
         t = (d / ".stignore").read_text()
-        self.assertTrue(t.startswith("// mine\n.git\n"))
+        self.assertTrue(t.startswith("// base-folder:start v1\n"), t[:80])     # first match wins: block on top
+        self.assertTrue(t.endswith("// base-folder:end\n// mine\n.git\n"))
         self.assertIn("/engines\n", t)
+        self.init(d)
+        self.assertEqual((d / ".stignore").read_text(), t)                     # an update: same bytes
         r = run(d / "tools/brain.py", "uninstall", d, "--no-backup")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual((d / ".stignore").read_text(), "// mine\n.git\n")
