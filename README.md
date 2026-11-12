@@ -486,12 +486,24 @@ engines.json  projects.json                 what is where (tracked)
   folder renamed so its sessions and memory follow, Codex trust paths updated, units/cron/tool configs that still name
   the old path listed); `projects move --undo` reverses the last move. `projects.json` (tracked) keeps each repo's
   remote, branch and worktrees: `projects clone` brings them back on a new machine.
-- **Never in git, GitHub or Syncthing**: the base's `.gitignore` ignores `projects/`, `data/`, `apps/`, `runs/`,
-  `scratch/`, `backups/` and is deny-by-default for `engines/` (only `*.md` at the top of a tool folder, `agents/`,
-  `skills/`, `memories/`, `hooks/`, `scripts/`, Hermes `cron/jobs.json` and profiles' `SOUL.md`/memories/skills;
-  credentials, `.claude.json`, auth, `.env`, tokens, sessions, project transcripts, databases, caches, logs and
-  `node_modules` are denied last, so they always win). `.stignore` keeps all layout folders off Syncthing.
-  `check` proves it (fake secret paths must be ignored, no tracked secret, no nested repo added as a gitlink).
+- **What leaves this machine, per tool folder** (one table in `brain.py` makes the `.gitignore` and `.stignore`
+  blocks, the mirror filter, the pre-commit guard and doctor's checks; `brain.py layout --print` shows them):
+  git and Syncthing get only the safe files of `engines/<tool>/` (`*.md` at its top, `MIRROR`, `agents/`, `skills/`,
+  `memories/`, `hooks/`, `scripts/`, `commands/`, `rules/`, `prompts/`, `output-styles/`; Hermes `cron/jobs.json` and
+  its profiles' `SOUL.md`, memories, skills), so the Mac and GitHub see every skill change. Git also keeps Claude
+  Code's `settings.json` and plugin manifests (content checked by the guard; never Syncthing). Secrets come first and
+  always win: credentials, `.claude.json`, `.env`, keys, `auth.json`, token files, sessions, transcripts
+  (`projects/`), databases, caches, logs, `node_modules` at any depth, and loose `auth*`/`*token*`/`*secret*` names at
+  the top of a tool folder (a skill called `x-token-spend` is still shared). `projects/`, `data/`, `apps/`, `runs/`,
+  `scratch/`, `backups/`, `ops/` never leave (README only). Checked with a real Syncthing 2.1 scan: only the safe
+  files were indexed.
+- **Pre-commit guard**: `init` writes `.git/hooks/pre-commit` in a base that is a git repo (your own hook is kept:
+  rename it to `pre-commit.local` and it runs first). `brain.py guard` refuses gitlinks, `engines/` files off the
+  allow list, anything in the closed folders, secret file names, files over 5 MB and key-like content (gitleaks too
+  when installed), never printing the secret. The watcher's own commits skip hooks, so it runs the same check itself
+  and leaves a refused `engines/` file out. `check` proves the ignore rules (fake secret paths must be ignored, safe
+  ones kept, no tracked secret, no nested repo added as a gitlink). `projects move` backs up a partial clone as its
+  `.git` folder (a `bundle --all` would download every missing blob).
 - **Never walked**: backups (`uninstall`), tidy's snapshot, the MCP server, `check-public` (in a repo it reads only
   what git could publish) skip the layout folders; `collect` and `watch` find tool memories through each tool's own
   setting (a moved folder keeps its memories' names, so nothing is collected twice).

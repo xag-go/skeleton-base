@@ -3977,12 +3977,16 @@ class EverythingInBaseTests(ToolHome):
     def test_git_keeps_only_safe_engine_files_and_check_proves_it(self):
         self.git(self.base, "init", "-q")
         keep = ["engines/claude/CLAUDE.md", "engines/claude/skills/s/SKILL.md", "engines/claude/agents/a.md",
+                "engines/claude/settings.json", "engines/claude/skills/x-token-spend/SKILL.md",
+                "engines/claude-worker/CLAUDE.md", "engines/hermes/cron/jobs.json",
                 "engines/hermes/memories/MEMORY.md", "engines/hermes/profiles/p/SOUL.md", "engines/codex/AGENTS.md",
                 "engines/README.md", "projects/README.md"]
-        deny = ["engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/claude/settings.json",
+        deny = ["engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/codex/settings.json",
+                "engines/claude/skills/s/.env", "engines/claude/skills/s/token.json", "engines/claude/auth-x.md",
+                "engines/hermes/profiles/p/auth.json", "engines/hermes/config.yaml",
                 "engines/claude/projects/-k/s.jsonl", "engines/codex/auth.json", "engines/codex/config.toml",
                 "engines/hermes/.env", "engines/hermes/state.db", "engines/hermes/cache/x.md",
-                "engines/hermes/skills/x/api_token.txt", "engines/hermes/sessions/a.json",
+                "engines/hermes/skills/x/sessions/a.md", "engines/hermes/sessions/a.json",
                 "projects/app/main.py", "data/big.bin", "scratch/n.md", "backups/b.tgz", "apps/tool/bin"]
         for r in keep + deny:
             if not (self.base / r).exists():
@@ -4048,7 +4052,7 @@ class EverythingInBaseTests(ToolHome):
                    json.dumps({"name": "team", "sources": [{"src": str(src), "dest": "teams/t1/claude"},
                                                            {"src": "/x", "dest": "../escape"}]}))
         self.ok_env("engine", "sync", "--base", str(self.base))
-        m = self.eng / "teams/t1/claude"
+        m = self.eng / "teams-t1-claude"                                 # one engines/ folder per source
         self.assertTrue((m / "CLAUDE.md").is_file())
         self.assertFalse((m / ".credentials.json").exists())
         self.assertFalse((m / "projects").exists())
@@ -4189,3 +4193,93 @@ class EverythingInBaseTests(ToolHome):
         r = run(d / "tools/brain.py", "uninstall", d, "--no-backup")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual((d / ".stignore").read_text(), "// mine\n.git\n")
+
+    def test_shipped_ignore_blocks_are_the_generated_ones(self):
+        gi, st = (REPO / ".gitignore").read_text(), (REPO / ".stignore").read_text()
+        self.assertIn(B.gitignore_layout() + "\n# base-folder:end", gi)
+        self.assertIn("// base-folder:start v1\n" + B.stignore_layout() + "\n// base-folder:end", st)
+        r = self.ok_env("layout", "--print")
+        self.assertEqual(r.stdout, B.gitignore_layout() + "\n\n" + B.stignore_layout() + "\n")
+
+    def test_syncthing_shares_safe_engine_files_and_never_a_secret(self):
+        pats = [l for l in B.stignore_layout().splitlines() if l and not l.startswith("//")]
+        synced = lambda path: syncthing_allows(pats, path)
+        for ok in ("engines/README.md", "engines/claude/CLAUDE.md", "engines/claude/skills/s/SKILL.md",
+                   "engines/claude/skills/x-token-spend/SKILL.md", "engines/claude/agents/a.md",
+                   "engines/hermes/profiles/p/SOUL.md", "engines/hermes/cron/jobs.json", "engines/gemini/MIRROR",
+                   "hot.md", "wiki/me/who-i-am.md"):
+            self.assertTrue(synced(ok), ok)
+        for no in ("engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/claude/settings.json",
+                   "engines/claude/skills/s/.env", "engines/claude/skills/s/token.json",
+                   "engines/claude/projects/-k/s.jsonl", "engines/claude/projects/-k/memory/MEMORY.md",
+                   "engines/hermes/state.db", "engines/hermes/cache/a.md", "engines/codex/auth.json",
+                   "engines/codex/config.toml", "engines/claude/skills/s/sessions/a.md", "engines/x/api_token",
+                   "projects/app/main.py", "data/x.bin", "ops/ci.py", "backups/a.tgz"):
+            self.assertFalse(synced(no), no)
+
+    def test_mirror_keeps_a_skill_named_like_a_token(self):
+        g = self.home / ".gemini"
+        self.write(g, "skills/x-token-spend/SKILL.md", "skill\n")
+        self.write(g, "skills/x-token-spend/token.json", '{"a": 1}')
+        self.ok_env("engine", "mirror", "gemini", "--base", str(self.base))
+        self.assertTrue((self.eng / "gemini/skills/x-token-spend/SKILL.md").is_file())
+        self.assertFalse((self.eng / "gemini/skills/x-token-spend/token.json").exists())
+
+    def test_guard_hook_from_init_refuses_secrets_and_tool_files(self):
+        self.git(self.base, "init", "-q")
+        r = self.init(self.base)
+        hook = self.base / ".git/hooks/pre-commit"
+        self.assertIn("skeleton-base pre-commit guard", hook.read_text())
+        self.git(self.base, "add", "-A"); self.git(self.base, "commit", "-qm", "base")
+        self.write(self.base, "engines/claude/skills/s/SKILL.md", "fine\n")
+        self.git(self.base, "add", "engines")
+        self.git(self.base, "commit", "-qm", "skill")                           # passes the hook
+        self.write(self.base, "wiki/leak.md", "k " + "sk-" + "ant-api03-abcdefghij1234567890XYZabc\n")
+        self.write(self.base, "engines/claude/settings.json", '{"env": {"K": "' + "sk-" + 'ant-api03-zz1234567890abcdefghijk"}}')
+        self.git(self.base, "add", "-A")
+        r = subprocess.run(["git", "-C", str(self.base), "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+                            "commit", "-qm", "leak"], capture_output=True, text=True,
+                           env=dict(os.environ, PATH=TEST_PATH, HOME=str(self.home)))
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("wiki/leak.md: content looks like a key", r.stderr)
+        self.assertIn("engines/claude/settings.json: content looks like a key", r.stderr)
+        self.assertNotIn("abcdefghij1234567890", r.stderr)
+        mine = self.tmp / "own-hook-base"
+        mine.mkdir()
+        self.git(mine, "init", "-q")
+        self.write(mine, ".git/hooks/pre-commit", "#!/bin/sh\nexit 0\n")
+        r = self.init(mine)
+        self.assertIn("pre-commit is your own: kept", r.stdout)
+
+    def test_projects_move_backs_up_a_partial_clone_without_a_download(self):
+        repo = self.home / "pc"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        self.write(repo, "a.md", "x\n")
+        self.git(repo, "add", "-A"); self.git(repo, "commit", "-qm", "one")
+        self.git(repo, "remote", "add", "origin", "https://example.invalid/nowhere.git")
+        self.git(repo, "config", "remote.origin.promisor", "true")
+        self.git(repo, "config", "extensions.partialClone", "origin")
+        r = self.ok_env("projects", "move", str(repo), "--base", str(self.base))
+        self.assertIn("partial clone", r.stdout)
+        bk = list((self.home / "skeleton-base-backups/moves").glob("pc-*.git.tar.gz"))
+        self.assertEqual(len(bk), 1)
+        self.assertTrue((self.base / "projects/pc/a.md").is_file())
+
+
+def syncthing_allows(patterns, path):
+    """Syncthing's ignore rules as documented: the FIRST pattern that matches the path or one of its parent folders
+    decides; '!' includes; a leading '/' anchors at the folder root; '*' stays in one part, '**' crosses parts."""
+    parts = path.split("/")
+    for pat in patterns:
+        neg = pat.startswith("!")
+        g = pat[1:] if neg else pat
+        anchored = g.startswith("/")
+        g = g.lstrip("/")
+        rx = B._glob_rx(g)
+        cands = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        if not anchored:
+            cands += ["/".join(parts[j:i]) for i in range(1, len(parts) + 1) for j in range(1, i)]
+        if any(rx.match(c) for c in cands):
+            return neg
+    return True

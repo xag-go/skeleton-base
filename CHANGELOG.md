@@ -11,13 +11,16 @@ Everything can live in the base, for any tool:
 - **Several folders of one tool**: `connect --tool-dir TOOL=DIR` / `--claude-config-dir DIR` (repeatable) and the
   shared registry `~/.config/ai-tool-dirs.d/*.json` (+ `~/.config/claude-code-dirs.d/`), read by connect, collect,
   watch and Frugal-Bridge; disconnect gives every folder back byte-identical.
-- **Layout**: `engines/`, `projects/` (+ `engines.json`, `projects.json`); deny-by-default `.gitignore` rules for
-  `engines/`, all layout folders off Syncthing (`.stignore` block, also added to a changed `.stignore`).
+- **Layout**: `engines/`, `projects/` (+ `engines.json`, `projects.json`). One per-tool table makes the `.gitignore`
+  and `.stignore` blocks (`layout --print`): the safe files of each tool folder (rules, agents, skills, memories,
+  hooks, scripts) reach git and Syncthing, secrets never (they come first, path-aware: a skill named `x-token-spend`
+  is kept); the `.stignore` block is added to a changed `.stignore` too and stays kit-owned.
+- **Pre-commit guard** (`guard`, hook written by `init`), also run by the watcher before its own commits.
 - **`engine adopt|release|mirror|unmirror|sync|list`**, **`projects move [--undo]|scan|clone`**, **`doctor`**.
 - **Never walked**: archive (uninstall backup), tidy snapshot, MCP `read_page`, `check-public` in a git repo.
 - `check` adds the git safety checks; `watch --discover` lists configured tool folders not wired yet.
 - README: the MCP server is the generic door for any agent (and why ACP is not).
-- 22 new tests (183 + 1 with Frugal-Bridge).
+- 27 new tests (189 in total).
 
 ## v1.5.4 - 2026-11-11
 Three fixes from a live run of `tidy` and `file` on a real base:

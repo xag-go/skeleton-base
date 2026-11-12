@@ -482,6 +482,7 @@ class Installer:
             self.offer_frugal(frugal_answer)
         _, wrote = build_map(self.d, quiet=True)
         self.log += [f"wrote {r}" for r in wrote]
+        self.log += install_hook(self.d)
         rep = check(self.d)
         return rep
 
@@ -578,6 +579,9 @@ class Installer:
         created = me.get("created", {})
         modes = me.get("placement", {})
         kept = []
+        hook = self.d / ".git" / "hooks" / "pre-commit"
+        if read(hook) == HOOK_TEXT:
+            hook.unlink(); self.log.append("removed .git/hooks/pre-commit (base guard)")
 
         if me.get("connect"):
             self.log += Connector(self.d).disconnect()
@@ -6240,6 +6244,10 @@ def git_commit(base, msg, extra=()):
     paths = [p for p in dict.fromkeys(WATCH_COMMIT + tuple(extra)) if (base / p).exists()]
     for p in paths:
         git("add", "-A", "--", p)                         # an ignored path just fails, the others still go in
+    eng = [p for p in paths if p.startswith("engines/")]
+    if eng and shutil.which("git"):                                               # watch commits skip hooks: the guard runs here instead
+        for p, why in staged_problems(base, eng):
+            git("reset", "-q", "--", p)
     if not paths or git("diff", "--cached", "--quiet", "--", *paths).returncode == 0:
         return False
     who = [] if git("config", "user.email").stdout.strip() else \
@@ -6794,9 +6802,12 @@ def check_public(target, words_file):
     skip_dirs = {".git", ".brain", "__pycache__", ".base-folder"}
     listed = None
     if (target / ".git").exists():        # a repo: what git could publish (tracked + not ignored); never walks
-        out = subprocess.run(["git", "-C", str(target), "ls-files", "-co", "--exclude-standard", "-z"],
-                             capture_output=True)                   # ignored tool dirs, code or heavy data
-        if out.returncode == 0:
+        try:
+            out = subprocess.run(["git", "-C", str(target), "ls-files", "-co", "--exclude-standard", "-z"],
+                                 capture_output=True)               # ignored tool dirs, code or heavy data
+        except OSError:
+            out = None
+        if out is not None and out.returncode == 0:
             listed = sorted({x for x in out.stdout.decode(errors="replace").split("\0") if x})
     walk = ((str(target / os.path.dirname(x)), [], [os.path.basename(x)]) for x in listed) if listed is not None \
         else os.walk(target)
@@ -6852,13 +6863,118 @@ ADOPT_WARN = {".hermes": "Hermes keeps absolute paths to its home in its launche
                          "pyvenv.cfg): it must be re-bootstrapped at the new home; rehearse on a copy first"}
 ENV_START, ENV_END = "# skeleton-base engines:start", "# skeleton-base engines:end"
 ENV_FILES = (".config/environment.d/60-base-engines.conf", ".profile", ".bashrc")   # services, logins, shells
-MIRROR_KEEP = ("*.md", "agents/**", "skills/**", "memories/**", "hooks/**", "scripts/**", "commands/**",
-               "rules/**", "cron/jobs.json")
-SECRET_NAMES = (".credentials*", ".claude.json*", "auth*", ".env", ".env.*", "*token*", "*secret*", "*.pem", "*.key",
-                "*.p12", "vault", "pairing", "mcp-tokens", "sessions", "projects", "*.db", "*.db-*", "*.sqlite*",
-                "cache", "caches", "logs", "*.log", "node_modules", "*.jsonl", "telegram_*", "browser-profile",
-                ".git", "__pycache__", ".venv", "venv", "shell-snapshots", "session-env", "file-history", "todos",
-                "statsig", "history*", "backups", "plugins", "frugal-bridge", "outputs", "state", "runtime")
+# What of a tool's folder in engines/ may leave this machine. Deny by default; the secrets first (they always win).
+# One table makes the base's .gitignore and .stignore blocks (`brain.py layout --print`), the mirror filter, the
+# pre-commit guard and doctor's checks, so they never disagree. Patterns: "x/" = that folder and all below it;
+# "*" = one path part. Keys: a tool folder name pattern under engines/ ("*" = every tool folder).
+ENGINE_SAFE = {         # Syncthing + git: rules, agents, skills, memories, hooks, scripts (no secrets live there)
+    "*": ("*.md", "MIRROR", "agents/", "skills/", "memories/", "hooks/", "scripts/", "commands/", "rules/",
+          "prompts/", "output-styles/"),
+    "hermes*": ("cron/jobs.json", "profiles/*/SOUL.md", "profiles/*/memories/", "profiles/*/skills/"),
+}
+ENGINE_GIT_ONLY = {     # git only (the pre-commit guard reads their content first); never Syncthing
+    "claude*": ("settings.json", "plugins/installed_plugins.json", "plugins/known_marketplaces.json"),
+}
+ENGINE_DENY_FILES = (".credentials*", ".claude.json*", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
+                     "id_rsa*", "id_ed25519*", "id_ecdsa*", "auth.json", "auth-*.json", "*token*.json", "*.token",
+                     "*credentials*", "*secret*.json", "oauth*.json", "*.db", "*.db-*", "*.sqlite*", "*.log",
+                     "*.jsonl", "telegram_*")       # file names, at any depth
+ENGINE_DENY_DIRS = ("vault", "pairing", "mcp-tokens", "sessions", "projects", "cache", "caches", "logs",
+                    "node_modules", "browser-profile", ".git", "__pycache__", ".venv", "venv", "shell-snapshots",
+                    "session-env", "file-history", "todos", "statsig")      # folder names, at any depth
+ENGINE_DENY_TOP = ("auth*", "*token*", "*secret*")  # loose names only at the top of a tool folder (a skill named
+                                                    # `x-token-spend` or `authoring/` stays allowed)
+LAYOUT_CLOSED = ("projects", "data", "apps", "runs", "scratch", "backups")   # never in git (README.md only)
+
+
+def _glob_rx(g):
+    out, i = "", 0
+    while i < len(g):
+        if g.startswith("**", i):
+            out += ".*"; i += 2
+        elif g[i] == "*":
+            out += "[^/]*"; i += 1
+        elif g[i] == "?":
+            out += "[^/]"; i += 1
+        else:
+            out += re.escape(g[i]); i += 1
+    return re.compile("^" + out + "$")
+
+
+def _safe_match(r, pats):
+    for g in pats:
+        if g.endswith("/"):
+            parts = g.rstrip("/").split("/")
+            rp = r.split("/")
+            if len(rp) > len(parts) and all(_glob_rx(a).match(b) for a, b in zip(parts, rp)):
+                return True
+        elif "/" in g or "/" not in r:
+            if _glob_rx(g).match(r):
+                return True
+    return False
+
+
+def engine_rule(rel):
+    """For a path below engines/ ('claude/skills/x/SKILL.md'): 'deny' (a secret or session), 'sync' (git and
+    Syncthing), 'git' (git only, content checked) or 'no' (not on the allow list: stays local)."""
+    parts = rel.split("/")
+    if len(parts) < 2:
+        return "sync" if rel in ("README.md",) else "no"
+    tool, r = parts[0], "/".join(parts[1:])
+    if any(fnmatch.fnmatchcase(parts[-1], g) for g in ENGINE_DENY_FILES) or \
+            any(fnmatch.fnmatchcase(d, g) for d in parts[1:-1] for g in ENGINE_DENY_DIRS) or \
+            (len(parts) == 2 and any(fnmatch.fnmatchcase(parts[-1], g) for g in ENGINE_DENY_TOP)):
+        return "deny"
+    for table, kind in ((ENGINE_SAFE, "sync"), (ENGINE_GIT_ONLY, "git")):
+        for k, pats in table.items():
+            if fnmatch.fnmatchcase(tool, k) and _safe_match(r, pats):
+                return kind
+    return "no"
+
+
+def _parents(pat):
+    """'profiles/*/SOUL.md' -> ['profiles/', 'profiles/*/'] (git needs each folder re-included)."""
+    ps = pat.rstrip("/").split("/")[:-1]
+    return ["/".join(ps[:i + 1]) + "/" for i in range(len(ps))]
+
+
+def gitignore_layout():
+    """The layout part of the base's .gitignore block (deny by default for engines/, hard denies last)."""
+    out = ["# layout (generated: brain.py layout --print): code, heavy data and tool folders live in the base, "
+           "never in its git"]
+    for d in LAYOUT_CLOSED:
+        out += [f"/{d}/*", f"!/{d}/README.md"]
+    out += ["/engines/**", "!/engines/README.md", "!/engines/*/"]
+    for table in (ENGINE_SAFE, ENGINE_GIT_ONLY):
+        for k, pats in table.items():
+            for g in pats:
+                for par in _parents(g):
+                    out.append(f"!/engines/{k}/{par}")
+                out.append(f"!/engines/{k}/{g}")
+                if g.endswith("/"):
+                    out.append(f"!/engines/{k}/{g}**")
+    out.append("# hard denies last: they win over every line above")
+    out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
+    out += [f"/engines/**/{d}/" for d in ENGINE_DENY_DIRS]
+    out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
+    return "\n".join(dict.fromkeys(out))
+
+
+def stignore_layout():
+    """The base's .stignore block: Syncthing takes the FIRST pattern that matches, so the secrets come first, then
+    the safe files of each tool folder, then everything else of the layout folders is ignored."""
+    out = ["// layout (generated: brain.py layout --print): secrets first (first match wins), then the safe files of",
+           "// engines/<tool>/, then nothing else of the layout folders leaves this machine"]
+    out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
+    out += [f"/engines/**/{d}" for d in ENGINE_DENY_DIRS]
+    out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
+    out.append("!/engines/README.md")
+    for k, pats in ENGINE_SAFE.items():
+        out += [f"!/engines/{k}/{g.rstrip('/')}" for g in pats]
+    out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]
+    return "\n".join(dict.fromkeys(out))
+
+
 MIRROR_MAX = 5 * 1024 * 1024
 SOURCES_D = ".config/my-setup/sources.d"          # older mirror registrations: {"name", "sources": [{src, dest}]}
 SECRET_TEXT = re.compile(
@@ -6874,7 +6990,9 @@ GIT_PROBES = (("engines/x/.credentials.json", True), ("engines/x/.claude.json", 
               ("engines/x/state.db", True), ("engines/x/cache/a.md", True), ("engines/x/api_token.txt", True),
               ("engines/x/settings.json", True), ("engines/x/config.toml", True), ("projects/x/main.py", True),
               ("data/x.bin", True), ("engines/x/CLAUDE.md", False), ("engines/x/skills/s/SKILL.md", False),
-              ("engines/x/memories/MEMORY.md", False))
+              ("engines/x/memories/MEMORY.md", False), ("engines/x/skills/s/.env", True),
+              ("engines/x/skills/x-token-spend/SKILL.md", False), ("engines/x/auth-profiles.json", True),
+              ("engines/claude/settings.json", False), ("engines/x/skills/s/sessions/a.md", True))
 
 
 def looks_secret(text):
@@ -6885,8 +7003,13 @@ def looks_secret(text):
     return False
 
 
+SECRET_FILES = (".credentials*", ".claude.json*", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
+                "id_rsa*", "id_ed25519*", "id_ecdsa*", "auth.json")      # anywhere in the base
+
+
 def secret_name(r):
-    return any(fnmatch.fnmatchcase(part, g) for part in r.split("/") for g in SECRET_NAMES)
+    """A secret-looking file name anywhere in the base (outside engines/ too)."""
+    return any(fnmatch.fnmatchcase(r.split("/")[-1], g) for g in SECRET_FILES)
 
 
 def keep_match(r, pat):
@@ -6943,6 +7066,87 @@ def procs_using(path):
                 cmd = "?"
             out.append((int(pid), cmd.strip()[:120]))
     return out
+
+
+# -- the base's pre-commit guard (second wall after .gitignore): same table as the ignore files
+HOOK_MARK = "skeleton-base pre-commit guard"
+HOOK_TEXT = f"""#!/bin/sh
+# {HOOK_MARK} (written by brain.py init; put a hook of your own in .git/hooks/pre-commit.local: it runs first)
+top=$(git rev-parse --show-toplevel) || exit 1
+if [ -x "$top/.git/hooks/pre-commit.local" ]; then "$top/.git/hooks/pre-commit.local" || exit 1; fi
+exec python3 "$top/tools/brain.py" guard --root "$top"
+"""
+GUARD_MAX = 5 * 1024 * 1024
+
+
+def install_hook(d):
+    d = pathlib.Path(d)
+    if not (d / ".git").is_dir():
+        return []
+    hook = d / ".git" / "hooks" / "pre-commit"
+    cur = read(hook)
+    if cur == HOOK_TEXT:
+        return []
+    if cur is None or HOOK_MARK in cur:
+        write(hook, HOOK_TEXT)
+        hook.chmod(0o755)
+        return ["wrote .git/hooks/pre-commit (base guard: secrets, tool folders, code, big files)"]
+    return [".git/hooks/pre-commit is your own: kept. For the base guard too, rename it to "
+            ".git/hooks/pre-commit.local and run init again"]
+
+
+def staged_problems(base, paths=None):
+    """[(path, why)] for staged changes that must not be committed. Never shows a secret's text."""
+    base, bad = pathlib.Path(base), []
+    r = subprocess.run(["git", "-C", str(base), "diff", "--cached", "--raw", "-z", "--no-renames",
+                        "--diff-filter=ACMRT", "--", *(paths or [])], capture_output=True)
+    parts = r.stdout.decode("utf-8", "replace").split("\0")
+    for meta, path in zip(parts[0::2], parts[1::2]):
+        if not meta.startswith(":"):
+            continue
+        f = meta[1:].split()
+        mode, obj = f[1], f[3]
+        top, _, rest = path.partition("/")
+        if mode == "160000":
+            bad.append((path, "a nested repo (gitlink): keep it in projects/ (ignored) and in projects.json"))
+            continue
+        if top == "engines" and rest != "README.md" and engine_rule(rest) in ("deny", "no"):
+            bad.append((path, "engines/ file not on the allow list (or a secret, session or cache name)"))
+            continue
+        if top in LAYOUT_CLOSED and rest not in ("README.md", "projects.json"):
+            bad.append((path, f"{top}/ is never tracked"))
+            continue
+        if secret_name(path):
+            bad.append((path, "secret-looking file name"))
+            continue
+        size = subprocess.run(["git", "-C", str(base), "cat-file", "-s", obj], capture_output=True, text=True)
+        n = int(size.stdout.strip() or 0) if size.returncode == 0 else 0
+        if n > GUARD_MAX:
+            bad.append((path, f"{n // 1024 // 1024} MB is over the 5 MB limit"))
+            continue
+        blob = subprocess.run(["git", "-C", str(base), "cat-file", "blob", obj], capture_output=True)
+        if n and b"\0" not in blob.stdout[:4096] and looks_secret(blob.stdout.decode("utf-8", "replace")):
+            bad.append((path, "content looks like a key or token (not shown)"))
+    return bad
+
+
+def guard_main(base):
+    try:
+        bad = staged_problems(base)
+    except OSError as e:
+        print(f"pre-commit (base guard): git not usable ({e})", file=sys.stderr)
+        return 1
+    gl = shutil.which("gitleaks")
+    if gl and not bad:
+        r = subprocess.run([gl, "git", "--pre-commit", "--staged", "--redact", "--no-banner", "--log-level", "error",
+                            "--exit-code", "1", str(base)], capture_output=True, text=True)
+        if r.returncode == 1:
+            bad.append(("(staged)", "gitleaks found a possible secret (gitleaks git --pre-commit --staged --redact -v)"))
+    if bad:
+        print("pre-commit (base guard): commit refused (a reviewed false positive: git commit --no-verify)\n" +
+              "".join(f"  - {p}: {why}\n" for p, why in bad[:50]), end="", file=sys.stderr)
+        return 1
+    return 0
 
 
 # -- engines: adopt (move + the tool's own setting), release (exact reverse), mirror (tools without a setting)
@@ -7151,7 +7355,7 @@ def mirror_sources(base, home):
     out = []
     for name, e in sorted(reg_load(base, ENGINES_REG).get("engines", {}).items()):
         if e.get("mode") == "mirror" and e.get("src"):
-            out.append((name, pathlib.Path(expand(e["src"], home)), e.get("keep") or list(MIRROR_KEEP)))
+            out.append((name, pathlib.Path(expand(e["src"], home)), e.get("keep") or None))
     d = pathlib.Path(os.environ.get("MY_SETUP_SOURCES_DIR") or (pathlib.Path(home) / SOURCES_D)).expanduser()
     for f in sorted(d.glob("*.json")) if d.is_dir() else []:
         try:
@@ -7162,22 +7366,24 @@ def mirror_sources(base, home):
             src, dest = (x or {}).get("src"), (x or {}).get("dest")
             parts = pathlib.PurePosixPath(dest).parts if isinstance(dest, str) else ()
             if isinstance(src, str) and parts and not pathlib.PurePosixPath(dest).is_absolute() and ".." not in parts:
-                out.append(("/".join(parts), pathlib.Path(expand(src, home)), None))
+                out.append(("-".join(parts), pathlib.Path(expand(src, home)), None))   # one engines/ folder each
     return out
 
 
-def mirror_files(src, keep):
-    """{relative path: file} to copy: keep globs (None = all), never secret names, links or big files."""
+def mirror_files(src, keep, name="x"):
+    """{relative path: file} to copy: what engines/NAME/ may hold (engine_rule: safe or git-only, never a secret),
+    narrowed by keep globs; no links, no big files."""
+    ok = lambda r: engine_rule(f"{name}/{r}") in ("sync", "git") and (not keep or any(keep_match(r, g) for g in keep))
     if src.is_file():
-        return {} if secret_name(src.name) else {src.name: src}
+        return {src.name: src} if ok(src.name) else {}
     out = {}
     for dp, dns, fns in os.walk(src):
         r0 = os.path.relpath(dp, src)
         r0 = "" if r0 == "." else r0 + "/"
-        dns[:] = sorted(d for d in dns if not secret_name(d) and not os.path.islink(os.path.join(dp, d)))
+        dns[:] = sorted(d for d in dns if d not in ENGINE_DENY_DIRS and not os.path.islink(os.path.join(dp, d)))
         for f in sorted(fns):
             r, p = r0 + f, pathlib.Path(dp) / f
-            if secret_name(r) or p.is_symlink() or (keep and not any(keep_match(r, g) for g in keep)):
+            if p.is_symlink() or not ok(r):
                 continue
             try:
                 if p.stat().st_size > MIRROR_MAX:
@@ -7197,7 +7403,7 @@ def mirror_sync(base, home=None, quiet=True):
         dst = base / "engines" / name
         if in_dir(src, base):
             continue                                    # never mirror the base into itself
-        want = mirror_files(src, keep) if src.exists() else {}
+        want = mirror_files(src, keep, name) if src.exists() else {}
         n, skipped = 0, []
         dst.mkdir(parents=True, exist_ok=True)
         marker = (f"MIRROR: read-only copy kept by `brain.py watch` (engine mirror).\nsource: {home_rel(src, home)}\n"
@@ -7288,7 +7494,10 @@ def engine_list(base):
 
 # -- projects: one repo per folder, registry for a new machine, safe moves with undo
 def git_out(*args, cwd=None):
-    r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    except OSError:
+        return None
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -7403,6 +7612,7 @@ def move_paths_in_tools(home, pairs, log, undo=False):
 
 def projects_move(base, path, slug=None, force=False, keep_worktrees=False, bundle=True):
     base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    os.environ["GIT_NO_LAZY_FETCH"] = "1"            # never download missing blobs of a partial clone
     src = pathlib.Path(os.path.abspath(os.path.expanduser(path)))
     if not (src / ".git").is_dir():
         raise SystemExit(f"projects move: {src} is not the main folder of a git repository")
@@ -7423,10 +7633,21 @@ def projects_move(base, path, slug=None, force=False, keep_worktrees=False, bund
     if bundle:
         bdir = home / BACKUPS_DIR / "moves"
         bdir.mkdir(parents=True, exist_ok=True)
-        bf = bdir / f"{slug}-{dt.datetime.now():%Y%m%d-%H%M%S}.bundle"
-        if git_out("-C", str(src), "bundle", "create", str(bf), "--all") is None:
-            raise SystemExit(f"projects move: git bundle failed for {src}; nothing moved (or pass --no-bundle)")
-        log.append(f"backup: {bf}")
+        stamp = f"{slug}-{dt.datetime.now():%Y%m%d-%H%M%S}"
+        partial = git_out("-C", str(src), "config", "--get", "extensions.partialClone") or \
+            any((git_out("-C", str(src), "config", "--get", f"remote.{r}.promisor") or "") == "true"
+                for r in (git_out("-C", str(src), "remote") or "").split())
+        if partial:          # a partial clone: `bundle --all` would download every missing blob; keep .git as is
+            import tarfile
+            bf = bdir / f"{stamp}.git.tar.gz"
+            with tarfile.open(bf, "w:gz") as tar:
+                tar.add(str(src / ".git"), arcname=f"{slug}/.git")
+            os.chmod(bf, 0o600)
+        else:
+            bf = bdir / f"{stamp}.bundle"
+            if git_out("-C", str(src), "bundle", "create", str(bf), "--all") is None:
+                raise SystemExit(f"projects move: git bundle failed for {src}; nothing moved (or pass --no-bundle)")
+        log.append(f"backup: {bf}" + (" (partial clone: its .git as it is, nothing downloaded)" if partial else ""))
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.rename(src, dest)
@@ -7537,7 +7758,7 @@ def configured_dirs(home):
 def doctor_git(base):
     """[(level, text)]: tracked secrets or gitlinks under the layout dirs, ignore rules that do not hold."""
     base, out = pathlib.Path(base), []
-    if not (base / ".git").exists():
+    if not (base / ".git").exists() or not shutil.which("git"):
         return out
     tracked = (git_out("-C", str(base), "ls-files", "-s", "--", *BASE_SKIP) or "").splitlines()
     for line in tracked:
@@ -7546,8 +7767,11 @@ def doctor_git(base):
         if mode == "160000":
             out.append(("ERROR", f"gitlink (nested repo added to the base's git): {path}; "
                                  f"`git rm --cached {path}` and keep projects/ ignored"))
-        elif path.startswith("engines/") and secret_name(path.split("/", 2)[-1]):
-            out.append(("ERROR", f"tracked in git but may hold a secret: {path} (`git rm --cached {path}`)"))
+        elif path.startswith("engines/") and engine_rule(path[len("engines/"):]) in ("deny", "no"):
+            out.append(("ERROR", f"tracked in git but may hold a secret (not on the engines/ allow list): {path} "
+                                 f"(`git rm --cached {path}`)"))
+        elif path.split("/")[0] in LAYOUT_CLOSED and path.split("/", 1)[-1] not in ("README.md", "projects.json"):
+            out.append(("ERROR", f"tracked in git but {path.split('/')[0]}/ is never tracked: {path}"))
     for probe, want in GIT_PROBES:
         r = subprocess.run(["git", "-C", str(base), "check-ignore", "-q", "--no-index", probe], capture_output=True)
         if (r.returncode == 0) != want:
@@ -7774,6 +7998,13 @@ def main(argv):
             log += [f"needs you: {tool_tilde(k)}: {c.tools[k]['why']}" for k in needs]
         print("\n".join(log) or "nothing to change")
         return 0
+    if cmd == "layout":
+        if "--print" not in args:
+            print("usage: layout --print   (the generated layout part of .gitignore, then of .stignore)"); return 1
+        print(gitignore_layout() + "\n\n" + stignore_layout())
+        return 0
+    if cmd == "guard":
+        return guard_main(root_of())
     if cmd in ("engine", "projects", "doctor"):
         base, i, rest, flags = SRC, 0, [], set()
         while i < len(args):
