@@ -4230,12 +4230,79 @@ class EverythingInBaseTests(ToolHome):
         for no in ("engines/claude/.credentials.json", "engines/claude/.claude.json", "engines/claude/settings.json",
                    "engines/codex/config.toml", "engines/codex/auth.json", "engines/hermes/config.yaml",
                    "engines/claude/projects/-k/s.jsonl", "engines/hermes/state.db", "engines/x/api_token",
-                   "projects/app/.env", "projects/app/.env.local", "projects/app/k.pem", "projects/app/a/token.json",
+                   "projects/app/.env", "projects/app/.env.local", "ops/x/members-e2e.env", "projects/app/.npmrc", "projects/app/k.pem", "projects/app/a/token.json",
                    "projects/app/node_modules/x/i.js", "projects/app/.git/config", "projects/app/.venv/bin/py",
                    "data/x.bin", "backups/a.tgz", "apps/x", "runs/a.zst", "projects/app/db.sqlite3"):
             self.assertFalse(synced(no), no)
 
+    def fake_gitleaks(self):
+        g = self.bin / "gitleaks"
+        g.write_text(f"#!{sys.executable}\n" + """import json, os, sys
+a = sys.argv
+root = a[a.index("dir") + 1]
+flag = [x for x in os.environ.get("FAKE_FLAGGED", "").split(",") if x]
+out = []
+for dp, _, fns in os.walk(root):
+    for f in fns:
+        rel = os.path.relpath(os.path.join(dp, f), root)
+        if rel in flag:
+            out.append({"File": os.path.join(dp, f), "RuleID": "fake-key", "Secret": "REDACTED"})
+open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
+""")
+        g.chmod(0o755)
+
+    def sync_base(self):
+        self.git(self.base, "init", "-q")
+        self.init(self.base)
+        self.write(self.base, ".stignore", "// mine\n")
+        self.init(self.base)
+        for f in ("ops/a/preview.sh", "ops/a/ok.sh", "wiki/n.md"):
+            self.write(self.base, f, "echo hi\n")
+
+    def test_sync_all_refuses_without_gitleaks(self):
+        self.sync_base()
+        r = self.hb("engine", "sync-all", "on", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("gitleaks", r.stdout + r.stderr)
+        self.assertNotIn("sync", (self.base / ".brain/engines.json").read_text() if (self.base / ".brain/engines.json").exists() else "")
+
+    def test_sync_scan_denies_flagged_files_and_is_idempotent(self):
+        self.sync_base()
+        self.fake_gitleaks()
+        env = {"FAKE_FLAGGED": "ops/a/preview.sh"}
+        self.ok_env("engine", "sync-all", "on", "--base", str(self.base), env=env)
+        st = (self.base / ".stignore").read_text()
+        self.assertIn("\n/ops/a/preview.sh\n", st)
+        self.assertLess(st.index("/ops/a/preview.sh"), st.index("// sync all"))
+        pats = [l for l in B.stignore_layout({B.SYNC_ALL: ["all"], B.SYNC_DENIED: ["ops/a/preview.sh"]}).splitlines()
+                if l and not l.startswith("//")]
+        self.assertFalse(syncthing_allows(pats, "ops/a/preview.sh"))
+        self.assertTrue(syncthing_allows(pats, "ops/a/ok.sh"))
+        den = json.loads((self.base / ".brain/sync-denied.json").read_text())["denied"]
+        self.assertEqual(den, {"ops/a/preview.sh": ["fake-key"]})
+        self.assertNotIn("REDACTED", (self.base / ".brain/sync-denied.json").read_text())
+        self.ok_env("engine", "sync-scan", "--force", "--base", str(self.base), env=env)
+        self.assertEqual(st, (self.base / ".stignore").read_text())
+        self.ok_env("engine", "sync-scan", "--base", str(self.base), env=env)
+        self.assertEqual(st, (self.base / ".stignore").read_text())
+        self.ok_env("engine", "sync-all", "off", "--base", str(self.base))
+        self.assertNotIn("preview.sh", (self.base / ".stignore").read_text())
+
+    def test_doctor_warns_when_the_scan_is_behind(self):
+        self.sync_base()
+        self.fake_gitleaks()
+        self.ok_env("engine", "sync-all", "on", "--base", str(self.base))
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("brain.py engine sync-scan", r.stdout)
+        self.write(self.base, "ops/a/new.sh", "echo new\n")
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertIn("brain.py engine sync-scan", r.stdout)
+        self.ok_env("engine", "sync-scan", "--base", str(self.base))
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("brain.py engine sync-scan", r.stdout)
+
     def test_engine_sync_all_on_and_off_round_trip(self):
+        self.fake_gitleaks()
         self.git(self.base, "init", "-q")
         self.init(self.base)
         self.write(self.base, ".stignore", "// mine\n")

@@ -76,6 +76,7 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
                                XDG_CONFIG_HOME/XDG_DATA_HOME for opencode, Kilo, Goose)
 
 Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's git or Syncthing)
+  engine sync-scan [--force]   (sync all) gitleaks over what would be shared; flagged files get exact deny lines
   engine sync-all on|off       Syncthing shares the whole base except secrets, tool config files and heavy files
                                (node_modules, .git, DBs, archives); data/, apps/, backups/ stay off; git unchanged
   engine share NAME SUBDIR [--remove]  share one more safe sub-folder of engines/NAME (engines.json "share"); the
@@ -128,6 +129,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -6200,6 +6202,13 @@ def watch_once(base, commit=True, connect=True):
             out["mirror"] = mirrored
     except (SystemExit, Exception) as e:
         mirrored, out["error"] = [], f"mirror: {e}"
+    try:                                                  # sync all: scan new files for secrets (at most every 10 min)
+        if engine_shares(base).get(SYNC_ALL) is not None:
+            st = json.loads(read(base / SYNC_SCAN_STATE) or "{}")
+            if time.time() - float(st.get("scanned_at", 0)) > 600:
+                out["sync-scan"] = sync_scan(base)[0]
+    except (SystemExit, Exception) as e:
+        out["error"] = f"sync-scan: {e}"
     import io, contextlib
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -6904,7 +6913,8 @@ ENGINE_DENY_TOP = ("auth*", "*token*", "*secret*")  # loose names only at the to
                                                     # `x-token-spend` or `authoring/` stays allowed)
 LAYOUT_CLOSED = ("projects", "data", "apps", "runs", "scratch", "backups")   # never in git (README.md only)
 SYNC_ALL_CLOSED = ("data", "apps", "backups")    # engines.json "sync": "all" still keeps these off other devices
-SYNC_ALL_DENY_FILES = tuple(g for g in ENGINE_DENY_FILES if g not in ("*.db", "*.db-*", "*.sqlite*", "*.log", "*.jsonl"))
+SYNC_ALL_DENY_FILES = tuple(g for g in ENGINE_DENY_FILES if g not in ("*.db", "*.db-*", "*.sqlite*", "*.log", "*.jsonl")) + \
+    ("*.env", "*.env.*", ".netrc", ".npmrc", ".pypirc", "*.keystore", "*.jks", "service-account*.json")
 SYNC_ALL_HEAVY_FILES = ("*.db", "*.db-*", "*.sqlite*", "*.tar", "*.tar.*", "*.tgz", "*.zst", "*.zip", "*.bundle",
                         "*.7z", "*.iso", "*.whl")
 SYNC_ALL_ENGINE_CONFIG = ("settings.json", "settings.local.json", "config.toml", "config.yaml", "config.yml",
@@ -6983,7 +6993,7 @@ def gitignore_layout(shares=None):
                 if g.endswith("/"):
                     out.append(f"!/engines/{k}/{g}**")
     for k, subs in sorted((shares or {}).items()):          # engines.json "share": extra safe sub-folders
-        if k == SYNC_ALL:
+        if k in (SYNC_ALL, SYNC_DENIED):
             continue
         for sub in subs:
             out += [f"!/engines/{k}/{par}" for par in _parents(sub + "/x")] + [f"!/engines/{k}/{sub}/",
@@ -6995,11 +7005,19 @@ def gitignore_layout(shares=None):
     return "\n".join(dict.fromkeys(out))
 
 
+def _st_escape(path):
+    """A path as an exact Syncthing pattern (glob characters escaped)."""
+    return re.sub(r"([\\*?\[\]{}])", r"\\\1", path).replace("\n", "")
+
+
 def stignore_layout(shares=None):
     """The base's .stignore block: Syncthing takes the FIRST pattern that matches, so the secrets come first, then
     the safe files of each tool folder, then everything else of the layout folders is ignored."""
     out = ["// layout (generated: brain.py layout --print): secrets first (first match wins), then the safe files of",
            "// engines/<tool>/, then nothing else of the layout folders leaves this machine"]
+    if (shares or {}).get(SYNC_ALL) and (shares or {}).get(SYNC_DENIED):
+        out.append(SYNC_DENY_MARK)
+        out += ["/" + _st_escape(x) for x in sorted(shares[SYNC_DENIED])]
     out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
     out += [f"/engines/**/{d}" for d in ENGINE_DENY_DIRS]
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
@@ -7036,6 +7054,11 @@ def share_check(sub):
 
 
 SYNC_ALL = "*sync-all*"     # key in engine_shares() output: engines.json "sync": "all" (never a folder name)
+SYNC_DENIED = "*sync-denied*"   # key: exact paths the content scan flagged (.brain/sync-denied.json), sync all only
+SYNC_DENIED_REG = ".brain/sync-denied.json"
+SYNC_SCAN_STATE = ".brain/sync-scan-state.json"
+SYNC_SCAN_MAX = 2 * 1024 * 1024
+SYNC_DENY_MARK = "// sync scan denied (generated: brain.py engine sync-scan): flagged files, before the share lines"
 
 
 def engine_shares(base):
@@ -7043,6 +7066,12 @@ def engine_shares(base):
     out, reg = {}, reg_load(base, ENGINES_REG)
     if reg.get("sync") == "all":
         out[SYNC_ALL] = ["all"]
+        try:
+            den = json.loads(read(pathlib.Path(base) / SYNC_DENIED_REG) or "{}").get("denied", {})
+        except ValueError:
+            den = {}
+        if isinstance(den, dict) and den:
+            out[SYNC_DENIED] = sorted(k for k in den if isinstance(k, str))
     for name, e in reg.get("engines", {}).items():
         subs = []
         for x in (e.get("share") or []) if isinstance(e, dict) else []:
@@ -7081,17 +7110,191 @@ def refresh_ignore_blocks(base):
     return done
 
 
+def syncthing_allows(patterns, path):
+    """Syncthing's ignore rules: the FIRST pattern matching the path or one of its parent folders decides ('!'
+    includes; a leading '/' anchors at the folder root; '*' stays in one part, '**' crosses parts)."""
+    parts = path.split("/")
+    for pat in patterns:
+        neg = pat.startswith("!")
+        g = pat[1:] if neg else pat
+        if g.startswith("(?d)"):
+            g = g[4:]
+        anchored = g.startswith("/")
+        g = g.lstrip("/").rstrip("/")
+        rx = _glob_rx(g)
+        cands = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        if not anchored:
+            cands += ["/".join(parts[j:i]) for i in range(1, len(parts) + 1) for j in range(1, i)]
+        if any(rx.match(c) for c in cands):
+            return neg
+    return True
+
+
+def find_gitleaks():
+    return shutil.which("gitleaks") or next((str(c) for c in (pathlib.Path.home() / ".local/bin/gitleaks",)
+                                             if c.is_file() and os.access(c, os.X_OK)), None)
+
+
+def _sync_patterns(base):
+    """The share rules without the generated denied lines: the layout part for sync all plus the base's own block."""
+    pats = [l.strip() for l in stignore_layout({SYNC_ALL: ["all"]}).splitlines()
+            if l.strip() and not l.startswith("//")]
+    extra = []
+    own = {"/" + _st_escape(x) for x in reg_load(base, SYNC_DENIED_REG).get("denied", {})}   # last scan's lines
+    for l in (read(pathlib.Path(base) / ".stignore") or "").splitlines():
+        l = l.strip()
+        if l and not l.startswith("//") and not l.startswith("#include") and l not in pats and l not in own:
+            extra.append(l)
+    return pats + extra
+
+
+def sync_candidates(base):
+    """{rel path: (mtime_ns, size)} of the regular files the share rules would send (sync all on)."""
+    base, out = pathlib.Path(base), {}
+    pats = _sync_patterns(base)
+    for dp, dns, fns in os.walk(base):
+        rel = os.path.relpath(dp, base)
+        rel = "" if rel == "." else rel.replace(os.sep, "/")
+        keep = []
+        for d in sorted(dns):
+            r = f"{rel}/{d}" if rel else d
+            if d in (".git", ".brain") or os.path.islink(os.path.join(dp, d)) or not syncthing_allows(pats, r + "/x"):
+                continue
+            keep.append(d)
+        dns[:] = keep
+        for f in fns:
+            r = f"{rel}/{f}" if rel else f
+            fp = os.path.join(dp, f)
+            if os.path.islink(fp) or not syncthing_allows(pats, r):
+                continue
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                out[r] = (st.st_mtime_ns, st.st_size)
+    return out
+
+
+def _is_text(fp):
+    try:
+        with open(fp, "rb") as f:
+            return b"\0" not in f.read(8192)
+    except OSError:
+        return False
+
+
+def sync_scan(base, force=False, now=None):
+    """Content gate for sync all: gitleaks over the files the rules would share (only new or changed ones since the
+    last scan unless FORCE); flagged files (and non-text files above 2 MB) go to .brain/sync-denied.json (paths and
+    rule ids only) and into the generated deny lines of .stignore. Returns (log lines, number denied)."""
+    base = pathlib.Path(base).resolve()
+    if engine_shares(base).get(SYNC_ALL) is None:
+        return ["sync scan: sync all is off (nothing to do)"], 0
+    gl = find_gitleaks()
+    if not gl:
+        raise SystemExit("sync scan: gitleaks not found (put it on PATH or in ~/.local/bin/gitleaks); "
+                         "sync all needs it to keep secrets out of what is shared")
+    cur = sync_candidates(base)
+    try:
+        state = {} if force else json.loads(read(base / SYNC_SCAN_STATE) or "{}")
+    except ValueError:
+        state = {}
+    seen = state.get("seen", {}) if isinstance(state, dict) and isinstance(state.get("seen"), dict) else {}
+    prev = reg_load(base, SYNC_DENIED_REG).get("denied", {})
+    denied, todo = {}, []
+    for r, (mt, sz) in cur.items():
+        if sz > SYNC_SCAN_MAX:
+            if not _is_text(base / r):
+                denied[r] = ["binary-over-2mb"]
+            continue
+        if seen.get(r) == [mt, sz]:
+            if r in prev:
+                denied[r] = prev[r]
+        else:
+            todo.append(r)
+    if todo:
+        tmp = base / ".brain" / "sync-scan-tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        rep = base / ".brain" / "sync-scan-report.json"
+        try:
+            for r in todo:
+                dst = tmp / r
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(base / r, dst)
+                except OSError:
+                    shutil.copy2(base / r, dst)
+            rep.unlink(missing_ok=True)
+            p = subprocess.run([gl, "dir", str(tmp), "--no-banner", "--report-format", "json", "--report-path",
+                                str(rep), "--exit-code", "0", "--redact"], capture_output=True, text=True)
+            if p.returncode != 0:
+                raise SystemExit(f"sync scan: gitleaks failed ({p.returncode}): {(p.stderr or '').strip()[-200:]}")
+            try:
+                found = json.loads(read(rep) or "[]") or []
+            except ValueError:
+                raise SystemExit("sync scan: gitleaks report is not valid JSON")
+        finally:
+            rep.unlink(missing_ok=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+        pre = str(tmp) + os.sep
+        for f in found:
+            fp = str(f.get("File", ""))
+            r = fp[len(pre):] if fp.startswith(pre) else (os.path.relpath(fp, base) if os.path.isabs(fp) else fp)
+            r = r.replace(os.sep, "/")
+            if r in cur:
+                denied[r] = sorted(set(denied.get(r, [])) | {str(f.get("RuleID", "?"))})
+    new_seen = {r: list(v) for r, v in cur.items() if v[1] <= SYNC_SCAN_MAX}
+    ts = time.time() if now is None else now
+    reg_save(base, SYNC_DENIED_REG, {"denied": {k: denied[k] for k in sorted(denied)}})
+    atomic_write(base / SYNC_SCAN_STATE, json.dumps({"scanned_at": ts, "seen": new_seen}, sort_keys=True) + "\n")
+    done = refresh_ignore_blocks(base)
+    added = sorted(set(denied) - set(prev))
+    log = [f"sync scan: {len(cur)} shareable files, {len(todo)} scanned, {len(denied)} denied"
+           + (f" ({len(added)} new)" if added else "") + (f"; updated {', '.join(done)}" if done else "")]
+    return log, len(denied)
+
+
+def sync_scan_due(base, max_age=86400.0, now=None):
+    """None when fine, else why a scan is needed (sync all on only): never scanned, scan too old, or a shareable file
+    is new or changed since the last scan."""
+    base = pathlib.Path(base)
+    if engine_shares(base).get(SYNC_ALL) is None:
+        return None
+    try:
+        st = json.loads(read(base / SYNC_SCAN_STATE) or "{}")
+    except ValueError:
+        st = {}
+    if not isinstance(st, dict) or "scanned_at" not in st:
+        return "never scanned"
+    if (time.time() if now is None else now) - float(st["scanned_at"]) > max_age:
+        return "last scan is older than 24 h"
+    seen = st.get("seen", {})
+    n = sum(1 for r, (mt, sz) in sync_candidates(base).items() if sz <= SYNC_SCAN_MAX and seen.get(r) != [mt, sz])
+    return f"{n} new or changed shareable file(s) not scanned yet" if n else None
+
+
 def engine_sync_all(base, on):
     """engines.json "sync": "all" on/off: Syncthing shares the whole base except secrets, tool config files and
     heavy files (git rules do not change). Returns log lines."""
     reg = reg_load(base, ENGINES_REG)
     if on:
+        if not find_gitleaks():
+            raise SystemExit("engine sync-all: gitleaks not found (put it on PATH or in ~/.local/bin/gitleaks); "
+                             "it scans the files for secrets before they are shared, so sync all stays off")
         reg["sync"] = "all"
     else:
         reg.pop("sync", None)
     reg_save(base, ENGINES_REG, reg)
     done = refresh_ignore_blocks(base)
-    return [f"sync all {'on' if on else 'off'}" + (f": {', '.join(done)} updated" if done else "")]
+    log = [f"sync all {'on' if on else 'off'}" + (f": {', '.join(done)} updated" if done else "")]
+    if on:
+        try:
+            log += sync_scan(base, force=True)[0]
+        except BaseException:                      # no scan, no sharing: turn it off again
+            reg.pop("sync", None); reg_save(base, ENGINES_REG, reg); refresh_ignore_blocks(base)
+            raise
+    return log
 
 
 def engine_share(base, name, sub, remove=False):
@@ -7994,6 +8197,9 @@ def doctor(base, strict=False):
                 rows.append(("OUTSIDE", f"code {kind} {home_rel(d, home)} -> brain.py projects move "
                                         f"{home_rel(d, home)}"))
     rows += doctor_git(base)
+    why = sync_scan_due(base)
+    if why:
+        rows.append(("WARN", f"sync all is on but the content scan is behind ({why}): brain.py engine sync-scan"))
     for lvl, text in rows:
         print(f"{lvl:8} {text}")
     n = {l: sum(1 for x, _ in rows if x == l) for l in ("ERROR", "WARN", "OUTSIDE")}
@@ -8192,6 +8398,8 @@ def main(argv):
                 if len(rest) != 2 or rest[1] not in ("on", "off"):
                     print("usage: engine sync-all on|off"); return 1
                 log = engine_sync_all(base, rest[1] == "on")
+            elif sub == "sync-scan":
+                log = sync_scan(base)[0] if "--force" not in flags else sync_scan(base, force=True)[0]
             elif sub == "sync":
                 ch = mirror_sync(base, quiet=False)
                 log = [f"mirrors changed: {', '.join(ch)}" if ch else "mirrors up to date"]
