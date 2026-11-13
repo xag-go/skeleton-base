@@ -4344,11 +4344,38 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         r = self.hb("doctor", "--base", str(self.base))
         self.assertNotIn("brain.py engine sync-scan", r.stdout)
         self.write(self.base, "ops/a/new.sh", "echo new\n")
+        # a file that changed within one watcher cycle is not a warning (the watcher scans it)
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("brain.py engine sync-scan", r.stdout)
+        # past the stale window and still unscanned: warn
+        st = self.base / ".brain/sync-scan-state.json"
+        data = json.loads(st.read_text())
+        data["scanned_at"] = time.time() - B.SYNC_SCAN_STALE - 60
+        st.write_text(json.dumps(data))
         r = self.hb("doctor", "--base", str(self.base))
         self.assertIn("brain.py engine sync-scan", r.stdout)
         self.ok_env("engine", "sync-scan", "--base", str(self.base))
         r = self.hb("doctor", "--base", str(self.base))
         self.assertNotIn("brain.py engine sync-scan", r.stdout)
+
+    def test_sync_scan_leaves_nothing_pending_after_it_rewrites_ignore_files(self):
+        # the scan writes the flagged file's deny line into .stignore after it saved its state: that file was
+        # reported as behind right after the scan. The scan now scans the files it rewrote, so none is pending.
+        self.sync_base()
+        self.fake_gitleaks()
+        self.ok_env("engine", "sync-all", "on", "--base", str(self.base), env={"FAKE_FLAGGED": "ops/a/preview.sh"})
+        self.assertIn("\n/ops/a/preview.sh\n", (self.base / ".stignore").read_text())
+        self.assertEqual(B.sync_pending(self.base)[1], [])
+        self.assertIsNone(B.sync_scan_due(self.base))
+
+    def test_files_over_2mb_are_not_pending(self):
+        # text over 2 MB is shared on purpose without a scan: it must not count as pending (doctor would warn forever)
+        self.sync_base()
+        self.fake_gitleaks()
+        self.write(self.base, "wiki/big.txt", "x" * (B.SYNC_SCAN_MAX + 10))
+        self.ok_env("engine", "sync-all", "on", "--base", str(self.base))
+        self.assertNotIn("wiki/big.txt", B.sync_pending(self.base)[1])
+        self.assertIsNone(B.sync_scan_due(self.base, now=time.time() + B.SYNC_SCAN_STALE + 60))
 
     def test_engine_sync_all_on_and_off_round_trip(self):
         self.fake_gitleaks()

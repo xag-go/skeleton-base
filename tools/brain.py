@@ -152,7 +152,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.6.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -6230,7 +6230,7 @@ def watch_once(base, commit=True, connect=True):
     try:                                                  # sync all: scan new files for secrets (at most every 10 min)
         if engine_shares(base).get(SYNC_ALL) is not None:
             st = json.loads(read(base / SYNC_SCAN_STATE) or "{}")
-            if time.time() - float(st.get("scanned_at", 0)) > 600:
+            if time.time() - float(st.get("scanned_at", 0)) > SYNC_SCAN_EVERY:
                 out["sync-scan"] = sync_scan(base)[0]
     except (SystemExit, Exception) as e:
         out["error"] = f"sync-scan: {e}"
@@ -7090,6 +7090,9 @@ SYNC_DENIED = "*sync-denied*"   # key: exact paths the content scan flagged (.br
 SYNC_DENIED_REG = ".brain/sync-denied.json"
 SYNC_SCAN_STATE = ".brain/sync-scan-state.json"
 SYNC_SCAN_MAX = 2 * 1024 * 1024
+SYNC_SCAN_EVERY = 600.0                # the watcher scans at least this often (its rescan pass, see watch_once)
+SYNC_SCAN_STALE = 2 * SYNC_SCAN_EVERY  # doctor warns about pending files only past this (a slow pass gets a cycle)
+SYNC_SCAN_ROUNDS = 3                   # a scan rescans the generated ignore files it rewrote, at most this often
 SYNC_DENY_MARK = "// sync scan denied (generated: brain.py engine sync-scan): flagged files, before the share lines"
 
 
@@ -7222,10 +7225,35 @@ def _is_text(fp):
         return False
 
 
+def sync_scan_state(base):
+    """(state, seen): the last scan's state file and its {rel: [mtime_ns, size]} map (empty when unreadable)."""
+    try:
+        st = json.loads(read(pathlib.Path(base) / SYNC_SCAN_STATE) or "{}")
+    except ValueError:
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    seen = st.get("seen") if isinstance(st.get("seen"), dict) else {}
+    return st, seen
+
+
+def sync_pending(base, cur=None, seen=None):
+    """(cur, sorted rels): the shareable files that still have to be scanned, i.e. new or changed (mtime and size)
+    since the last scan. This one rule is used by sync-scan and by doctor. Files over SYNC_SCAN_MAX are handled
+    by rule and never pending: a binary one is denied, a text one is shared without a scan on purpose."""
+    base = pathlib.Path(base)
+    cur = sync_candidates(base) if cur is None else cur
+    if seen is None:
+        seen = sync_scan_state(base)[1]
+    return cur, sorted(r for r, (mt, sz) in cur.items() if sz <= SYNC_SCAN_MAX and seen.get(r) != [mt, sz])
+
+
 def sync_scan(base, force=False, now=None):
-    """Content gate for sync all: gitleaks over the files the rules would share (only new or changed ones since the
+    """Content gate for sync all: gitleaks over the files that sync_pending lists (only new or changed ones since the
     last scan unless FORCE); flagged files (and non-text files above 2 MB) go to .brain/sync-denied.json (paths and
-    rule ids only) and into the generated deny lines of .stignore. Returns (log lines, number denied)."""
+    rule ids only) and into the generated deny lines of .stignore. The generated ignore files this rewrites are
+    scanned again in the next round (at most SYNC_SCAN_ROUNDS), so nothing that is shared is left unscanned.
+    Returns (log lines, number denied)."""
     base = pathlib.Path(base).resolve()
     if engine_shares(base).get(SYNC_ALL) is None:
         return ["sync scan: sync all is off (nothing to do)"], 0
@@ -7233,82 +7261,84 @@ def sync_scan(base, force=False, now=None):
     if not gl:
         raise SystemExit("sync scan: gitleaks not found (put it on PATH or in ~/.local/bin/gitleaks); "
                          "sync all needs it to keep secrets out of what is shared")
-    cur = sync_candidates(base)
-    try:
-        state = {} if force else json.loads(read(base / SYNC_SCAN_STATE) or "{}")
-    except ValueError:
-        state = {}
-    seen = state.get("seen", {}) if isinstance(state, dict) and isinstance(state.get("seen"), dict) else {}
-    prev = reg_load(base, SYNC_DENIED_REG).get("denied", {})
-    denied, todo = {}, []
-    for r, (mt, sz) in cur.items():
-        if sz > SYNC_SCAN_MAX:
-            if not _is_text(base / r):
-                denied[r] = ["binary-over-2mb"]
-            continue
-        if seen.get(r) == [mt, sz]:
-            if r in prev:
+    prev0 = reg_load(base, SYNC_DENIED_REG).get("denied", {})
+    shareable, scanned, updated, denied = None, 0, [], {}
+    for rnd in range(SYNC_SCAN_ROUNDS):
+        seen = {} if (force and rnd == 0) else sync_scan_state(base)[1]
+        cur, todo = sync_pending(base, seen=seen)
+        if shareable is None:
+            shareable = len(cur)
+        todo_set = set(todo)
+        prev = reg_load(base, SYNC_DENIED_REG).get("denied", {})
+        denied = {}
+        for r, (mt, sz) in cur.items():
+            if sz > SYNC_SCAN_MAX:
+                if not _is_text(base / r):
+                    denied[r] = ["binary-over-2mb"]
+            elif r not in todo_set and r in prev:
                 denied[r] = prev[r]
-        else:
-            todo.append(r)
-    if todo:
-        tmp = base / ".brain" / "sync-scan-tmp"
-        shutil.rmtree(tmp, ignore_errors=True)
-        rep = base / ".brain" / "sync-scan-report.json"
-        try:
-            for r in todo:
-                dst = tmp / r
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.link(base / r, dst)
-                except OSError:
-                    shutil.copy2(base / r, dst)
-            rep.unlink(missing_ok=True)
-            p = subprocess.run([gl, "dir", str(tmp), "--no-banner", "--report-format", "json", "--report-path",
-                                str(rep), "--exit-code", "0", "--redact"], capture_output=True, text=True)
-            if p.returncode != 0:
-                raise SystemExit(f"sync scan: gitleaks failed ({p.returncode}): {(p.stderr or '').strip()[-200:]}")
-            try:
-                found = json.loads(read(rep) or "[]") or []
-            except ValueError:
-                raise SystemExit("sync scan: gitleaks report is not valid JSON")
-        finally:
-            rep.unlink(missing_ok=True)
+        if todo:
+            tmp = base / ".brain" / "sync-scan-tmp"
             shutil.rmtree(tmp, ignore_errors=True)
-        pre = str(tmp) + os.sep
-        for f in found:
-            fp = str(f.get("File", ""))
-            r = fp[len(pre):] if fp.startswith(pre) else (os.path.relpath(fp, base) if os.path.isabs(fp) else fp)
-            r = r.replace(os.sep, "/")
-            if r in cur:
-                denied[r] = sorted(set(denied.get(r, [])) | {str(f.get("RuleID", "?"))})
-    new_seen = {r: list(v) for r, v in cur.items() if v[1] <= SYNC_SCAN_MAX}
-    ts = time.time() if now is None else now
-    reg_save(base, SYNC_DENIED_REG, {"denied": {k: denied[k] for k in sorted(denied)}})
-    atomic_write(base / SYNC_SCAN_STATE, json.dumps({"scanned_at": ts, "seen": new_seen}, sort_keys=True) + "\n")
-    done = refresh_ignore_blocks(base)
-    added = sorted(set(denied) - set(prev))
-    log = [f"sync scan: {len(cur)} shareable files, {len(todo)} scanned, {len(denied)} denied"
-           + (f" ({len(added)} new)" if added else "") + (f"; updated {', '.join(done)}" if done else "")]
+            rep = base / ".brain" / "sync-scan-report.json"
+            try:
+                for r in todo:
+                    dst = tmp / r
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(base / r, dst)
+                    except OSError:
+                        shutil.copy2(base / r, dst)
+                rep.unlink(missing_ok=True)
+                p = subprocess.run([gl, "dir", str(tmp), "--no-banner", "--report-format", "json", "--report-path",
+                                    str(rep), "--exit-code", "0", "--redact"], capture_output=True, text=True)
+                if p.returncode != 0:
+                    raise SystemExit(f"sync scan: gitleaks failed ({p.returncode}): {(p.stderr or '').strip()[-200:]}")
+                try:
+                    found = json.loads(read(rep) or "[]") or []
+                except ValueError:
+                    raise SystemExit("sync scan: gitleaks report is not valid JSON")
+            finally:
+                rep.unlink(missing_ok=True)
+                shutil.rmtree(tmp, ignore_errors=True)
+            pre = str(tmp) + os.sep
+            for f in found:
+                fp = str(f.get("File", ""))
+                r = fp[len(pre):] if fp.startswith(pre) else (os.path.relpath(fp, base) if os.path.isabs(fp) else fp)
+                r = r.replace(os.sep, "/")
+                if r in cur:
+                    denied[r] = sorted(set(denied.get(r, [])) | {str(f.get("RuleID", "?"))})
+            scanned += len(todo)
+        new_seen = {r: list(v) for r, v in cur.items() if v[1] <= SYNC_SCAN_MAX}
+        reg_save(base, SYNC_DENIED_REG, {"denied": {k: denied[k] for k in sorted(denied)}})
+        atomic_write(base / SYNC_SCAN_STATE, json.dumps(
+            {"scanned_at": time.time() if now is None else now, "seen": new_seen}, sort_keys=True) + "\n")
+        done = refresh_ignore_blocks(base)
+        updated += [x for x in done if x not in updated]
+        if not done:
+            break
+    added = sorted(set(denied) - set(prev0))
+    log = [f"sync scan: {shareable} shareable files, {scanned} scanned, {len(denied)} denied"
+           + (f" ({len(added)} new)" if added else "") + (f"; updated {', '.join(updated)}" if updated else "")]
     return log, len(denied)
 
 
 def sync_scan_due(base, max_age=86400.0, now=None):
-    """None when fine, else why a scan is needed (sync all on only): never scanned, scan too old, or a shareable file
-    is new or changed since the last scan."""
+    """None when fine, else why a scan is due (sync all on only). Never scanned, or older than MAX_AGE: due. Within
+    SYNC_SCAN_STALE of the last scan: fine, because the watcher scans every SYNC_SCAN_EVERY and files that changed
+    since are not yet due. Past it: the files sync_pending still lists."""
     base = pathlib.Path(base)
     if engine_shares(base).get(SYNC_ALL) is None:
         return None
-    try:
-        st = json.loads(read(base / SYNC_SCAN_STATE) or "{}")
-    except ValueError:
-        st = {}
-    if not isinstance(st, dict) or "scanned_at" not in st:
+    st, seen = sync_scan_state(base)
+    if "scanned_at" not in st:
         return "never scanned"
-    if (time.time() if now is None else now) - float(st["scanned_at"]) > max_age:
+    age = (time.time() if now is None else now) - float(st["scanned_at"])
+    if age > max_age:
         return "last scan is older than 24 h"
-    seen = st.get("seen", {})
-    n = sum(1 for r, (mt, sz) in sync_candidates(base).items() if sz <= SYNC_SCAN_MAX and seen.get(r) != [mt, sz])
+    if age <= SYNC_SCAN_STALE:
+        return None
+    n = len(sync_pending(base, seen=seen)[1])
     return f"{n} new or changed shareable file(s) not scanned yet" if n else None
 
 

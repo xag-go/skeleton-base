@@ -2,6 +2,18 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.4 - 2026-11-13
+- **sync all: one rule for "not scanned yet"**. `engine sync-scan` and `doctor` now both use `sync_pending` (new or
+  changed shareable files since the last scan, same mtime and size). Found on a real base: doctor warned "749 behind"
+  seconds after a scan of 32 files. Causes: (1) the scan saved its state, then rewrote `.stignore`/`.gitignore`
+  (denied lines), so those files were behind right after every scan that changed them; a scan now rescans the files
+  it rewrote (at most 3 rounds); (2) doctor warned on any changed file, but `watch` scans only every 10 min, so any
+  changing log (worktrees, session files) warned all the time. Doctor now warns about pending files only when the last
+  scan is older than two watch cycles (`SYNC_SCAN_STALE`), or never ran, or is older than 24 h.
+- Files over 2 MB are not pending: binary ones are denied by rule, text ones are shared without a scan on purpose.
+- Tests `test_sync_scan_leaves_nothing_pending_after_it_rewrites_ignore_files`, `test_files_over_2mb_are_not_pending`;
+  `test_doctor_warns_when_the_scan_is_behind` now checks the stale window.
+
 ## v1.6.3 - 2026-11-13
 - Role rule ("Your role and name", in every tool's pointer block and the base's AGENTS.md): a tool's product name
   and its built-in "You are <tool>" line are not a role or a name; only an identity the user set counts (a custom
