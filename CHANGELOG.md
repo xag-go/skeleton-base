@@ -8,6 +8,10 @@ Changes to the skeleton structure and tools (not to anyone's content).
   system prompt or SOUL.md that names a role, a project ROLE.md). For "who are you?" the tool reads `agents/*.md`
   and answers with the ONE role that lists it. Found by the real matrix: Codex answered "I'm Codex" while
   `agents/engineer.md` listed `codex`. Regression test `test_tool_product_identity_is_not_a_role`.
+- `tidy --harness codex`: Codex has no file-read tool, so "Do not run commands" left it unable to read the page
+  (real run: "0 lines merged ... no command-free local file reader"). Its prompt now allows read-only shell reads
+  (cat, sed -n, ls, rg) and edits with its patch tool; its sandbox still keeps writes inside the base. Other tools
+  keep "Do not run commands". Regression test `test_codex_is_told_to_read_with_read_only_commands`.
 
 ## v1.6.2 - 2026-11-13
 - **`engine vault NAME [--undo] [--dry-run]`**: the secret files of `engines/NAME` (the same secret names the
