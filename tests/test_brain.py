@@ -4228,7 +4228,8 @@ class EverythingInBaseTests(ToolHome):
         self.assertFalse([x for x in rows if x.startswith("OUTSIDE") and "~/.codex" in x], r.stdout)
         self.assertTrue([x for x in rows if x.startswith("WARN") and "guard file" in x and "CODEX_HOME" in x],
                         r.stdout)
-        self.assertTrue([x for x in rows if x.startswith("OK") and "guard link" in x and "~/.claude" in x], r.stdout)
+        self.assertTrue([x for x in rows if x.startswith("WARN") and "a link where a setting exists" in x
+                         and "~/.claude" in x and "engine pin claude-code" in x], r.stdout)          # 1.6.9
         self.assertNotIn("not wired by connect", r.stdout)
         self.assertNotIn("engine adopt", r.stdout)
         env = {"CODEX_HOME": str(self.eng / "codex"), "CLAUDE_CONFIG_DIR": str(self.eng / "claude")}
@@ -5354,8 +5355,8 @@ class SkillsLinkTests(ToolHome):
 
     def setUp(self):
         super().setUp()
-        self.bins("codex")
-        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.bins("gemini")                     # reads skills only from ~/.agents/skills
+        self.write(self.home, ".gemini/settings.json", "{}\n")
         self.link, self.dest = self.home / ".agents/skills", self.base / "engines/agents-skills"
 
     def reg(self):
@@ -5448,7 +5449,7 @@ class SkillsLinkTests(ToolHome):
             self.skipTest("no second filesystem")
         h = pathlib.Path(tempfile.mkdtemp(prefix="skb-xfs-", dir=shm))
         self.addCleanup(shutil.rmtree, h, True)
-        self.write(h, ".codex/config.toml", 'model = "x"\n')
+        self.write(h, ".gemini/settings.json", "{}\n")
         self.write(h, ".agents/skills/mine/SKILL.md", "mine\n")
         r = self.hb("connect", env={"HOME": str(h)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -5549,8 +5550,8 @@ class LiveGapsTests(ToolHome):
         self.assertIn("GEMINI_CLI_HOME", line)
 
     def test_skills_written_by_an_older_connect_are_ours(self):
-        self.bins("codex")
-        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}\n")
         self.ok("connect")
         link = self.home / ".agents/skills"
         os.unlink(link)                                                      # an older release: a real folder
@@ -5577,8 +5578,8 @@ class LiveGapsTests(ToolHome):
             self.assertNotIn("Use it when", (self.home / rr).read_text())
 
     def test_a_skill_file_you_edited_is_kept(self):
-        self.bins("codex")
-        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}\n")
         self.ok("connect")
         f = self.home / ".agents/skills/base-lint/SKILL.md"
         f.write_text("# my own lint skill\n")
@@ -5919,3 +5920,132 @@ class CacheAllowTests(ToolHome):
         out = self.hb("doctor", "--base", str(self.base)).stdout
         self.assertNotIn("codex-runtimes", out)
         self.assertRegex(out, r"OUTSIDE\s+~/\.cache/claude-big: a cache named after a product")
+
+
+class SkillsPerToolTests(ToolHome):
+    """1.6.9: the base's skills go into each installed tool's own skills folder; ~/.agents/skills only while a tool
+    reads skills from nowhere else; never twice in one tool."""
+
+    def codex(self):
+        self.bins("codex")
+        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.write(self.home, ".codex/skills/.system/own/SKILL.md", "codex's own\n")
+
+    def gemini(self):
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}\n")
+
+    def test_codex_alone_gets_its_own_folder_and_no_link(self):
+        self.codex()
+        self.ok("connect")
+        self.assertTrue((self.home / ".codex/skills/base-home/SKILL.md").is_file())
+        self.assertFalse(os.path.lexists(self.home / ".agents/skills"))
+        self.assertEqual((self.home / ".codex/skills/.system/own/SKILL.md").read_text(), "codex's own\n")
+        self.ok("disconnect")
+        self.assertFalse((self.home / ".codex/skills/base-home").exists())
+        self.assertEqual((self.home / ".codex/skills/.system/own/SKILL.md").read_text(), "codex's own\n")
+
+    def test_codex_home_in_the_base(self):
+        self.bins("codex")
+        ch = self.base / "engines/codex"
+        self.write(ch, "config.toml", 'model = "x"\n')
+        r = self.hb("connect", env={"CODEX_HOME": str(ch)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((ch / "skills/base-home/SKILL.md").is_file())
+        self.assertFalse(os.path.lexists(self.home / ".agents/skills"))
+        k = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]
+        self.assertIn("engines/codex/skills/base-home/SKILL.md", k["created"], "listed as connect's own")
+
+    def test_codex_and_gemini_share_agents_skills_only(self):
+        self.codex(); self.gemini()
+        self.ok("connect")
+        self.assertTrue((self.home / ".agents/skills/base-home/SKILL.md").is_file())
+        self.assertFalse((self.home / ".codex/skills/base-home").exists(), "never twice in Codex")
+
+    def test_when_no_tool_needs_agents_skills_the_copies_move_and_the_link_goes(self):
+        self.codex(); self.gemini()
+        self.ok("connect")
+        self.assertTrue((self.home / ".agents/skills").is_symlink())
+        os.unlink(self.bin / "gemini"); os.unlink(self.home / ".gemini/settings.json")
+        r = self.ok("connect")
+        self.assertTrue((self.home / ".codex/skills/base-home/SKILL.md").is_file())
+        self.assertFalse(os.path.lexists(self.home / ".agents/skills"), r.stdout)
+        self.assertFalse((self.base / "engines/agents-skills").exists())
+        self.assertTrue(list((self.base / ".brain/backups").rglob("base-home/SKILL.md")), "archived first")
+
+    def test_other_kits_files_keep_the_link_and_are_reported(self):
+        self.codex(); self.gemini()
+        self.write(self.home, ".agents/skills/frugal-handoff/SKILL.md", "frugal's\n")
+        self.ok("connect")
+        os.unlink(self.bin / "gemini"); os.unlink(self.home / ".gemini/settings.json")
+        r = self.ok("connect")
+        self.assertIn("frugal-handoff", r.stdout)
+        self.assertTrue((self.home / ".agents/skills").is_symlink())
+        self.assertEqual((self.home / ".agents/skills/frugal-handoff/SKILL.md").read_text(), "frugal's\n")
+        self.assertFalse((self.home / ".agents/skills/base-home").exists())
+        self.assertTrue((self.home / ".codex/skills/base-home/SKILL.md").is_file())
+
+    def test_hermes_gets_its_own_category_folder(self):
+        self.bins("hermes")
+        self.write(self.home, ".hermes/config.yaml", "model: x\n")
+        self.ok("connect")
+        self.assertTrue((self.home / ".hermes/skills/skeleton-base/base-home/SKILL.md").is_file())
+        self.assertFalse(os.path.lexists(self.home / ".agents/skills"))
+
+
+class PinTests(ToolHome):
+    """H1/H2: a link where a setting exists is a WARN; `engine pin` puts the variable where every launcher sees
+    it and guard files in place of the links, with undo (fake HOME)."""
+
+    def setUp(self):
+        super().setUp()
+        cl = self.base / "engines/claude"
+        self.write(cl, "CLAUDE.md", "x\n")
+        self.write(cl, ".claude.json", "{}\n")
+        (self.home / ".claude").symlink_to(cl)
+        (self.home / ".claude.json").symlink_to(cl / ".claude.json")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {"claude": {
+            "tool": "claude-code", "mode": "adopted", "env": "CLAUDE_CONFIG_DIR", "from": "~/.claude",
+            "moved": [".claude.json"], "since": "2026-11-13"}}}))
+        self.cl = cl
+
+    def test_doctor_warns_pin_replaces_links_and_undo_restores(self):
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertRegex(out, r"WARN\s+Claude Code: ~/\.claude is a link into the base, a link where a setting "
+                              r"exists \(CLAUDE_CONFIG_DIR\) -> brain\.py engine pin claude-code")
+        self.assertRegex(out, r"WARN\s+Claude Code: ~/\.claude\.json is a link into the base")
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for p in (self.home / ".claude", self.home / ".claude.json"):
+            self.assertFalse(p.is_symlink(), p)
+            self.assertEqual((p.stat().st_size, p.stat().st_mode & 0o777), (0, 0), p)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={self.cl}",
+                      (self.home / ".config/environment.d/60-base-engines.conf").read_text())
+        self.assertIn("CLAUDE_CONFIG_DIR", (self.home / ".profile").read_text())
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotIn("a link where a setting exists", out)
+        r = self.hb("engine", "pin", "--undo", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(self.home / ".claude"), str(self.cl))
+        self.assertEqual(os.readlink(self.home / ".claude.json"), str(self.cl / ".claude.json"))
+
+    def test_pin_refuses_a_real_folder(self):
+        os.unlink(self.home / ".claude")
+        (self.home / ".claude").mkdir()
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("real folder", r.stdout + r.stderr)
+        self.assertTrue((self.home / ".claude.json").is_symlink(), "nothing changed")
+
+    def test_a_link_for_a_tool_without_a_setting_stays_ok(self):
+        app = self.base / "engines/claude-desktop"
+        self.write(app, "config.json", "{}\n")
+        (self.home / ".config").mkdir(exist_ok=True)
+        (self.home / ".config/Claude").symlink_to(app)
+        reg = json.loads((self.base / "engines.json").read_text())
+        reg["engines"]["claude-desktop"] = {"tool": "claude-desktop", "mode": "adopted", "link": True,
+                                            "from": "~/.config/Claude"}
+        (self.base / "engines.json").write_text(json.dumps(reg))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"OK\s+~/\.config/Claude: link into engines/claude-desktop")
+        self.assertNotRegex(out, r"WARN.*\.config/Claude.*setting exists")

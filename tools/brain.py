@@ -108,6 +108,8 @@ Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's g
   engine adopt-units [--undo]  real unit files and drop-ins of ~/.config/systemd/user -> ops/systemd/ + links back
                                (then systemctl --user daemon-reload); watch adopts one again an installer rewrote
   engine adopt --undo TOOL     the reverse of either kind
+  engine pin TOOL [--undo]     a tool adopted by its setting whose default places are still links: the variable
+                               for every launcher (environment.d, ~/.profile, ~/.bashrc), guard files instead
   engine release TOOL          the exact reverse (dir back, blocks out, old bytes restored)
   engine mirror TOOL|PATH [--name N] [--keep GLOB,...] | engine unmirror NAME | engine sync | engine list
                                a tool without such a setting: a read-only copy of its rules, agents, skills,
@@ -4322,7 +4324,8 @@ TOOLS = {t["key"]: t for t in (
          marks=(".codex/auth.json", ".codex/config.toml"), rules=((".codex/AGENTS.override.md", "existing"), (".codex/AGENTS.md", "create")),
          pick="first", cap=(32768, "bytes", "Codex loads at most 32 KiB of AGENTS.md text, this file and the "
                                             "project's together (project_doc_max_bytes)"),
-         skills=True, access="`[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`",
+         skills=True, skills_home=".codex/skills",   # $CODEX_HOME/skills (and ~/.agents/skills: never both)
+         access="`[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`",
          mcp="`[mcp_servers.skeleton-base]` in `~/.codex/config.toml` (shared by the desktop app)",
          memory="`~/.codex/memories/**/*.md`, `memories_v2/**/*.md`, `memories_*.sqlite` (off by default in Codex)",
          hooks="none written (Codex hooks need your trust by hash)",
@@ -4385,7 +4388,9 @@ TOOLS = {t["key"]: t for t in (
          access="no wall (its file tools reach any path you can)",
          mcp="`mcp_servers` in `~/.hermes/config.yaml`",
          memory="`memories/*.md`, `memory_store.db` facts, the same in every profile",
-         skills_note="reads `~/.agents/skills` only when it is in `skills.external_dirs`",
+         skills_note="reads `~/.agents/skills` only when it is in `skills.external_dirs`; the base's skills go "
+                     "to `$HERMES_HOME/skills/skeleton-base/` (its own skills folder, by category)",
+         skills_home=".hermes/skills/skeleton-base",
          src="hermes-agent source (agent/prompt_builder.py, hermes_cli/config_defaults.py)"),
     dict(key=".config/crush", name="Crush", bins=("crush",),
          marks=(".config/crush/crushrc", ".config/crush/crush.json"), dir=".config/crush",
@@ -4682,8 +4687,7 @@ class Connector:
                     files.setdefault(r, []).append(e)
         for r, edits in files.items():
             self.apply_edits(rec, r, edits)
-        if any(TOOLS[x].get("skills") for x in found) and not skip(SKILLS_DIR):
-            self.install_skills(rec)
+        self.install_skills(rec, [r for r in self.skill_roots(found) if not skip(r)])
         for key in found:
             self.tools[key] = self.tool_state(key, wrote, via, rec)
         if unknown:                                       # zero-touch: a dir that looks like an AI tool
@@ -5233,7 +5237,19 @@ class Connector:
         return cur
 
     # -- the base's skills, once, in ~/.agents/skills (read by most tools)
-    def skill_texts(self):
+    def skill_roots(self, found):
+        """Where the base's skills go: each installed tool's OWN skills folder (in the base when the tool's folder
+        is), and ~/.agents/skills only while an installed tool reads skills from nowhere else. A tool that reads
+        both (Codex) then gets them only there: a skill is never loaded twice in one tool."""
+        agents = any(TOOLS[k].get("skills") and not TOOLS[k].get("skills_home") for k in found)
+        roots = [SKILLS_DIR] if agents else []
+        for k in found:
+            h = TOOLS[k].get("skills_home")
+            if h and not (agents and TOOLS[k].get("skills")):
+                roots.append(self.L(h))
+        return list(dict.fromkeys(roots))
+
+    def skill_texts(self, root=SKILLS_DIR):
         out = {}
         b = str(self.base)
         note = (f"\n> Installed by Skeleton Base `connect` for the base at `{b}`: run its commands there "
@@ -5252,8 +5268,8 @@ class Connector:
                         cut = t.find("\n", end + 4)
                         cut = len(t) if cut < 0 else cut + 1
                         t = t[:cut] + note + t[cut:]
-                out[f"{SKILLS_DIR}/{sk.parent.name}/{f.relative_to(sk.parent).as_posix()}"] = t
-        out[f"{SKILLS_DIR}/base-home/SKILL.md"] = (
+                out[f"{root}/{sk.parent.name}/{f.relative_to(sk.parent).as_posix()}"] = t
+        out[f"{root}/base-home/SKILL.md"] = (
             "---\nname: base-home\ndescription: The user's knowledge base (Skeleton Base) at " + b + ". Use when "
             "you need context about the user, their projects, clients, people or decisions, or to save durable "
             "knowledge.\n---\n\n" + pointer_body(self.base) + "\n")
@@ -5315,11 +5331,23 @@ class Connector:
         listed with its hash in the kit's "created" record: an installer that guards your data then knows these
         files leave the base on purpose (they are back in your home, not lost)."""
         created = me.setdefault("created", {})
-        for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r == ENGINES_REG]:
+        for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r == ENGINES_REG] + \
+                [r for r in me.pop("connect_files", []) if r in created]:
             created.pop(r)
+        if gone:
+            return
+        own = []                                         # connect's skill copies inside a tool's folder in the base
+        for r in (me.get("connect") or {}).get("skills", {}):
+            p = pathlib.Path(os.path.normpath(os.path.join(str(self.home), r)))
+            if p.is_file() and not p.is_symlink() and in_dir(p, self.base) and not in_dir(p, self.base / "engines" /
+                                                                                       SKILLS_ENGINE):
+                k = p.relative_to(self.base).as_posix()
+                created[k] = sha(p.read_bytes()); own.append(k)
+        if own:
+            me["connect_files"] = sorted(own)
         dest = self.base / "engines" / SKILLS_ENGINE
         reg = reg_load(self.base, ENGINES_REG)
-        if gone or not (reg.get("engines", {}).get(SKILLS_ENGINE) or {}).get("link") or dest.is_symlink():
+        if not (reg.get("engines", {}).get(SKILLS_ENGINE) or {}).get("link") or dest.is_symlink():
             return
         for dp, dns, fns in os.walk(dest):
             for f in fns:
@@ -5369,10 +5397,16 @@ class Connector:
                                   + b + ". ")
         return r.endswith("/SKILL.md") and f"> Installed by Skeleton Base `connect` for the base at `{b}`" in cur
 
-    def install_skills(self, rec):
-        self.link_skills(rec)
+    def install_skills(self, rec, roots):
+        if SKILLS_DIR in roots:
+            self.link_skills(rec)
         store = rec.setdefault("skills", {})
-        for r, text in self.skill_texts().items():
+        texts = {r: t for root in roots for r, t in self.skill_texts(root).items()}
+        for r in [r for r in store if r not in texts]:     # a place no tool needs now: our copy goes (archived)
+            self.drop_skill(store, r)
+        if SKILLS_DIR not in roots:
+            self.retire_skills_link(rec)
+        for r, text in texts.items():
             cur, t = read(self.home / r), store.get(r)
             ours = cur is not None and self.skill_ours(r, cur, text, t)
             if t is None and cur is not None and not ours:
@@ -5386,9 +5420,69 @@ class Connector:
             if t is None:
                 t = {"previous": self.backup(r), "dirs": self.missing_dirs(r)}
             if self.put(r, text) and len(store) == 0:
-                self.log.append(f"skills installed once in ~/{SKILLS_DIR}/ (read by most tools)")
+                self.log.append(f"skills installed in {', '.join(tool_tilde(x) for x in roots)}")
             t["sha"] = sha(text)
             store[r] = t
+
+    def drop_skill(self, store, r):
+        """Our copy at R goes (archived first; the file it replaced comes back); a copy you changed stays."""
+        t, p = store.pop(r), self.home / r
+        cur = read(p) if p.is_file() and not p.is_symlink() else None
+        if cur is None:
+            return
+        if sha(cur) != t.get("sha") and not self.skill_ours(r, cur, cur, None):
+            self.log.append(f"kept {tool_tilde(r)} (changed since connect; no tool needs it here now)")
+            return
+        arch = self.backup(r)
+        if t.get("previous"):
+            shutil.copy2(self.base / t["previous"], p)
+        else:
+            p.unlink()
+        for d in sorted(t.get("dirs", []) + [path_key(p.parent, self.home)], key=lambda x: -x.count("/")):
+            d = self.home / d
+            if d.is_dir() and not d.is_symlink() and not any(d.iterdir()) and not in_dir(self.base, d):
+                d.rmdir()
+        self.log.append(f"{tool_tilde(r)}: removed (no installed tool reads skills there now; archived in {arch})")
+
+    def retire_skills_link(self, rec):
+        """No installed tool needs ~/.agents/skills: the link goes once engines/agents-skills holds nothing more
+        (files of other kits or yours stay where they are, reported); a folder that was there before comes back."""
+        sl = rec.get("skills_link")
+        src, dest = self.home / SKILLS_DIR, self.base / "engines" / SKILLS_ENGINE
+        if sl is None or not (src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest)):
+            return
+        for dp, dns, fns in os.walk(dest, topdown=False):
+            if dp != str(dest) and not os.listdir(dp):
+                os.rmdir(dp)
+        left = sorted(os.listdir(dest)) if dest.is_dir() else []
+        if left:
+            note = (f"kept ~/{SKILLS_DIR} (a link into {dest}): no installed tool needs it, but it holds files "
+                    f"connect did not write: {', '.join(left[:8])}{' ...' if len(left) > 8 else ''} (their kits "
+                    "move them; then connect removes the link)")
+            if rec.get("skills_refused") != note:
+                self.log.append(note)
+            rec["skills_refused"] = note
+            return
+        os.unlink(src)
+        dest.rmdir()
+        if sl.get("moved"):
+            src.mkdir()                                   # it was a folder before connect: it comes back
+        for d in sorted(sl.get("dirs", []), key=lambda x: -x.count("/")):
+            d = self.home / d
+            if d.is_dir() and not d.is_symlink() and not any(d.iterdir()):
+                d.rmdir()
+        reg = reg_load(self.base, ENGINES_REG)
+        if (reg.get("engines", {}).get(SKILLS_ENGINE) or {}).get("link"):
+            reg["engines"].pop(SKILLS_ENGINE)
+            if not reg["engines"]:
+                reg.pop("engines")
+            if reg:
+                reg_save(self.base, ENGINES_REG, reg)
+            else:
+                (self.base / ENGINES_REG).unlink()
+        rec.pop("skills_link", None); rec.pop("skills_refused", None)
+        self.log.append(f"removed the link ~/{SKILLS_DIR} and the empty {dest}: no installed tool reads skills "
+                        "there now")
 
     def tool_state(self, key, wrote, via, rec):
         t = TOOLS[key]
@@ -8964,6 +9058,60 @@ def engine_adopt(base, tool, force=False, undo=False, path=None, vault=(), heavy
     return log
 
 
+def engine_pin(base, tool, undo=False):
+    """A tool adopted by its own setting whose default places are still links into the base (made by hand or by
+    an older setup): the variable goes where every launcher sees it (the marked blocks in environment.d for user
+    units and GUI sessions, ~/.profile, ~/.bashrc), then each link becomes the guard file (0 bytes, mode 000) that
+    stops a launcher without the variable from making a fresh folder. UNDO puts the links back."""
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    key = tool_key_of(tool)
+    name = ENGINE_NAMES.get(key, tool) if key else tool
+    reg = reg_load(base, ENGINES_REG)
+    e = reg.get("engines", {}).get(name)
+    if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("env")):
+        raise SystemExit(f"engine pin: {tool} is not adopted by its own setting here (engine adopt first)")
+    dest = base / "engines" / name
+    places = [pathlib.Path(home) / key] + [pathlib.Path(home) / f for f, k in TOOL_FILES.items() if k == key]
+    if undo:
+        for r, tgt in sorted((e.get("pinned") or {}).items()):
+            p = pathlib.Path(expand(r, home))
+            if p.is_file() and not p.is_symlink() and p.stat().st_size == 0:
+                os.chmod(p, 0o600); p.unlink()
+                if tgt:
+                    os.symlink(tgt, p)
+                log.append(f"{r}: " + (f"the link to {tgt} is back" if tgt else "guard removed"))
+        e.pop("pinned", None)
+        reg_save(base, ENGINES_REG, reg)
+        return log or [f"engine pin --undo: nothing pinned for {tool}"]
+    for p in places:
+        if os.path.lexists(p) and not (p.is_symlink() and in_dir(p, dest)) and \
+                not (p.is_file() and not p.is_symlink() and p.stat().st_size == 0):
+            raise SystemExit(f"engine pin: {home_rel(p, home)} is a real {'folder' if p.is_dir() else 'file'}, not a "
+                             f"link into engines/{name}: merge it into the base first (doctor: split brain)")
+    write_env_files(base, reg, home, log)
+    pinned = dict(e.get("pinned") or {})
+    for p in places:
+        if p.is_file() and not p.is_symlink():
+            continue                                  # already the guard
+        tgt = os.readlink(p) if p.is_symlink() else None
+        tmp = p.with_name(f".{p.name}.pin-tmp")
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        os.chmod(tmp, 0)
+        os.replace(tmp, p)                            # the link (or nothing) becomes the guard in one rename
+        pinned[home_rel(p, home)] = tgt
+        log.append(f"{home_rel(p, home)}: guard file (0 bytes, mode 000) instead of " +
+                   (f"the link to {tgt}" if tgt else "nothing"))
+    e["pinned"] = pinned
+    reg_save(base, ENGINES_REG, reg)
+    log.append(f"{e['env']}={dest}: restart sessions and user services that started without it "
+               "(systemctl --user daemon-reload; log out and in for GUI apps). Undo: brain.py engine pin --undo "
+               f"{tool}")
+    return log
+
+
 def engine_release(base, tool, force=False):
     base, home, log = pathlib.Path(base).resolve(), home_dir(), []
     reg = reg_load(base, ENGINES_REG)
@@ -9835,8 +9983,9 @@ def adopt_guard(base, key, d, home):
         tool, env, eng = TOOLS.get(key, {}).get("name", key), e.get("env") or "its variable", base / "engines" / n
         load = "load ~/.config/environment.d/60-base-engines.conf or start a login shell"
         if d.is_symlink() and in_dir(d, eng):
-            return ("OK", f"{tool}: ~/{key} is the guard link into engines/{n} ({env} is not set in this shell; "
-                          f"the link keeps the tool in the base)"), str(eng)
+            return ("WARN", f"{tool}: ~/{key} is a link into engines/{n}, a link where a setting exists ({env}) "
+                            f"-> brain.py engine pin {e.get('tool') or n} (the variable for every launcher, a "
+                            "guard file instead of the link)"), str(eng)
         if d.is_file() and not d.is_symlink():
             return ("WARN", f"{tool}: ~/{key} is the guard file of engines/{n} ({env} is not set in this shell: "
                             f"{load})"), str(eng)
@@ -10184,7 +10333,13 @@ def doctor(base, strict=False):
                 hint = f" -> {setting_note(key)}: brain.py engine mirror " + home_rel(d, home)
         rows.append((lvl, f"{name}: {home_rel(d, home)} ({how}, {tag}){hint}"))
         default = pathlib.Path(home) / key
-        if var and not extra and default.is_dir() and not in_dir(default, d):
+        tid = next((i for i, k in TOOL_IDS.items() if k == key), key)
+        for lk in ([default] + [pathlib.Path(home) / f for f, k in TOOL_FILES.items() if k == key]) \
+                if var and not extra else []:
+            if lk.is_symlink() and in_dir(lk, base):
+                rows.append(("WARN", f"{name}: {home_rel(lk, home)} is a link into the base, a link where a setting "
+                                     f"exists ({var}) -> brain.py engine pin {tid}"))
+        if var and not extra and default.is_dir() and not default.is_symlink() and not in_dir(default, d):
             rows.append(("WARN", f"{name}: {var} points to {home_rel(d, home)} but {home_rel(default, home)} exists "
                                  "too (split brain: a launcher without the variable made or kept it)"))
     for key, d, where in configured_dirs(home):
@@ -10459,6 +10614,10 @@ def main(argv):
                 many = lambda k: [v for x in flags if isinstance(x, tuple) and x[0] == k for v in [x[1]]]
                 log = engine_adopt(base, rest[1], force, undo, val("--path"), sorted(many("--vault")),
                                    sorted(many("--heavy")))
+            elif sub == "pin":
+                if len(rest) != 2:
+                    print("usage: engine pin TOOL [--undo]"); return 1
+                log = engine_pin(base, rest[1], undo)
             elif sub == "adopt-units":
                 log = units_adopt(base, undo)
             elif sub == "release":

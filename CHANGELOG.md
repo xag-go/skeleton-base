@@ -13,6 +13,32 @@ Changes to the skeleton structure and tools (not to anyone's content).
   blob_storage, Shared Dictionary, shader caches: `/engines/<id>/**/<name>` lines in the generated .gitignore and
   .stignore blocks, never walked by the vault. claude-desktop keeps its profile at the top (re-checked: no
   sub-profile), so it changes only by these any-depth lines.
+- **Skills in each tool's own folder**: connect writes the base's skills into each installed tool's own skills
+  folder (Codex: `$CODEX_HOME/skills`, verified in the Codex binary; Hermes: `$HERMES_HOME/skills/skeleton-base/`, its
+  category layout) and into `~/.agents/skills` only while an installed tool reads skills from nowhere else. A tool
+  that reads both (Codex reads `~/.agents/skills` and `$CODEX_HOME/skills`) then gets them only in `~/.agents/skills`:
+  never twice. When no installed tool needs `~/.agents/skills`, connect's copies there go (archived first) and the
+  link and `engines/agents-skills` go once nothing else is in it; files of other kits (Frugal-Bridge's frugal-*) or
+  yours stay and are reported. Copies inside a tool's folder in the base are listed in the kit's `created` record.
+  The Claude app syncs its skills to `~/.claude/skills/synced` (its own text says so), i.e. Claude Code's folder;
+  the `synced/` in `~/.agents/skills` is an old copy that connect does not touch.
+- **A link only where nothing else works**: doctor WARNs "a link where a setting exists" for a link into the base
+  at the default place of a tool that has its own setting (Claude Code `~/.claude`, `~/.claude.json`, ...), with the
+  fix `brain.py engine pin TOOL`; links for tools without a setting (the Claude app, ...) and unit links stay OK.
+  `engine pin TOOL [--undo]` writes the variable where every launcher sees it (the marked blocks in
+  `~/.config/environment.d/60-base-engines.conf` for user units and GUI sessions, `~/.profile`, `~/.bashrc`), then
+  replaces each link by the guard file (0 bytes, mode 000, one rename); undo puts the links back. It refuses a real
+  folder or file there (split brain).
+- ntfy (`ntfy-config`, `ntfy-data`): no code here: rewriting `--config` in the unit and `cache-file`, `auth-file`,
+  `attachment-cache-dir` in server.yml is specific to ntfy, so it is done by hand; the links stay until then.
+- MCP folders, settings that move them (none is set by connect; their links stay):
+  fastmcp: `FASTMCP_HOME` moves `~/.local/share/fastmcp` (fastmcp `settings.py`: env prefix `FASTMCP_`, `home =
+  user_data_dir("fastmcp")`), to be set in the env of the MCP server that uses fastmcp (none found in the tools'
+  MCP configs here). hcli: only `XDG_CONFIG_HOME` (moves every program; hcli `lib/config/__init__.py`:
+  `user_config_dir("hcli", "hex-rays")`). browser-harness: `BH_RUNTIME_DIR`/`BH_TMP_DIR` move only its runtime/ and
+  tmp/ (hermes-agent `tools/browser_harness_dirs.py`), not the folder. cua-driver, ida-mcp (`IDAUSR` moves only
+  ~/.idapro, not verified), google-workspace-mcp: none found in code on this machine (not installed as packages;
+  upstream docs not checked).
 - doctor: a `.brain/outside.json` entry for a path (e.g. `{"path": "~/.cache/codex-runtimes", "reason": "cache"}`)
   also silences the "cache named after a product, over 50 MB" check for that path.
 
