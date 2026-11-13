@@ -16,6 +16,26 @@ Changes to the skeleton structure and tools (not to anyone's content).
   vault. Doctor's fix for a real folder that replaced the link: move what is new into `engines/agents-skills`, remove
   the folder, then `brain.py connect`.
 
+- **Doctor full scan**: every entry of `~` (dotfiles too), `~/.config`, `~/.local/share`, `~/.local/state`,
+  `~/.local/bin` (link targets), `~/.config/systemd/user` (real unit files and drop-ins, and Exec/EnvironmentFile/
+  WorkingDirectory paths outside the base), `~/.cache` (a product-named cache over 50 MB, names from the built-in list plus outside.json "products";
+  its size cached a day in `.brain/doctor-sizes.json`) and `~/Documents ~/Desktop ~/Downloads` (one level) is in the base, a link into it,
+  or carries one STAYS reason id (os-system, program-install, cache, secret-store, vault, backups-outlive-base,
+  installer-record, fixed-locator, guard-file, other-user, tool-state-at-xdg-path) from the built-in table or
+  `.brain/outside.json` "allow" (now also `{"path": "~/x", "reason": "<id>"}`; a wrong id is a WARN). Anything else
+  is OUTSIDE "unclassified" with the fix. `~/rea-engines` is program-install. Containers (`~/.cache`, `~/.config`,
+  `~/.local`, Documents, Desktop, Downloads) are no longer allowed as one blob, by default or in outside.json.
+- **Generic adopt**: `engine adopt NAME --path DIR [--vault GLOB]... [--heavy GLOB]...` moves any folder by a link
+  (same mover, vault and heavy lines; the globs are kept in engines.json). Named rows (`engine adopt ID`, hinted by
+  doctor): codex-desktop (`~/.config/Codex`) and hermes-desktop (`~/.config/Hermes`) with the Claude app's Electron
+  secrets and heavy folders, google-workspace-mcp, fastmcp (oauth-proxy/ vaulted), cua-driver, browser-harness,
+  hcli, ida-mcp, ntfy-config (owner-topic, reply-topic, team-token, *.bak* vaulted), ntfy-data (user.db vaulted;
+  cache.db and attachments/ heavy).
+- **`engine adopt-units [--undo]`**: real unit files and drop-in folders in `~/.config/systemd/user` (not links,
+  not `*.wants`, not the units connect writes for this base) move into `ops/systemd/` with a link back, then
+  `systemctl --user daemon-reload`; engines.json "units" records them. An installer that replaces a link with a
+  real file is flagged by doctor and adopted again by watch (the older copy kept in `.brain/backups/units-*`).
+
 ## v1.6.7 - 2026-11-13
 - **Mirrors from older releases go too**: a mirror registered without a `tool` field is matched to its tool by its
   source folder, so a mirror of a tool that is not installed (e.g. `~/.gemini`, `~/.config/opencode`) is removed

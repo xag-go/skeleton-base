@@ -101,6 +101,12 @@ Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's g
                                such setting (claude-desktop = ~/.config/Claude) is adopted by a symlink: the dir
                                moves into engines/<name>/, a link stays at the old place (checked, else undone),
                                its secrets go to the vault; refuses while it runs or across filesystems
+  engine adopt NAME --path DIR [--vault GLOB]... [--heavy GLOB]...
+                               the same for any folder (named rows too: codex-desktop, hermes-desktop,
+                               google-workspace-mcp, fastmcp, cua-driver, browser-harness, hcli, ida-mcp,
+                               ntfy-config, ntfy-data): secrets by GLOB to the vault, heavy GLOBs out of git/Syncthing
+  engine adopt-units [--undo]  real unit files and drop-ins of ~/.config/systemd/user -> ops/systemd/ + links back
+                               (then systemctl --user daemon-reload); watch adopts one again an installer rewrote
   engine adopt --undo TOOL     the reverse of either kind
   engine release TOOL          the exact reverse (dir back, blocks out, old bytes restored)
   engine mirror TOOL|PATH [--name N] [--keep GLOB,...] | engine unmirror NAME | engine sync | engine list
@@ -6419,6 +6425,13 @@ def watch_once(base, commit=True, connect=True):
             out["mirror"] = mirrored
     except (SystemExit, Exception) as e:
         mirrored, out["error"] = [], f"mirror: {e}"
+    try:                                                  # an installer replaced a unit link with a real file
+        if reg_load(base, ENGINES_REG).get("units"):
+            ua = units_adopt(base, again=True)
+            if ua:
+                out["units"] = "; ".join(ua)
+    except (SystemExit, Exception) as e:
+        out["error"] = f"units: {e}"
     try:                                                  # a tool replaced a vault link with a real file: put it back
         rv = revault(base)
         if rv:
@@ -7112,9 +7125,53 @@ ENGINE_NAMES = {".claude": "claude", ".codex": "codex", ".hermes": "hermes", ".o
 SKILLS_ENGINE = "agents-skills"             # ~/.agents/skills -> engines/agents-skills (connect writes it there)
 # per tool folder under engines/ (exact name), from the TOOLS rows: secret names at its top ("x/" = a whole folder,
 # vaulted as one link) and heavy regenerated sub-folders that never go to git, Syncthing or the vault
-ENGINE_VAULT = {t["id"]: tuple(t["vault"]) for t in TOOLS.values() if t.get("vault")}
-ENGINE_HEAVY = {**{t["id"]: tuple(t["heavy"]) for t in TOOLS.values() if t.get("heavy")},
+_ELECTRON = TOOLS[".config/Claude"]           # an Electron profile: the same logins and caches
+# Folders that are not AI tools connect wires (no rules, no MCP) but move into the base by a link the same way
+# (`engine adopt ID`); doctor hints them. Owner decision: they all move, used or not.
+ADOPT_ROWS = {r["id"]: r for r in (
+    dict(id="codex-desktop", name="Codex desktop app", dir=".config/Codex", locks=("SingletonLock",),
+         marks=(".config/Codex/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"]),
+    dict(id="hermes-desktop", name="Hermes desktop app", dir=".config/Hermes", locks=("SingletonLock",),
+         marks=(".config/Hermes/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"]),
+    dict(id="google-workspace-mcp", name="Google Workspace MCP", dir=".google_workspace_mcp",
+         vault=("credentials/", "credentials*", "*token*"), heavy=("logs/",)),
+    dict(id="fastmcp", name="FastMCP (OAuth proxy tokens)", dir=".local/share/fastmcp", vault=("oauth-proxy/",)),
+    dict(id="cua-driver", name="cua computer-use driver", dir=".cua-driver"),
+    dict(id="browser-harness", name="browser-harness", dir=".config/browser-harness"),
+    dict(id="hcli", name="hcli", dir=".config/hcli"),
+    dict(id="ida-mcp", name="IDA MCP", dir=".ida-mcp"),
+    dict(id="ntfy-config", name="ntfy server config", dir=".config/ntfy",
+         vault=("owner-topic", "reply-topic", "team-token", "*.bak*")),
+    dict(id="ntfy-data", name="ntfy server data", dir=".local/share/ntfy", vault=("user.db",),
+         heavy=("cache.db", "cache.db-*", "attachments/")),
+)}
+for _r in ADOPT_ROWS.values():
+    _r.setdefault("key", _r["dir"])
+ENGINE_VAULT = {t["id"]: tuple(t["vault"]) for t in list(TOOLS.values()) + list(ADOPT_ROWS.values()) if t.get("vault")}
+ENGINE_HEAVY = {**{t["id"]: tuple(t["heavy"]) for t in list(TOOLS.values()) + list(ADOPT_ROWS.values())
+                   if t.get("heavy")},
                 SKILLS_ENGINE: ("synced/",)}     # ~/.agents/skills/synced: skills the Claude app syncs (regenerated)
+
+
+def link_row(name):
+    """The row of a folder adopted by a link: a TOOLS row (adopt=link), an ADOPT_ROWS row, or None."""
+    if name in ADOPT_ROWS:
+        return ADOPT_ROWS[name]
+    k = tool_key_of(name)
+    return TOOLS[k] if k in TOOLS and TOOLS[k].get("adopt") == "link" else None
+
+
+def engine_pats(d, kind):
+    """The secret ("vault") or heavy ("heavy") names of the tool folder D (engines/NAME): its row's, plus the
+    ones `engine adopt NAME --path DIR --vault/--heavy GLOB` recorded in engines.json."""
+    d = pathlib.Path(d)
+    table = ENGINE_VAULT if kind == "vault" else ENGINE_HEAVY
+    try:
+        e = json.loads(read(d.parent.parent / ENGINES_REG) or "{}").get("engines", {}).get(d.name)
+    except ValueError:
+        e = None
+    extra = tuple(x for x in (e.get(kind) or []) if isinstance(x, str)) if isinstance(e, dict) else ()
+    return tuple(dict.fromkeys(table.get(d.name, ()) + extra))
 ADOPT_WARN = {".hermes": "Hermes keeps absolute paths to its home in its launcher and venv (bin/hermes, "
                          "pyvenv.cfg): it must be re-bootstrapped at the new home; rehearse on a copy first"}
 ENV_START, ENV_END = "# skeleton-base engines:start", "# skeleton-base engines:end"
@@ -7222,7 +7279,7 @@ def gitignore_layout(shares=None):
                 if g.endswith("/"):
                     out.append(f"!/engines/{k}/{g}**")
     for k, subs in sorted((shares or {}).items()):          # engines.json "share": extra safe sub-folders
-        if k in (SYNC_ALL, SYNC_DENIED, VAULTED):
+        if k in (SYNC_ALL, SYNC_DENIED, VAULTED, HEAVY):
             continue
         for sub in subs:
             out += [f"!/engines/{k}/{par}" for par in _parents(sub + "/x")] + [f"!/engines/{k}/{sub}/",
@@ -7231,7 +7288,8 @@ def gitignore_layout(shares=None):
     out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
     out += [f"/engines/**/{d}/" for d in ENGINE_DENY_DIRS]
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
-    out += [f"/engines/{n}/{g}" for n, pats in sorted(ENGINE_HEAVY.items()) for g in pats]   # regenerated, heavy
+    out += [f"/engines/{n}/{g}" for n, pats in sorted({**ENGINE_HEAVY, **(shares or {}).get(HEAVY, {})}.items())
+            for g in pats]                                                                     # regenerated, heavy
     if (shares or {}).get(VAULTED):
         out.append("# vault links (generated: brain.py vault): the secrets live outside the base")
         out += ["/" + _st_escape(x) for x in shares[VAULTED]]
@@ -7257,7 +7315,8 @@ def stignore_layout(shares=None):
     out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
     out += [f"/engines/**/{d}" for d in ENGINE_DENY_DIRS]
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
-    out += [f"/engines/{n}/{g.rstrip('/')}" for n, pats in sorted(ENGINE_HEAVY.items()) for g in pats]  # even sync all
+    out += [f"/engines/{n}/{g.rstrip('/')}" for n, pats in sorted({**ENGINE_HEAVY, **(shares or {}).get(HEAVY, {})}
+                                                                  .items()) for g in pats]          # even sync all
     out.append("!/engines/README.md")
     for k, pats in ENGINE_SAFE.items():
         out += [f"!/engines/{k}/{g.rstrip('/')}" for g in pats]
@@ -7268,7 +7327,7 @@ def stignore_layout(shares=None):
         out += [f"/{d}" for d in SYNC_ALL_CLOSED]
         return "\n".join(dict.fromkeys(out))
     for k, subs in sorted((shares or {}).items()):          # after the secret denies, before the deny-all /engines
-        if k not in (SYNC_ALL, SYNC_DENIED, VAULTED):
+        if k not in (SYNC_ALL, SYNC_DENIED, VAULTED, HEAVY):
             out += [f"!/engines/{k}/{sub}" for sub in subs]
     out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]
     return "\n".join(dict.fromkeys(out))
@@ -7294,6 +7353,7 @@ def share_check(sub):
 SYNC_ALL = "*sync-all*"     # key in engine_shares() output: engines.json "sync": "all" (never a folder name)
 SYNC_DENIED = "*sync-denied*"   # key: exact paths the content scan flagged (.brain/sync-denied.json), sync all only
 SYNC_DENIED_REG = ".brain/sync-denied.json"
+HEAVY = "*heavy*"           # key: {tool folder: heavy globs} that `engine adopt --path ... --heavy` recorded
 SYNC_SCAN_STATE = ".brain/sync-scan-state.json"
 SYNC_SCAN_MAX = 2 * 1024 * 1024
 SYNC_SCAN_EVERY = 600.0                # the watcher scans at least this often (its rescan pass, see watch_once)
@@ -7322,6 +7382,10 @@ def engine_shares(base):
                 pass
         if subs:
             out[name] = sorted(set(subs))
+    hv = {n: [x for x in e["heavy"] if isinstance(x, str) and x.strip("/") and not x.startswith(("!", "#", "/"))]
+          for n, e in reg.get("engines", {}).items() if isinstance(e, dict) and isinstance(e.get("heavy"), list)}
+    if any(hv.values()):
+        out[HEAVY] = {n: v for n, v in sorted(hv.items()) if v}
     try:
         vl = sorted(vault_entries(base))
     except SystemExit:
@@ -7943,8 +8007,8 @@ def vault_secrets(d):
     `api_token.txt` only at D's top; every file of a login folder such as mcp-tokens/); sessions, caches and code
     folders skipped."""
     d, out = pathlib.Path(d), []
-    heavy = {g.rstrip("/") for g in ENGINE_HEAVY.get(d.name, ())}
-    own = ENGINE_VAULT.get(d.name, ())                # the tool row's own secret names (top of its folder)
+    heavy = {g.rstrip("/") for g in engine_pats(d, "heavy")}
+    own = engine_pats(d, "vault")                     # the tool row's own secret names (top of its folder)
     for dp, dns, fns in os.walk(d):
         dns[:] = sorted(x for x in dns if x not in VAULT_SKIP_DIRS and not os.path.islink(os.path.join(dp, x))
                         and not os.path.lexists(os.path.join(dp, x, ".git"))      # code checkouts are not logins
@@ -7970,7 +8034,7 @@ def vault_units(d):
     e.g. Claude's backups/ of .claude.json that it rotates, or mcp-tokens/) moves as ONE folder link, so new files the
     tool writes there land in the vault too; every other secret file moves alone. [(path, path below D)]"""
     d, files = pathlib.Path(d), vault_secrets(d)
-    own = ENGINE_VAULT.get(d.name, ())
+    own = engine_pats(d, "vault")
     whole = [d / x for x in sorted(os.listdir(d)) if vault_own(x, own, True) and (d / x).is_dir()
              and not (d / x).is_symlink()] if own else []      # a tool row's secret folder moves as ONE link
     out = [(x, x.name) for x in whole]
@@ -8504,10 +8568,10 @@ SECRET_TEXT = re.compile(
     r"(?<![A-Za-z0-9_-])(sk-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}"
     r"|AIza[0-9A-Za-z_-]{30,}|xox[abp]-[A-Za-z0-9-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|\b\d{8,10}:AA[A-Za-z0-9_-]{30,})")
-ALLOWED_OUTSIDE = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos", "Public", "Templates", "snap",
-                   ".cache", ".local", ".config", ".ssh", ".gnupg", ".nvm", ".cargo", ".rustup", ".npm", ".pki",
-                   ".mozilla", ".pyenv", ".dotnet", ".vscode-server", "go", ".git", ".agents", ".agent",
-                   BACKUPS_DIR)
+ALLOWED_OUTSIDE = ("Music", "Pictures", "Videos", "Public", "Templates", "snap", ".ssh", ".gnupg", ".nvm", ".cargo",
+                   ".rustup", ".npm", ".pki", ".mozilla", ".pyenv", ".dotnet", ".vscode-server", "go", ".git",
+                   ".agents", ".agent", BACKUPS_DIR)     # no containers (.cache, .config, .local, Documents, ...):
+                                                         # the full scan checks their entries one by one
 ALLOWED_WHY = {         # outside the base ON PURPOSE (doctor says why when they exist)
     BACKUPS_DIR: "backups of the base: they must survive a broken or deleted base (archive_base refuses a folder "
                  "inside the base)",
@@ -8784,7 +8848,7 @@ def reconnect(base, log):
     return log
 
 
-def engine_adopt(base, tool, force=False, undo=False):
+def engine_adopt(base, tool, force=False, undo=False, path=None, vault=(), heavy=()):
     base, home, log = pathlib.Path(base).resolve(), home_dir(), []
     key = tool_key_of(tool)
     if undo:
@@ -8792,6 +8856,13 @@ def engine_adopt(base, tool, force=False, undo=False):
         if isinstance(e, dict) and e.get("env"):
             return engine_release(base, tool, force)
         return engine_unadopt_link(base, ENGINE_NAMES.get(key, tool) if key else tool, force)
+    if path:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tool) or tool in ENGINE_NAMES.values() or link_row(tool):
+            raise SystemExit(f"engine adopt --path: '{tool}' must be a new plain name (a-z, 0-9, . _ -)")
+        return engine_adopt_link(base, force=force, row={"id": tool, "dir": str(path), "generic": True,
+                                                         "vault": list(vault or ()), "heavy": list(heavy or ())})
+    if tool in ADOPT_ROWS:
+        return engine_adopt_link(base, force=force, row=ADOPT_ROWS[tool])
     if key in TOOLS and TOOLS[key].get("adopt") == "link":
         return engine_adopt_link(base, key, force)
     var = engine_var(key) if key else None
@@ -8921,6 +8992,8 @@ def lock_holders(d, names):
 
 
 def tree_bytes(d):
+    if os.path.isfile(d):
+        return os.path.getsize(d)
     n = 0
     for dp, dns, fns in os.walk(d):
         for f in fns:
@@ -8942,6 +9015,10 @@ def _link_check(src, dest, proof=()):
     """Raise OSError unless SRC is a link that resolves to DEST and the files are readable through it."""
     if not src.is_symlink() or os.path.realpath(src) != os.path.realpath(dest):
         raise OSError(f"{src} does not resolve to {dest}")
+    if dest.is_file():
+        with open(src, "rb") as fh:
+            fh.read(1)
+        return
     names = sorted(os.listdir(src))
     if names != sorted(os.listdir(dest)):
         raise OSError(f"{src} does not list the same files as {dest}")
@@ -8952,19 +9029,20 @@ def _link_check(src, dest, proof=()):
                 fh.read(1)
 
 
-def link_move(base, src, name, home, locks=(), force=False, proof=(), what="engine adopt"):
+def link_move(base, src, name, home, locks=(), force=False, proof=(), what="engine adopt", dest=None, kind="engine"):
     """The one mover for adopt by symlink: SRC (a real folder outside the base) -> BASE/engines/NAME, then a symlink
     at SRC, then the check (the link resolves, files readable); any failure undoes it all. A mirror of SRC with the
     same name is set aside first and comes back on failure. Refuses: SRC missing or a link, the tool running, the
     target there, another filesystem (no partial copies). Returns the log."""
     base, home = pathlib.Path(base).resolve(), pathlib.Path(home)
-    src, dest, log = pathlib.Path(src), pathlib.Path(base) / "engines" / name, []
+    src, log = pathlib.Path(src), []
+    dest = pathlib.Path(dest) if dest else pathlib.Path(base) / "engines" / name
     if src.is_symlink():
         if in_dir(src, base):
             raise SystemExit(f"{what}: {home_rel(src, home)} is already a link into the base "
                              f"({os.path.realpath(src)})")
         raise SystemExit(f"{what}: {home_rel(src, home)} is a link to {os.readlink(src)}, not a folder to move")
-    if not src.is_dir():
+    if not src.is_dir() and not (kind != "engine" and src.is_file()):
         raise SystemExit(f"{what}: {home_rel(src, home)} is not a folder (nothing to adopt)")
     if in_dir(src, base):
         raise SystemExit(f"{what}: {src} is inside the base already")
@@ -8976,7 +9054,7 @@ def link_move(base, src, name, home, locks=(), force=False, proof=(), what="engi
     if busy and not force:
         raise SystemExit(f"{what}: these programs use {src} now (stop them first):\n" +
                          "\n".join(f"  {pid} {cmd}" for pid, cmd in busy[:10]))
-    e = reg_load(base, ENGINES_REG).get("engines", {}).get(name)
+    e = reg_load(base, ENGINES_REG).get("engines", {}).get(name) if kind == "engine" else None
     mirror = isinstance(e, dict) and e.get("mode") == "mirror" and (dest / "MIRROR").is_file() \
         and not dest.is_symlink()
     if os.path.lexists(dest) and not mirror:
@@ -9013,7 +9091,7 @@ def link_move(base, src, name, home, locks=(), force=False, proof=(), what="engi
         shutil.rmtree(aside, ignore_errors=True)
     log.append(f"moved {home_rel(src, home)} -> {dest}; {home_rel(src, home)} is now a link to it")
     moves = reg_load(base, MOVES_LOG)
-    moves.setdefault("moves", []).append({"kind": "engine", "name": name, "from": str(src), "to": str(dest),
+    moves.setdefault("moves", []).append({"kind": kind, "name": name, "from": str(src), "to": str(dest),
                                           "at": dt.datetime.now().isoformat(timespec="seconds")})
     reg_save(base, MOVES_LOG, moves)
     return log
@@ -9046,14 +9124,110 @@ def link_drop_mirrors(base, src, home, keep):
     return log
 
 
-def engine_adopt_link(base, key, force=False):
+UNIT_HOME = ".config/systemd/user"
+UNIT_OPS = "ops/systemd"
+UNIT_SUFFIX = (".service", ".timer", ".socket", ".path", ".target", ".mount", ".slice")
+
+
+def unit_candidates(base, home):
+    """Real unit files and drop-in folders (NAME.service.d) in ~/.config/systemd/user that adopt-units moves:
+    not links, not the *.wants/*.requires enable state, not the units connect writes for this base."""
+    d = pathlib.Path(home) / UNIT_HOME
+    mine = {pathlib.PurePosixPath(r).name for st in ("watch", "timer")
+            for r in (connect_rec(base).get(st) or {}) if r.startswith(UNIT_HOME + "/")}
+    out = []
+    for p in sorted(d.iterdir()) if d.is_dir() else []:
+        if p.is_symlink() or p.name in mine or p.name.endswith((".wants", ".requires")):
+            continue
+        if (p.is_file() and p.name.endswith(UNIT_SUFFIX)) or (p.is_dir() and p.name.endswith(
+                tuple(x + ".d" for x in UNIT_SUFFIX))):
+            out.append(p)
+    return out
+
+
+def systemctl_reload(log):
+    if shutil.which("systemctl"):
+        r = subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+        log.append("systemctl --user daemon-reload" + ("" if r.returncode == 0 else
+                                                       f": failed ({(r.stderr or '').strip()[:120]}); run it by hand"))
+    else:
+        log.append("run `systemctl --user daemon-reload` (systemctl is not on PATH here)")
+
+
+def units_adopt(base, undo=False, again=False):
+    """G3: every real unit file and drop-in folder of ~/.config/systemd/user (an installer's, e.g. team-*,
+    ntfy, claude-rc, *.service.d) moves into BASE/ops/systemd/ with a link back (link_move: checked, else
+    undone); engines.json "units" records them. AGAIN (watch): only recorded units an installer replaced by a
+    real file again. UNDO: they come back as real files."""
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    reg = reg_load(base, ENGINES_REG)
+    rec = reg.get("units") if isinstance(reg.get("units"), dict) else {}
+    ud, od = pathlib.Path(home) / UNIT_HOME, base / UNIT_OPS
+    if undo:
+        for n in sorted(rec):
+            src, dest = ud / n, od / n
+            if src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest) and os.path.lexists(dest):
+                os.unlink(src); os.rename(dest, src); log.append(f"~/{UNIT_HOME}/{n}: a real file again")
+            rec.pop(n)
+    else:
+        for p in unit_candidates(base, home):
+            dest = od / p.name
+            if again and p.name not in rec:
+                continue
+            if os.path.lexists(dest):
+                if p.name not in rec:
+                    log.append(f"kept ~/{UNIT_HOME}/{p.name}: {dest} exists and is not from adopt-units")
+                    continue
+                bk = base / ".brain" / "backups" / f"units-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
+                bk.mkdir(parents=True, exist_ok=True)
+                os.rename(dest, bk / p.name)            # an installer rewrote it: the new one wins, the old is kept
+                log.append(f"{p.name}: an installer replaced the link; the older copy is in {rel(bk, base)}")
+            od.mkdir(parents=True, exist_ok=True)
+            try:
+                log += link_move(base, p, p.name, home, what="engine adopt-units", dest=dest, kind="unit")
+            except SystemExit as e:
+                log.append(str(e)); continue
+            rec[p.name] = {"since": (rec.get(p.name) or {}).get("since") or today()}
+    if rec:
+        reg["units"] = {k: rec[k] for k in sorted(rec)}
+    else:
+        reg.pop("units", None)
+    if log:
+        if reg:
+            reg_save(base, ENGINES_REG, reg)
+        elif (base / ENGINES_REG).is_file():
+            (base / ENGINES_REG).unlink()
+        systemctl_reload(log)
+    return log or ([] if again else ["no real unit files to move"])
+
+
+def engine_adopt_link(base, key=None, force=False, row=None):
+    """Adopt by a link: the folder of a TOOLS row (adopt=link), an ADOPT_ROWS row, or a generic ROW
+    (`engine adopt NAME --path DIR [--vault GLOB] [--heavy GLOB]`)."""
     base, home = pathlib.Path(base).resolve(), home_dir()
-    t, name = TOOLS[key], ENGINE_NAMES[key]
-    src = home / key
+    t = row or TOOLS[key]
+    name, d = t["id"], t.get("dir") or t["key"]
+    src = pathlib.Path(os.path.abspath(os.path.expanduser(d))) if d.startswith(("/", "~")) else home / d
+    extra = {k: list(t[k]) for k in ("vault", "heavy") if row and row.get("generic") and t.get(k)}
+    if row and row.get("generic"):
+        if name in reg_load(base, ENGINES_REG).get("engines", {}) or os.path.lexists(base / "engines" / name):
+            raise SystemExit(f"engine adopt: engines/{name} exists already: pick another name")
+        if not src.is_dir() or src.is_symlink() or in_dir(src, base):
+            raise SystemExit(f"engine adopt: {d} is not a real folder outside the base")
+        link_register(base, name, name, src, home, extra)   # its heavy and secret names count before the move
     refresh_ignore_blocks(base)                      # the heavy and secret lines are in place before anything moves
-    log = link_move(base, src, name, home, t.get("locks", ()), force,
-                    [m[len(key) + 1:] for m in t.get("marks", ()) if m.startswith(key + "/")])
-    link_register(base, name, t["id"], src, home)
+    rel = d.rstrip("/") + "/"
+    try:
+        log = link_move(base, src, name, home, t.get("locks", ()), force,
+                        [m[len(rel):] for m in t.get("marks", ()) if m.startswith(rel)])
+    except SystemExit:
+        if row and row.get("generic"):
+            reg = reg_load(base, ENGINES_REG)
+            reg.get("engines", {}).pop(name, None)
+            reg_save(base, ENGINES_REG, reg)
+            refresh_ignore_blocks(base)
+        raise
+    link_register(base, name, name, src, home, extra)
     log += link_drop_mirrors(base, src, home, name)
     try:
         log += engine_vault(base, name)
@@ -9062,8 +9236,8 @@ def engine_adopt_link(base, key, force=False):
     ch = refresh_ignore_blocks(base)
     if ch:
         log.append(f"updated {', '.join(ch)}")
-    log.append(f"{t['name']}: start it again; it finds its folder through the link. Undo: "
-               f"brain.py engine adopt --undo {t['id']}")
+    log.append(f"{t.get('name', name)}: start it again; it finds its folder through the link. Undo: "
+               f"brain.py engine adopt --undo {name}")
     return log
 
 
@@ -9078,8 +9252,7 @@ def engine_unadopt_link(base, name, force=False):
             or not dest.is_dir():
         raise SystemExit(f"engine adopt --undo: {e['from']} is not the link into {dest} (brain.py doctor says "
                          "how to fix it): nothing changed")
-    key = tool_key_of(e.get("tool"))
-    running = lock_holders(dest, TOOLS.get(key, {}).get("locks", ()))
+    running = lock_holders(dest, (link_row(e.get("tool") or name) or {}).get("locks", ()))
     if running:
         raise SystemExit(f"engine adopt --undo: the tool is running ({'; '.join(running)}): quit it first")
     busy = procs_using(dest)
@@ -9106,6 +9279,8 @@ def engine_unadopt_link(base, name, force=False):
     moves.setdefault("moves", []).append({"kind": "engine", "undo": True, "name": name, "from": str(dest),
                                           "to": str(src), "at": dt.datetime.now().isoformat(timespec="seconds")})
     reg_save(base, MOVES_LOG, moves)
+    if e.get("heavy") or e.get("vault"):
+        refresh_ignore_blocks(base)                  # its own heavy lines go with it
     log.append(f"a mirror is not made again by itself: `brain.py engine mirror {e['from']}` if you want one")
     return log
 
@@ -9637,6 +9812,231 @@ def leftover_rows(base, home):
     return out
 
 
+# -- doctor's full scan (G1): every entry at the places below is in the base, a link into the base, or carries
+# one STAYS reason id; anything else is OUTSIDE "unclassified". No deep walks: names, links and (only for
+# product-named caches) a size kept in .brain/doctor-sizes.json for a day.
+STAYS_REASONS = ("os-system", "program-install", "cache", "secret-store", "vault", "backups-outlive-base",
+                 "installer-record", "fixed-locator", "guard-file", "other-user", "tool-state-at-xdg-path")
+SCAN_ROOTS = ("", ".config", ".local/share", ".local/state", ".local/bin", UNIT_HOME, ".cache", "Documents",
+              "Desktop", "Downloads")                 # "" = HOME itself (every name, dotfiles too)
+SCAN_SKIP = {".config", ".local", ".local/share", ".local/state", ".local/bin", ".cache", "Documents", "Desktop",
+             "Downloads", ".config/systemd", UNIT_HOME, ".local/share/systemd"}   # containers: their entries count
+STAYS = (             # (home-relative glob, reason id): first match wins
+    ("Pictures", "os-system"), ("Music", "os-system"), ("Videos", "os-system"), ("Templates", "os-system"),
+    ("Public", "os-system"), (".ICEauthority", "os-system"), (".Xauthority", "os-system"),
+    (".wget-hsts", "os-system"), (".lesshst", "os-system"), (".bash_logout", "os-system"),
+    (".sudo_as_admin_successful", "os-system"), (".selected_editor", "os-system"), (".inputrc", "os-system"),
+    (".xsession-errors*", "os-system"), (".dmrc", "os-system"), (".face*", "os-system"),
+    (".config/user-dirs.*", "os-system"), (".config/mimeapps.list", "os-system"), (".config/monitors.xml*", "os-system"),
+    (".config/dconf", "os-system"), (".config/pulse", "os-system"), (".config/cinnamon*", "os-system"),
+    (".config/xfce4", "os-system"), (".config/nemo", "os-system"), (".config/nautilus", "os-system"),
+    (".config/Thunar", "os-system"), (".config/ibus", "os-system"), (".config/evolution", "os-system"),
+    (".config/gtk-*", "os-system"), (".config/gnome-*", "os-system"), (".config/enchant", "os-system"),
+    (".config/menus", "os-system"), (".config/goa-1.0", "os-system"), (".config/procps", "os-system"),
+    (".config/htop", "os-system"), (".config/fontconfig", "os-system"), (".config/xsettingsd", "os-system"),
+    (".config/autostart", "tool-state-at-xdg-path"), (".config/syncthing", "tool-state-at-xdg-path"),
+    (".config/environment.d", "fixed-locator"), (".config/skeleton-base", "fixed-locator"),
+    (".config/ai-tool-dirs.d", "fixed-locator"), (".config/claude-code-dirs.d", "fixed-locator"),
+    (".profile", "fixed-locator"), (".bashrc", "fixed-locator"), (".zshrc", "fixed-locator"),
+    (".gitconfig", "fixed-locator"), (".config/git", "fixed-locator"),
+    (".local/share/Trash", "os-system"), (".local/share/applications", "os-system"),
+    (".local/share/icons", "os-system"), (".local/share/gvfs-metadata", "os-system"),
+    (".local/share/recently-used.xbel*", "os-system"), (".local/share/sounds", "os-system"),
+    (".local/share/nemo", "os-system"), (".local/share/nautilus", "os-system"), (".local/share/evolution", "os-system"),
+    (".local/share/gnome-*", "os-system"), (".local/share/cinnamon*", "os-system"), (".local/share/xfce4", "os-system"),
+    (".local/share/ibus*", "os-system"), (".local/share/tracker*", "os-system"), (".local/share/flatpak", "program-install"),
+    (".local/share/keyrings*", "secret-store"), (".local/share/the-mothership", "installer-record"),
+    (".local/share/claude", "program-install"), (".local/share/uv", "program-install"),
+    (".local/share/pnpm", "program-install"), (".local/share/powershell", "program-install"),
+    (".local/state/syncthing", "tool-state-at-xdg-path"), (".local/state/claude", "tool-state-at-xdg-path"),
+    (".local/state/hermes", "tool-state-at-xdg-path"), (".local/state/nous-research", "tool-state-at-xdg-path"),
+    (".local/state/wireplumber", "os-system"), (".local/state/pipewire", "os-system"),
+    (".nvm", "program-install"), (".cargo", "program-install"), (".rustup", "program-install"),
+    (".pyenv", "program-install"), (".dotnet", "program-install"), (".vscode-server", "program-install"),
+    (".bun", "program-install"), (".deno", "program-install"), ("go", "program-install"),
+    ("Applications", "program-install"), ("snap", "program-install"), ("rea-engines", "program-install"),
+    (".npm", "cache"), (".cache/*", "cache"),
+    (".ssh", "secret-store"), (".gnupg", "secret-store"), (".pki", "secret-store"), (".sigstore", "secret-store"),
+    (".docker", "secret-store"), (".config/gh", "secret-store"), (".idapro", "secret-store"),
+    (".semgrep", "secret-store"), (".mozilla", "secret-store"), (".config/google-chrome*", "secret-store"),
+    (".config/chromium", "secret-store"), (".bash_history", "secret-store"), (".python_history", "secret-store"),
+    (".netrc", "secret-store"), (".git-credentials", "secret-store"), (".aws", "secret-store"),
+    (".kube", "secret-store"), (".config/gcloud", "secret-store"),
+    ("coffre", "vault"), (".coffre", "vault"), (".mine", "vault"), ("Desktop/Mine", "vault"),
+    (BACKUPS_DIR, "backups-outlive-base"), ("backups", "backups-outlive-base"),
+    ("base-migration-backups", "backups-outlive-base"),
+)
+CACHE_PRODUCTS = ("frugal*", "hermes*", "codex*", "claude*", "skeleton*", "mothership*")   # + outside.json "products"
+CACHE_BIG = 50 * 1024 * 1024
+SIZES = ".brain/doctor-sizes.json"
+
+
+def outside_allow(base):
+    """.brain/outside.json "allow": [{path, reason}] (a STAYS reason id) or plain names (older form, reason
+    unknown). Returns ({home-relative path: reason id or ''}, notes)."""
+    out, notes = {}, []
+    for x in reg_load(base, ".brain/outside.json").get("allow", []) or []:
+        p, why = (x, "") if isinstance(x, str) else ((x.get("path"), x.get("reason")) if isinstance(x, dict)
+                                                     else (None, None))
+        if not isinstance(p, str) or not p.strip():
+            continue
+        p = p.strip().removeprefix("~/").rstrip("/")
+        if why and why not in STAYS_REASONS:
+            notes.append(("WARN", f".brain/outside.json: {p}: '{why}' is not a reason id ({', '.join(STAYS_REASONS)})"))
+            continue
+        out[p] = why or ""
+    return out, notes
+
+
+def _cached_size(base, p, cache):
+    try:
+        mt = os.stat(p).st_mtime_ns
+    except OSError:
+        return 0
+    c = cache.get(str(p))
+    if isinstance(c, list) and len(c) == 3 and c[0] == mt and time.time() - c[2] < 86400:
+        return c[1]
+    n = tree_bytes(p)
+    cache[str(p)] = [mt, n, time.time()]
+    return n
+
+
+def unit_paths(p, home):
+    """Paths named by a unit file's Exec*/EnvironmentFile/WorkingDirectory lines (%h = HOME)."""
+    out = []
+    for line in (read(p) or "").splitlines():
+        k, _, v = line.strip().partition("=")
+        if not (k.startswith("Exec") or k in ("EnvironmentFile", "WorkingDirectory")):
+            continue
+        try:
+            toks = shlex.split(v.replace("%h", str(home)))
+        except ValueError:
+            toks = v.split()
+        for t in toks:
+            t = t.lstrip("-@!+:")
+            if t.startswith("~/"):
+                t = str(home) + t[1:]
+            if t.startswith("/"):
+                out.append(t)
+    return out
+
+
+def outside_scan(base, home, handled=()):
+    """[(level, text)] for the full scan, plus one INFO line with the counts per reason."""
+    base, home = pathlib.Path(base).resolve(), pathlib.Path(home)
+    allow, rows = outside_allow(base)
+    for k in sorted(allow):
+        if k in SCAN_SKIP or k == "":
+            rows.append(("INFO", f".brain/outside.json: ~/{k} is a container: its entries are checked one by one "
+                                 "(the allow line hides nothing)"))
+    adopt = {r["dir"]: r for r in ADOPT_ROWS.values()}
+    adopt.update({k: t for k, t in TOOLS.items() if t.get("adopt") == "link"})
+    guards = {e.get("from", "").removeprefix("~/") for e in reg_load(base, ENGINES_REG).get("engines", {}).values()
+              if isinstance(e, dict) and e.get("mode") == "adopted"}
+    try:
+        vault = home_rel(vault_root(base), home).removeprefix("~/")
+    except SystemExit:
+        vault = None
+    mine_units = {pathlib.PurePosixPath(r).name for st in ("watch", "timer")
+                  for r in (connect_rec(base).get(st) or {}) if r.startswith(UNIT_HOME + "/")}
+    skip = set(handled) | set(TOOLS) | set(TOOL_HOMES) | {k.split("/")[0] for k in TOOLS if "/" not in k} | NOT_TOOLS
+    try:
+        cache = json.loads(read(base / SIZES) or "{}")
+    except ValueError:
+        cache = {}
+    counts, ncache = {}, len(cache)
+    own = reg_load(base, ".brain/outside.json").get("products")     # your own product names (cache globs)
+    products = CACHE_PRODUCTS + tuple(x.lower() for x in (own if isinstance(own, list) else []) if isinstance(x, str))
+    unclassified = []
+
+    def why_of(r):
+        if r in allow:
+            return allow[r] or "listed"
+        if vault and r == vault:
+            return "vault"
+        if r in guards:
+            return "guard-file"
+        if (home / r / "installed.json").is_file() and r.startswith(".local/share/"):
+            return "installer-record"
+        return next((w for g, w in STAYS if fnmatch.fnmatchcase(r, g)), None)
+    for root in SCAN_ROOTS:
+        d = home / root if root else home
+        if d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            ents = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e in ents:
+            r = f"{root}/{e.name}" if root else e.name
+            p = pathlib.Path(e.path)
+            if r in SCAN_SKIP or r in skip or os.path.normpath(e.path) == str(base) or in_dir(base, p) and \
+                    not p.is_symlink():
+                continue
+            if p.is_symlink() and in_dir(p, base):
+                counts["link into the base"] = counts.get("link into the base", 0) + 1
+                continue
+            if root == ".local/bin":
+                tgt = os.path.realpath(p) if p.is_symlink() else None
+                if tgt and not in_dir(tgt, base) and not any(in_dir(tgt, home / x) for x in (
+                        ".local/share/uv", ".local/share/claude", ".local/share/pnpm", ".local/bin", "Applications",
+                        ".nvm", ".cargo", "snap")) and not tgt.startswith(("/usr/", "/opt/", "/snap/", "/bin/")):
+                    rows.append(("OUTSIDE", f"~/{r} -> {tgt}: a link to a place outside the base (move what it "
+                                            "points to into the base, or give it a reason in .brain/outside.json)"))
+                else:
+                    counts["program-install"] = counts.get("program-install", 0) + 1
+                continue
+            if root == UNIT_HOME:
+                if e.name in mine_units or e.name.endswith((".wants", ".requires")) or \
+                        (p.is_symlink() and os.path.realpath(p) == "/dev/null"):
+                    counts["tool-state-at-xdg-path"] = counts.get("tool-state-at-xdg-path", 0) + 1
+                    continue
+                if not p.is_symlink():
+                    rows.append(("OUTSIDE", f"~/{r}: a real unit {'folder' if p.is_dir() else 'file'} "
+                                            "-> brain.py engine adopt-units"))
+                for f in ([x for x in sorted(p.iterdir()) if x.is_file()] if p.is_dir() else [p]):
+                    bad = sorted({x for x in unit_paths(f, home) if not in_dir(x, base) and (
+                        in_dir(x, home) and not in_dir(x, home / ".local/bin") or not in_dir(x, home) and not
+                        x.startswith(("/usr/", "/bin/", "/sbin/", "/etc/", "/opt/", "/snap/", "/dev/", "/proc/",
+                                      "/run/", "/tmp/", "/var/", "/lib")))})
+                    if bad:
+                        rows.append(("OUTSIDE", f"~/{r}: names paths outside the base: {', '.join(bad[:4])} (move "
+                                                "them into the base, then point the unit there)"))
+                continue
+            if r in adopt and not p.is_symlink():
+                t = adopt[r]
+                rows.append(("OUTSIDE", f"{t.get('name', t['id'])}: ~/{r} -> brain.py engine adopt {t['id']} "
+                                        "(moves it into the base and leaves a link)"))
+                continue
+            w = why_of(r)
+            if root == ".cache" and (w in (None, "cache", "listed")) and any(
+                    fnmatch.fnmatchcase(e.name.lower(), g) for g in products) and p.is_dir() and \
+                    not p.is_symlink() and _cached_size(base, p, cache) > CACHE_BIG:
+                rows.append(("OUTSIDE", f"~/{r}: a cache named after a product, over 50 MB "
+                                        f"({size_text(_cached_size(base, p, cache))}): its real data belongs in the "
+                                        "base (data/), or give it a reason in .brain/outside.json"))
+                continue
+            if w:
+                counts[w] = counts.get(w, 0) + 1
+                continue
+            if p.is_dir() and not p.is_symlink() and (p / ".git").exists():
+                continue                                  # doctor's code-repo row says `projects move`
+            unclassified.append(r)
+    for r in unclassified:
+        rows.append(("OUTSIDE", f"unclassified: ~/{r} -> move it into the base (brain.py engine adopt NAME --path "
+                                f"~/{r}, or brain.py projects move), or add {{\"path\": \"~/{r}\", \"reason\": "
+                                "\"<id>\"}} to .brain/outside.json \"allow\""))
+    if len(cache) != ncache or cache:
+        try:
+            if read(base / SIZES) != dump_json(cache):
+                write(base / SIZES, dump_json(cache))
+        except OSError:
+            pass
+    if counts:
+        rows.append(("INFO", "outside the base on purpose: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))))
+    return rows
+
+
 def setting_note(key):
     """Why a tool's folder cannot be adopted by its own setting (the doctor hint): the setting it has moves more
     than this folder (Gemini CLI's GEMINI_CLI_HOME is the home it lives in; XDG_* moves every program), or none."""
@@ -9684,8 +10084,7 @@ def link_rows(base, home):
 def doctor(base, strict=False):
     base, home = pathlib.Path(base).resolve(), home_dir()
     rows = []                                          # (level, text)
-    allow = set(ALLOWED_OUTSIDE) | {x.removeprefix("~/") for x in
-                                    reg_load(base, ".brain/outside.json").get("allow", []) if isinstance(x, str)}
+    allow = set(ALLOWED_OUTSIDE) | {k for k in outside_allow(base)[0] if k not in SCAN_SKIP}
     mirrors = {os.path.normpath(str(s)) for _, s, _ in mirror_sources(base, home)}
     mine = Connector(base).created_files(connect_rec(base))
     guarded = set()                                    # engines/ dirs whose default place holds our guard
@@ -9760,6 +10159,8 @@ def doctor(base, strict=False):
                 kind = "worktree" if (d / ".git").is_file() else "repo"
                 rows.append(("OUTSIDE", f"code {kind} {home_rel(d, home)} -> brain.py projects move "
                                         f"{home_rel(d, home)}"))
+    rows += outside_scan(base, home, {k for k, d in tool_dirs(home, base) if any(ai_signals(d))} |
+                         {home_rel(x, home).removeprefix("~/") for x in mirrors})
     rows += leftover_rows(base, home)
     rows += doctor_git(base)
     rows += vault_rows(base)
@@ -9943,7 +10344,7 @@ def main(argv):
     if cmd in ("engine", "projects", "doctor", "vault"):
         base, i, rest, flags = SRC, 0, [], set()
         while i < len(args):
-            if args[i] in ("--base", "--slug", "--name", "--keep") and i + 1 < len(args):
+            if args[i] in ("--base", "--slug", "--name", "--keep", "--path", "--vault", "--heavy") and i + 1 < len(args):
                 if args[i] == "--base":
                     base = pathlib.Path(args[i + 1]).expanduser().resolve()
                 else:
@@ -9972,7 +10373,8 @@ def main(argv):
                 print("usage: vault add PATH [--undo] [--dry-run] | vault root [PATH] | vault list"); return 1
             print("\n".join(log)); return 0
         if cmd == "engine":
-            if sub in ("adopt", "release", "mirror", "unmirror") and len(rest) != 2:
+            if sub in ("adopt", "release", "mirror", "unmirror") and len(rest) != 2 or \
+                    sub == "adopt-units" and len(rest) != 1:
                 print(f"usage: engine {sub} TOOL"); return 1
             if sub == "vault":
                 if len(rest) != 2:
@@ -9984,7 +10386,11 @@ def main(argv):
                 log = revault(base, rest[1] if len(rest) == 2 else None, dry) or ["re-vault: every vaulted path is "
                                                                                   "still a link: nothing to do"]
             elif sub == "adopt":
-                log = engine_adopt(base, rest[1], force, undo)
+                many = lambda k: [v for x in flags if isinstance(x, tuple) and x[0] == k for v in [x[1]]]
+                log = engine_adopt(base, rest[1], force, undo, val("--path"), sorted(many("--vault")),
+                                   sorted(many("--heavy")))
+            elif sub == "adopt-units":
+                log = units_adopt(base, undo)
             elif sub == "release":
                 log = engine_release(base, rest[1], force)
             elif sub == "mirror":
@@ -10008,7 +10414,7 @@ def main(argv):
             elif sub == "list":
                 log = engine_list(base)
             else:
-                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine vault NAME [--undo] [--dry-run] | engine revault [NAME|--all] [--dry-run] | engine sync | engine list"); return 1
+                print("usage: engine adopt|release|mirror|unmirror TOOL | engine adopt NAME --path DIR [--vault G] [--heavy G] | engine adopt-units [--undo] | engine share NAME SUBDIR [--remove] | engine vault NAME [--undo] [--dry-run] | engine revault [NAME|--all] [--dry-run] | engine sync | engine list"); return 1
         else:
             if sub == "move" and "--undo" in flags:
                 log = projects_undo(base, rest[1] if len(rest) > 1 else None, force)

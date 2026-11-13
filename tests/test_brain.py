@@ -4201,7 +4201,7 @@ class EverythingInBaseTests(ToolHome):
         r = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(cl)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("code repo ~/repo1 -> brain.py projects move ~/repo1", r.stdout)
-        self.assertNotIn("Downloads", r.stdout)
+        self.assertIn("code repo ~/Downloads/x", r.stdout)                 # 1.6.8: Downloads is checked too
         self.assertIn("split brain", r.stdout)
         self.assertIn(f"connect --tool-dir claude-code={team}", r.stdout)
         self.assertRegex(r.stdout, r"OK +Claude Code: .*engines/claude \(set by CLAUDE_CONFIG_DIR, in the base\)")
@@ -4848,7 +4848,7 @@ class VaultTests(ToolHome):
         r = self.hb("doctor", "--base", str(self.base))
         self.assertIn(f"allowed outside: ~/{B.BACKUPS_DIR}: backups of the base", r.stdout)
         self.assertIn("allowed outside: ~/.local/share/kit: a kit installer's record", r.stdout)
-        self.assertNotIn("~/.local/share/other", r.stdout)
+        self.assertRegex(r.stdout, r"OUTSIDE\s+unclassified: ~/\.local/share/other")     # 1.6.8: no reason id
 
 
 class SyncthingOnDemandTests(ToolHome):
@@ -5585,3 +5585,195 @@ class LiveGapsTests(ToolHome):
         r = self.ok("connect")
         self.assertIn("changed since connect", r.stdout)
         self.assertEqual(f.read_text(), "# my own lint skill\n")
+
+
+class FullScanTests(ToolHome):
+    """G1: doctor checks every entry of HOME and its XDG folders: in the base, a link into it, or a STAYS reason."""
+
+    def doctor(self):
+        return self.hb("doctor", "--base", str(self.base)).stdout
+
+    def test_every_entry_is_classified_or_unclassified(self):
+        h = self.home
+        for d in ("randomdir", ".ssh", "rea-engines", ".cache/fontconfig", ".config/weird", ".local/share/thing",
+                  "Documents/Codex", ".config/dconf", "allowed-by-me", "elsewhere/bin"):
+            (h / d).mkdir(parents=True, exist_ok=True)
+        big = h / ".cache/claude-big"
+        big.mkdir(parents=True)
+        with open(big / "blob", "wb") as f:
+            f.truncate(60 * 1024 * 1024)
+        (h / ".cache/claude-small").mkdir()
+        self.write(h, ".local/bin/realtool", "#!/bin/sh\n").chmod(0o755)
+        (h / ".local/bin/outlink").symlink_to(h / "elsewhere/bin")
+        (h / ".local/bin/inlink").symlink_to(self.base / "tools/brain.py")
+        self.write(self.base, ".brain/outside.json", json.dumps({"allow": [
+            {"path": "~/allowed-by-me", "reason": "backups-outlive-base"}, ".cache",
+            {"path": "~/x", "reason": "because"}]}))
+        out = self.doctor()
+        for r in ("randomdir", ".config/weird", ".local/share/thing", "Documents/Codex"):
+            self.assertRegex(out, rf"OUTSIDE\s+unclassified: ~/{re.escape(r)} -> ", r)
+        for r in (".ssh", "rea-engines", ".cache/fontconfig", ".config/dconf", "allowed-by-me", ".local/bin/realtool",
+                  ".cache/claude-small", ".local/bin/inlink"):
+            self.assertNotRegex(out, rf"OUTSIDE.*~/{re.escape(r)}\b", r)
+        self.assertRegex(out, r"OUTSIDE\s+~/\.cache/claude-big: a cache named after a product, over 50 MB")
+        self.assertRegex(out, r"OUTSIDE\s+~/\.local/bin/outlink -> .*outside the base")
+        self.assertRegex(out, r"WARN\s+\.brain/outside\.json: x: 'because' is not a reason id")
+        self.assertRegex(out, r"INFO\s+\.brain/outside\.json: ~/\.cache is a container")
+        self.assertRegex(out, r"INFO\s+outside the base on purpose: .*program-install \d+.*secret-store \d+")
+        self.assertTrue((self.base / ".brain/doctor-sizes.json").is_file(), "the size is cached")
+
+    def test_units_real_files_and_outside_paths(self):
+        u = self.home / ".config/systemd/user"
+        self.write(u, "team-x.service", f"[Service]\nExecStart={self.home}/rc-display/keeper.sh --x\n"
+                                        "WorkingDirectory=%h/rc-display\n")
+        (u / "default.target.wants").mkdir()
+        (u / "inbase.service").symlink_to(self.write(self.base, "ops/systemd/inbase.service",
+                                                     f"[Service]\nExecStart={self.base}/tools/brain.py watch\n"))
+        out = self.doctor()
+        self.assertRegex(out, r"OUTSIDE\s+~/\.config/systemd/user/team-x\.service: a real unit file -> brain\.py "
+                              r"engine adopt-units")
+        self.assertRegex(out, r"team-x\.service: names paths outside the base: .*rc-display")
+        self.assertNotRegex(out, r"OUTSIDE.*(inbase\.service|default\.target\.wants)")
+
+    def test_known_folders_get_the_adopt_hint(self):
+        for d in (".config/Codex", ".config/ntfy", ".local/share/ntfy", ".google_workspace_mcp", ".cua-driver"):
+            self.write(self.home, f"{d}/x", "x\n")
+        out = self.doctor()
+        for d, i in ((".config/Codex", "codex-desktop"), (".config/ntfy", "ntfy-config"),
+                     (".local/share/ntfy", "ntfy-data"), (".google_workspace_mcp", "google-workspace-mcp"),
+                     (".cua-driver", "cua-driver")):
+            self.assertRegex(out, rf"OUTSIDE\s+.*~/{re.escape(d)} -> brain\.py engine adopt {i}\b", d)
+
+
+class GenericAdoptTests(ToolHome):
+    """G2: `engine adopt NAME --path DIR [--vault G] [--heavy G]` and the named rows (fake HOME)."""
+
+    def reg(self):
+        p = self.base / "engines.json"
+        return json.loads(p.read_text()).get("engines", {}) if p.is_file() else {}
+
+    def test_generic_path_with_vault_and_heavy_then_undo(self):
+        d = self.home / "rc-display"
+        self.write(d, "keeper.sh", "#!/bin/sh\n")
+        self.write(d, "api.secret", "SECRET-VALUE\n").chmod(0o600)
+        self.write(d, "big/blob.bin", "heavy\n")
+        before = ltree(d)
+        r = self.hb("engine", "adopt", "rc-display", "--path", str(d), "--vault", "*.secret", "--heavy", "big/",
+                    "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.base / "engines/rc-display"
+        self.assertTrue(d.is_symlink())
+        self.assertEqual(os.path.realpath(d), str(dest.resolve()))
+        self.assertTrue((dest / "api.secret").is_symlink(), "vaulted by its --vault glob")
+        self.assertEqual((d / "api.secret").read_text(), "SECRET-VALUE\n")
+        e = self.reg()["rc-display"]
+        self.assertEqual((e["mode"], e["link"], e["vault"], e["heavy"]), ("adopted", True, ["*.secret"], ["big/"]))
+        self.assertIn("/engines/rc-display/big/", (self.base / ".gitignore").read_text())
+        self.assertIn("/engines/rc-display/big\n", (self.base / ".stignore").read_text())
+        r = self.hb("engine", "adopt", "--undo", "rc-display", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(ltree(d), before)
+        self.assertNotIn("rc-display", self.reg())
+        self.assertNotIn("/engines/rc-display/big/", (self.base / ".gitignore").read_text())
+
+    def test_generic_refuses_a_known_name_and_a_missing_folder(self):
+        r = self.hb("engine", "adopt", "claude-desktop", "--path", str(self.home / "x"), "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("new plain name", r.stdout + r.stderr)
+        r = self.hb("engine", "adopt", "nothing-here", "--path", str(self.home / "nope"), "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("nothing-here", self.reg())
+
+    def test_named_row_ntfy_data(self):
+        d = self.home / ".local/share/ntfy"
+        self.write(d, "user.db", "SECRET-VALUE users\n").chmod(0o600)
+        self.write(d, "cache.db", "messages\n")
+        self.write(d, "attachments/a.bin", "x\n")
+        r = self.hb("engine", "adopt", "ntfy-data", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.base / "engines/ntfy-data"
+        self.assertTrue(d.is_symlink())
+        self.assertTrue((dest / "user.db").is_symlink(), "user.db goes to the vault")
+        self.assertFalse((dest / "cache.db").is_symlink())
+        gi = (self.base / ".gitignore").read_text()
+        self.assertIn("/engines/ntfy-data/cache.db", gi)
+        self.assertIn("/engines/ntfy-data/attachments/", gi)
+
+    def test_named_row_ntfy_config_vaults_its_topic_files(self):
+        d = self.home / ".config/ntfy"
+        self.write(d, "server.yml", "listen-http: :80\n")
+        for f in ("owner-topic", "reply-topic", "team-token", "server.yml.bak-auth"):
+            self.write(d, f, "SECRET-VALUE\n").chmod(0o600)
+        r = self.hb("engine", "adopt", "ntfy-config", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.base / "engines/ntfy-config"
+        for f in ("owner-topic", "reply-topic", "team-token", "server.yml.bak-auth"):
+            self.assertTrue((dest / f).is_symlink(), f)
+        self.assertFalse((dest / "server.yml").is_symlink())
+        self.assertEqual((d / "server.yml").read_text(), "listen-http: :80\n")
+
+
+class UnitsAdoptTests(ToolHome):
+    """G3: `engine adopt-units` moves real unit files and drop-ins into ops/systemd/ and links them back."""
+
+    def setUp(self):
+        super().setUp()
+        self.sd_log = self.tmp / "systemctl.log"
+        p = self.bin / "systemctl"
+        p.write_text(f"#!/bin/sh\necho \"$@\" >> {shq_(self.sd_log)}\n")
+        p.chmod(0o755)
+        self.u = self.home / ".config/systemd/user"
+
+    def test_adopt_units_watch_readopts_and_undo(self):
+        u = self.u
+        self.write(u, "team-dispatch.service", "[Service]\nExecStart=/bin/true\n")
+        self.write(u, "team-dispatch.timer", "[Timer]\nOnCalendar=hourly\n")
+        self.write(u, "hermes-gateway.service.d/display.conf", "[Service]\nEnvironment=DISPLAY=:0\n")
+        (u / "default.target.wants").mkdir()
+        (u / "default.target.wants/team-dispatch.timer").symlink_to(u / "team-dispatch.timer")
+        (u / "linked.service").symlink_to(self.write(self.base, "ops/systemd/linked.service", "[Service]\n"))
+        self.write(u, "notes.txt", "not a unit\n")
+        before = ltree(u)
+        r = self.hb("engine", "adopt-units", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ops = self.base / "ops/systemd"
+        for n in ("team-dispatch.service", "team-dispatch.timer", "hermes-gateway.service.d"):
+            self.assertTrue((u / n).is_symlink(), n)
+            self.assertEqual(os.path.realpath(u / n), str((ops / n).resolve()))
+        self.assertEqual((u / "hermes-gateway.service.d/display.conf").read_text(),
+                         "[Service]\nEnvironment=DISPLAY=:0\n")
+        self.assertFalse((u / "default.target.wants").is_symlink())
+        self.assertFalse((u / "notes.txt").is_symlink())
+        self.assertIn("--user daemon-reload", self.sd_log.read_text())
+        self.assertIn("team-dispatch.service", json.loads((self.base / "engines.json").read_text())["units"])
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"OUTSIDE.*team-dispatch")
+        # an installer writes the unit again as a real file: doctor flags it, watch adopts it again
+        os.unlink(u / "team-dispatch.service")
+        self.write(u, "team-dispatch.service", "[Service]\nExecStart=/bin/false\n")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"OUTSIDE\s+~/\.config/systemd/user/team-dispatch\.service: a real unit file")
+        r = self.hb("watch", "--once", "--no-commit", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((u / "team-dispatch.service").is_symlink())
+        self.assertEqual((ops / "team-dispatch.service").read_text(), "[Service]\nExecStart=/bin/false\n")
+        self.assertTrue(list((self.base / ".brain/backups").glob("units-*/team-dispatch.service")))
+        # undo: real files again
+        os.unlink(u / "team-dispatch.service")
+        self.write(u, "team-dispatch.service", "[Service]\nExecStart=/bin/true\n")
+        self.hb("engine", "adopt-units", "--base", str(self.base))           # adopt the restored text again
+        r = self.hb("engine", "adopt-units", "--undo", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(ltree(u), before)
+
+    def test_connects_own_units_are_left(self):
+        self.ok("connect", "--watch")
+        own = sorted(p.name for p in self.u.iterdir())
+        self.assertTrue(own)
+        r = self.hb("engine", "adopt-units", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(any((self.u / n).is_symlink() for n in own), "connect's own units are not moved")
+
+
+def shq_(p):
+    return "'" + str(p).replace("'", "'\\''") + "'"

@@ -144,4 +144,36 @@ graphify-out/
 /engines/claude-desktop/blob_storage/
 /engines/claude-desktop/fcache
 /engines/claude-desktop/Shared Dictionary/
+/engines/codex-desktop/vm_bundles/
+/engines/codex-desktop/claude-code-vm/
+/engines/codex-desktop/claude-code/
+/engines/codex-desktop/Cache/
+/engines/codex-desktop/Code Cache/
+/engines/codex-desktop/GPUCache/
+/engines/codex-desktop/DawnGraphiteCache/
+/engines/codex-desktop/DawnWebGPUCache/
+/engines/codex-desktop/Crashpad/
+/engines/codex-desktop/logs/
+/engines/codex-desktop/sentry/
+/engines/codex-desktop/blob_storage/
+/engines/codex-desktop/fcache
+/engines/codex-desktop/Shared Dictionary/
+/engines/google-workspace-mcp/logs/
+/engines/hermes-desktop/vm_bundles/
+/engines/hermes-desktop/claude-code-vm/
+/engines/hermes-desktop/claude-code/
+/engines/hermes-desktop/Cache/
+/engines/hermes-desktop/Code Cache/
+/engines/hermes-desktop/GPUCache/
+/engines/hermes-desktop/DawnGraphiteCache/
+/engines/hermes-desktop/DawnWebGPUCache/
+/engines/hermes-desktop/Crashpad/
+/engines/hermes-desktop/logs/
+/engines/hermes-desktop/sentry/
+/engines/hermes-desktop/blob_storage/
+/engines/hermes-desktop/fcache
+/engines/hermes-desktop/Shared Dictionary/
+/engines/ntfy-data/cache.db
+/engines/ntfy-data/cache.db-*
+/engines/ntfy-data/attachments/
 # base-folder:end
