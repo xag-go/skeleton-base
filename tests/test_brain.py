@@ -4432,3 +4432,151 @@ def syncthing_allows(patterns, path):
         if any(rx.match(c) for c in cands):
             return neg
     return True
+
+
+class VaultTests(ToolHome):
+    """engine vault / vault add: secrets leave the base for one vault folder (mode 700); links stay (fake HOME)."""
+
+    SECRETS = ("engines/w/.credentials.json", "engines/w/.claude.json", "engines/w/backups/.claude.json.backup.1",
+               "engines/w/api_token.txt", "engines/w/mcp-tokens/srv.json", "engines/w/team/.env")
+    KEEP = ("engines/w/CLAUDE.md", "engines/w/settings.json", "engines/w/skills/x-token-spend/SKILL.md",
+            "engines/w/sessions/a.jsonl", "engines/w/projects/k/a.jsonl", "engines/w/cache/token.json",
+            "engines/w/team/agents.json", "engines/w/.env.example")
+
+    def setUp(self):
+        super().setUp()
+        r = subprocess.run(["git", "-C", str(self.base), "init", "-q"], capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        self.init(self.base)
+        for f in self.SECRETS + self.KEEP:
+            p = self.write(self.base, f, f"SECRET-VALUE {f}\n")
+            p.chmod(0o600 if f in self.SECRETS else 0o644)
+        self.vault = self.home / ".base-secret"
+
+    def ok_env(self, *args, env=None):
+        r = self.hb(*args, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def ignored(self, rel):
+        return subprocess.run(["git", "-C", str(self.base), "check-ignore", "-q", rel]).returncode == 0
+
+    def test_engine_vault_dry_run_vault_and_undo(self):
+        before = tree(self.base)
+        r = self.ok_env("engine", "vault", "w", "--dry-run", "--base", str(self.base))
+        self.assertEqual(tree(self.base), before)
+        self.assertFalse(self.vault.exists())
+        for f in self.SECRETS:
+            self.assertIn(f"would vault: {f}", r.stdout)
+        for f in self.KEEP:
+            self.assertNotIn(f + " ", r.stdout)
+        r = self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        self.assertIn("close w", r.stdout)
+        self.assertEqual(stat_mode(self.vault), 0o700)
+        self.assertEqual(stat_mode(self.vault / "w"), 0o700)
+        for f in self.SECRETS:
+            p, v = self.base / f, self.vault / "w" / f[len("engines/w/"):]
+            self.assertTrue(p.is_symlink(), f)
+            self.assertEqual(os.readlink(p), str(v))
+            self.assertTrue(os.path.isabs(os.readlink(p)))
+            self.assertEqual(v.read_text(), f"SECRET-VALUE {f}\n")
+            self.assertEqual(p.read_text(), f"SECRET-VALUE {f}\n")          # the tool still reads it there
+            self.assertEqual(stat_mode(v), 0o600)
+            self.assertTrue(self.ignored(f), f)
+        for f in self.KEEP:
+            self.assertFalse((self.base / f).is_symlink(), f)
+        gs = self.git_status()
+        for f in self.SECRETS:
+            self.assertNotIn(f, gs)
+        st = (self.base / ".stignore").read_text().split("// base-folder:end")[0]
+        pats = [l for l in st.splitlines() if l and not l.startswith("//")]
+        shares = B.engine_shares(self.base)
+        self.assertEqual(shares[B.VAULTED], sorted(self.SECRETS))
+        allpats = [l for l in B.stignore_layout({**shares, B.SYNC_ALL: ["all"]}).splitlines()
+                   if l and not l.startswith("//")]
+        for f in self.SECRETS:
+            self.assertFalse(B.syncthing_allows(pats, f), f)
+            self.assertFalse(B.syncthing_allows(allpats, f), f)                 # sync all mode too
+            self.assertIn("/" + B._st_escape(f), pats)
+        self.assertTrue(B.syncthing_allows(allpats, "engines/w/team/agents.json"))
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("not in the vault", r.stdout)
+        self.assertIn(f"{len(self.SECRETS)} secret(s) in the vault", r.stdout)
+        page = (self.base / B.VAULT_PAGE).read_text()
+        self.assertIn("~/.base-secret", page)
+        self.assertIn("`engines/w/.credentials.json`", page)
+        self.assertNotIn("SECRET-VALUE", page)
+        self.assertTrue(page.startswith("---\ntitle: Secrets in the vault\n"))
+        self.assertTrue(self.ignored(B.VAULT_REG))
+        again = tree(self.base)
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))           # again: nothing changes
+        self.assertEqual(tree(self.base), again)
+        r = self.ok_env("engine", "vault", "w", "--undo", "--dry-run", "--base", str(self.base))
+        self.assertIn("would bring back: engines/w/.credentials.json", r.stdout)
+        self.assertTrue((self.base / self.SECRETS[0]).is_symlink())
+        self.ok_env("engine", "vault", "w", "--undo", "--base", str(self.base))
+        for f in self.SECRETS:
+            p = self.base / f
+            self.assertFalse(p.is_symlink(), f)
+            self.assertEqual(p.read_text(), f"SECRET-VALUE {f}\n")
+            self.assertEqual(stat_mode(p), 0o600)
+        self.assertEqual(list(self.vault.iterdir()), [])
+        self.assertNotIn(B.VAULTED, B.engine_shares(self.base))
+        self.assertNotIn("/engines/w/.credentials.json\n", (self.base / ".stignore").read_text())
+        self.assertIn("No secret is in the vault.", (self.base / B.VAULT_PAGE).read_text())
+
+    def git_status(self):
+        return subprocess.run(["git", "-C", str(self.base), "status", "--porcelain", "--ignored=no", "-uall"],
+                              capture_output=True, text=True).stdout
+
+    def test_vault_add_doctor_errors_and_vault_root(self):
+        tok = self.write(self.base, "data/app/x.token", "SECRET-VALUE t\n")
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("ERROR", r.stdout)
+        self.assertIn("not in the vault: data/app/x.token -> brain.py vault add data/app/x.token", r.stdout)
+        self.assertIn("not in the vault: engines/w/.credentials.json -> brain.py engine vault w", r.stdout)
+        self.assertNotIn("engines/w/sessions", r.stdout)
+        out = self.tmp / "mine-secret"
+        self.assertNotEqual(self.hb("vault", "root", str(self.base / "x"), "--base", str(self.base)).returncode, 0)
+        self.ok_env("vault", "root", str(out), "--base", str(self.base))
+        self.assertEqual(json.loads((self.base / "engines.json").read_text())["vault"], str(out))
+        r = self.ok_env("vault", "add", "data/app/x.token", "--dry-run", "--base", str(self.base))
+        self.assertIn("would vault: data/app/x.token", r.stdout)
+        self.assertFalse(tok.is_symlink())
+        self.ok_env("vault", "add", "data/app/x.token", "--base", str(self.base))
+        self.assertEqual(os.readlink(tok), str(out / "app" / "x.token"))
+        self.assertEqual(stat_mode(out), 0o700)
+        self.assertTrue(self.ignored("data/app/x.token"))
+        self.assertNotEqual(self.hb("vault", "root", str(self.tmp / "other"), "--base", str(self.base)).returncode,
+                            0)                                                   # not while secrets are in it
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("not in the vault", r.stdout)
+        self.assertIn("secret(s) in the vault", r.stdout)
+        self.ok_env("vault", "list", "--base", str(self.base))
+        cred = self.base / "engines/w/.credentials.json"                         # the tool wrote a new file
+        os.unlink(cred); cred.write_text("NEW\n")
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertIn("engines/w/.credentials.json (the tool replaced its link: vault it again)", r.stdout)
+        self.write(self.base, "wiki/n.md", "x\n")
+        subprocess.run(["git", "-C", str(self.base), "add", "-f", "wiki/n.md"], check=True)
+        r = self.hb("vault", "add", "wiki/n.md", "--base", str(self.base))
+        self.assertIn("tracked in git", r.stdout + r.stderr)
+        for bad in (str(self.tmp / "outside.token"), "raw/a.token"):
+            self.write(self.base, "raw/a.token", "x\n")
+            (self.tmp / "outside.token").write_text("x\n")
+            self.assertNotEqual(self.hb("vault", "add", bad, "--base", str(self.base)).returncode, 0, bad)
+
+    def test_doctor_names_folders_outside_on_purpose(self):
+        (self.home / B.BACKUPS_DIR).mkdir()
+        self.write(self.home, ".local/share/kit/installed.json", "{}\n")
+        self.write(self.home, ".local/share/other/x.txt", "x\n")
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertIn(f"allowed outside: ~/{B.BACKUPS_DIR}: backups of the base", r.stdout)
+        self.assertIn("allowed outside: ~/.local/share/kit: a kit installer's record", r.stdout)
+        self.assertNotIn("~/.local/share/other", r.stdout)
+
+
+def stat_mode(p):
+    return os.stat(p).st_mode & 0o777

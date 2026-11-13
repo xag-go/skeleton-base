@@ -474,6 +474,12 @@ engines.json  projects.json                 what is where (tracked)
 - **Share one more sub-folder** of a tool folder (say a worker's built team in `engines/claude-worker/team`):
   `brain.py engine share claude-worker team` (`--remove` undoes it). The secret rules still win inside it; names
   like `auth`, `token`, `sessions` or `.git` are refused.
+- **Secrets out of the base**: `brain.py engine vault claude-worker` moves the logins of a tool folder (credentials,
+  `.claude.json`, `auth.json`, `.env`, tokens, keys; not sessions or caches) to one vault folder outside the base
+  (`~/.<base folder name>-secret`, mode 700, one sub-folder per tool; `brain.py vault root PATH` picks another) and
+  leaves a symlink, so the tool keeps working. Close the tool first; `--dry-run` shows the list, `--undo` brings them
+  back. `brain.py vault add data/<app>/x.token` does the same for any other secret file. `doctor` reports a secret
+  file still in `engines/` or `data/` as an ERROR and keeps `wiki/secrets.md` (where each one is, never contents).
 - **Tools without such a setting** (Gemini CLI, Qwen, Kilo, Goose, Cursor, desktop apps, ...): `engine mirror TOOL`
   keeps a read-only copy of their rules, agents, skills, memories and hooks in `engines/<tool>/` (a `MIRROR` file
   says so; keys, logins and sessions are never copied; text that looks like a key is left out and listed in

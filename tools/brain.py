@@ -81,6 +81,14 @@ Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's g
                                (node_modules, .git, DBs, archives); data/, apps/, backups/ stay off; git unchanged
   engine share NAME SUBDIR [--remove]  share one more safe sub-folder of engines/NAME (engines.json "share"); the
                                secret rules still win inside it; sessions, auth, tokens, .git are refused
+  engine vault NAME [--undo] [--dry-run]
+                               move the secret files of engines/NAME (credentials, .claude.json, auth.json, .env,
+                               tokens, keys, oauth; not sessions or caches) to the vault <vault>/NAME/<same path>
+                               (engines.json "vault", default ~/.<base name>-secret, mode 700) and leave a symlink;
+                               modes kept; close the tool first; --undo moves them back
+  vault add PATH [--undo] [--dry-run] | vault root [PATH] | vault list
+                               the same for any secret file in the base (e.g. data/<app>/x.token); root shows or
+                               sets the vault folder (only while the vault is empty)
   engine adopt TOOL [--force]  move a tool's config dir into engines/<tool>/ and point the tool's own setting
                                there (marked blocks in ~/.config/environment.d, ~/.profile, ~/.bashrc);
                                refuses while a program uses the dir; engines.json records it
@@ -98,7 +106,9 @@ Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's g
   doctor [--strict]            every AI tool dir and code repo: where it lives, set by which setting, split brain
                                (old dir back while the setting points elsewhere), dirs configured but not wired,
                                what is outside the base (allowed list + .brain/outside.json), tracked secrets and
-                               gitlinks; exit 2 on errors (--strict: also on anything outside)
+                               gitlinks; secret files under engines/ and data/ not in the vault (ERROR), the
+                               vaulted count and wiki/secrets.md (where each one is, never contents); the folders
+                               outside on purpose with their reason; exit 2 on errors (--strict: also outside)
 
 The generic door for ANY agent (MCP client), and for apps that cannot read your files (Claude app, ChatGPT, Zed)
   mcp [--base DIR] [--read-only] [--max-note-kb 64]
@@ -136,7 +146,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.6.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -2360,8 +2370,8 @@ class PageIndex:
         self.root, self.pages = root, {}
         for p in wiki_pages(root):
             r = rel(p, root)
-            if (p.parent == root / "wiki" and p.name in SPECIAL) or r == UNSORTED:
-                continue
+            if (p.parent == root / "wiki" and p.name in SPECIAL) or r in (UNSORTED, VAULT_PAGE):
+                continue                                  # generated pages: never a filing target
             t = p.read_text(encoding="utf-8", errors="replace")
             fm = frontmatter(t) or {}
             body = body_of(t)
@@ -2921,7 +2931,7 @@ def pending_jobs(base):
             conf_by.setdefault(m.group(2), []).append((m.group(1), line))
     for p in wiki_pages(base):
         r = rel(p, base)
-        if r == UNSORTED or (p.parent == base / "wiki" and p.name in SPECIAL):
+        if r in (UNSORTED, VAULT_PAGE) or (p.parent == base / "wiki" and p.name in SPECIAL):
             continue
         b = section_bullets(read(p) or "", COLLECTED_H)
         c = conf_by.pop(p.stem, [])
@@ -6993,7 +7003,7 @@ def gitignore_layout(shares=None):
                 if g.endswith("/"):
                     out.append(f"!/engines/{k}/{g}**")
     for k, subs in sorted((shares or {}).items()):          # engines.json "share": extra safe sub-folders
-        if k in (SYNC_ALL, SYNC_DENIED):
+        if k in (SYNC_ALL, SYNC_DENIED, VAULTED):
             continue
         for sub in subs:
             out += [f"!/engines/{k}/{par}" for par in _parents(sub + "/x")] + [f"!/engines/{k}/{sub}/",
@@ -7002,6 +7012,9 @@ def gitignore_layout(shares=None):
     out += [f"/engines/**/{g}" for g in ENGINE_DENY_FILES]
     out += [f"/engines/**/{d}/" for d in ENGINE_DENY_DIRS]
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
+    if (shares or {}).get(VAULTED):
+        out.append("# vault links (generated: brain.py vault): the secrets live outside the base")
+        out += ["/" + _st_escape(x) for x in shares[VAULTED]]
     return "\n".join(dict.fromkeys(out))
 
 
@@ -7015,6 +7028,9 @@ def stignore_layout(shares=None):
     the safe files of each tool folder, then everything else of the layout folders is ignored."""
     out = ["// layout (generated: brain.py layout --print): secrets first (first match wins), then the safe files of",
            "// engines/<tool>/, then nothing else of the layout folders leaves this machine"]
+    if (shares or {}).get(VAULTED):
+        out.append("// vault links (generated: brain.py vault): the secrets live outside the base")
+        out += ["/" + _st_escape(x) for x in shares[VAULTED]]
     if (shares or {}).get(SYNC_ALL) and (shares or {}).get(SYNC_DENIED):
         out.append(SYNC_DENY_MARK)
         out += ["/" + _st_escape(x) for x in sorted(shares[SYNC_DENIED])]
@@ -7031,7 +7047,8 @@ def stignore_layout(shares=None):
         out += [f"/{d}" for d in SYNC_ALL_CLOSED]
         return "\n".join(dict.fromkeys(out))
     for k, subs in sorted((shares or {}).items()):          # after the secret denies, before the deny-all /engines
-        out += [f"!/engines/{k}/{sub}" for sub in subs]
+        if k not in (SYNC_ALL, SYNC_DENIED, VAULTED):
+            out += [f"!/engines/{k}/{sub}" for sub in subs]
     out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]
     return "\n".join(dict.fromkeys(out))
 
@@ -7081,6 +7098,12 @@ def engine_shares(base):
                 pass
         if subs:
             out[name] = sorted(set(subs))
+    try:
+        vl = sorted(vault_entries(base))
+    except SystemExit:
+        vl = []
+    if vl:
+        out[VAULTED] = vl
     return out
 
 
@@ -7323,6 +7346,307 @@ def engine_share(base, name, sub, remove=False):
             + (f"; updated {', '.join(ch)}" if ch else "")]
 
 
+# -- the vault: secret files live OUTSIDE the base in one folder (mode 700, one sub-folder per tool); the base keeps
+# a symlink (absolute target) at the old path, so the tool finds its login where it always did
+VAULT_REG = ".brain/backups/vault.json"     # local only (ignored by git and Syncthing): {"entries": {rel: {...}}}
+VAULT_PAGE = "wiki/secrets.md"              # generated by vault / doctor: where each secret is, never its contents
+VAULT_MARK = "<!-- generated by brain.py vault / doctor: never edit by hand; contents are never shown -->"
+VAULTED = "*vaulted*"                       # key in engine_shares(): exact paths of the vault links
+VAULT_FILES = SYNC_ALL_DENY_FILES          # the product's secret file names (any depth; no DBs, logs or sessions)
+VAULT_TOP = ENGINE_DENY_TOP                 # loose secret names, only at the top of a tool folder
+VAULT_SECRET_DIRS = ("vault", "pairing", "mcp-tokens")   # deny folders that hold logins: every file in them
+VAULT_NOT = ("*.example", "*.sample", "*.template", "*.dist", "*.pub", "*.lock", "*.tmp", "*.md", "*.vault-tmp",
+             "*.vault-link", "*.vault-back")   # templates, public keys, notes, our own temp names
+VAULT_SKIP_DIRS = tuple(x for x in ENGINE_DENY_DIRS if x not in VAULT_SECRET_DIRS)   # sessions, caches, code
+VAULT_SCAN = ("engines", "data")            # doctor: a real secret file here is an ERROR (it belongs in the vault)
+
+
+def vault_secret_name(name, top=False, in_secret_dir=False):
+    if any(fnmatch.fnmatchcase(name, g) for g in VAULT_NOT):
+        return False
+    return in_secret_dir or any(fnmatch.fnmatchcase(name, g) for g in VAULT_FILES + (VAULT_TOP if top else ()))
+
+
+def vault_root(base):
+    """The vault folder: engines.json "vault" (a path; ~ allowed), else ~/.<base folder name>-secret."""
+    base = pathlib.Path(base).resolve()
+    v = reg_load(base, ENGINES_REG).get("vault")
+    p = pathlib.Path(os.path.expanduser(v)) if isinstance(v, str) and v.strip() else \
+        home_dir() / f".{base.name}-secret"
+    p = pathlib.Path(os.path.abspath(str(p)))
+    if in_dir(p, base) or in_dir(base, p):
+        raise SystemExit(f"vault: {p} is inside the base (or holds it): the vault must live outside the base")
+    return p
+
+
+def vault_set_root(base, path=None):
+    """Show the vault folder, or set it (engines.json "vault") while nothing is in the vault yet."""
+    base = pathlib.Path(base).resolve()
+    if path is None:
+        return [f"vault: {vault_root(base)}"]
+    if vault_entries(base):
+        raise SystemExit("vault root: secrets are in the vault already: `--undo` them first, then change the root")
+    p = os.path.abspath(os.path.expanduser(path))
+    if in_dir(pathlib.Path(p), base) or in_dir(base, pathlib.Path(p)):
+        raise SystemExit(f"vault root: {p} is inside the base (or holds it): the vault must live outside the base")
+    reg = reg_load(base, ENGINES_REG)
+    home = str(home_dir())
+    reg["vault"] = "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+    reg_save(base, ENGINES_REG, reg)
+    return [f"vault: {p} (engines.json \"vault\"; created mode 700 on the first vault)"]
+
+
+def vault_make(root):
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+
+
+def vault_secrets(d):
+    """Sorted real (non-symlink) secret files below the tool folder D (the product's deny names; loose names like
+    `api_token.txt` only at D's top; every file of a login folder such as mcp-tokens/); sessions, caches and code
+    folders skipped."""
+    d, out = pathlib.Path(d), []
+    for dp, dns, fns in os.walk(d):
+        dns[:] = sorted(x for x in dns if x not in VAULT_SKIP_DIRS and not os.path.islink(os.path.join(dp, x)))
+        rel_parts = pathlib.Path(dp).relative_to(d).parts
+        sec = any(x in VAULT_SECRET_DIRS for x in rel_parts)
+        for f in fns:
+            fp = pathlib.Path(dp) / f
+            if vault_secret_name(f, not rel_parts, sec) and not fp.is_symlink() and fp.is_file():
+                out.append(fp)
+    return sorted(out)
+
+
+def _file_sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _vault_one(src, dst):
+    """Copy SRC (a real file in the base) to DST in the vault (mode kept), then swap SRC for a symlink to DST in
+    one rename: the path never goes missing."""
+    mode = stat.S_IMODE(os.lstat(src).st_mode)
+    for p in reversed([x for x in dst.parents if not x.exists()]):
+        p.mkdir(); os.chmod(p, 0o700)
+    for _ in range(3):
+        before = _file_sha(src)
+        tmp = dst.with_name(f".{dst.name}.vault-tmp")
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+        link = src.with_name(f".{src.name}.vault-link")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(str(dst), link)
+        if _file_sha(src) != before:                  # the tool wrote it meanwhile: copy again
+            os.unlink(link); continue
+        os.replace(link, src)
+        return mode
+    raise SystemExit(f"vault: {src} keeps changing (close the tool first)")
+
+
+def _unvault_one(src, dst):
+    """The reverse: the vault file comes back over the symlink in one rename, then leaves the vault."""
+    mode = stat.S_IMODE(os.stat(dst).st_mode)
+    tmp = src.with_name(f".{src.name}.vault-back")
+    shutil.copy2(dst, tmp)
+    os.chmod(tmp, mode)
+    os.replace(tmp, src)
+    os.unlink(dst)
+
+
+def _vault_prune(root, d):
+    while d != root and in_dir(d, root):
+        try:
+            d.rmdir()
+        except OSError:
+            return
+        d = d.parent
+
+
+def vault_entries(base):
+    e = reg_load(base, VAULT_REG).get("entries", {})
+    return {k: v for k, v in e.items() if isinstance(k, str) and isinstance(v, dict)} if isinstance(e, dict) else {}
+
+
+def _vault_save(base, entries):
+    reg = reg_load(base, VAULT_REG)
+    reg["entries"] = {k: entries[k] for k in sorted(entries)}
+    reg_save(base, VAULT_REG, reg)
+    try:
+        os.chmod(pathlib.Path(base) / VAULT_REG, 0o600)
+    except OSError:
+        pass
+
+
+VAULT_WARN = "close {what} first: a running tool may hold these files open or rewrite them (this is not checked)"
+
+
+def vault_files(base, files, tool, root, undo=False, dry=False, what="the tool"):
+    """Move FILES (absolute paths in the base) to ROOT/TOOL/<path below the tool folder> and leave symlinks; UNDO
+    moves them back. Returns log lines."""
+    base = pathlib.Path(base).resolve()
+    entries, log, n = vault_entries(base), [], 0
+    for src, sub in files:
+        rel = src.relative_to(base).as_posix()
+        dst = root / tool / sub
+        if undo:
+            e = entries.get(rel)
+            if not e:
+                continue
+            dst = pathlib.Path(e["vault"])
+            if src.is_symlink() and os.readlink(src) == str(dst) and dst.is_file():
+                log.append(f"{'would bring back' if dry else 'back'}: {rel} <- {dst}")
+                if not dry:
+                    _unvault_one(src, dst); _vault_prune(root, dst.parent); entries.pop(rel); n += 1
+            elif src.is_file() and not src.is_symlink():
+                log.append(f"kept {rel}: the tool wrote a new file there; the older vault copy stays at {dst} "
+                           "(delete it by hand)")
+                if not dry:
+                    entries.pop(rel); n += 1
+            else:
+                log.append(f"skipped {rel}: link or vault file missing (vault file: {dst})")
+            continue
+        if src.is_symlink():
+            continue                                  # already a link (vaulted or something else): untouched
+        e = entries.get(rel)
+        if os.path.lexists(dst) and not (e and e.get("vault") == str(dst)):
+            log.append(f"refused {rel}: {dst} already exists in the vault (not from this base); move it away first")
+            continue
+        log.append(f"{'would vault' if dry else 'vaulted'}: {rel} -> {dst}" + (" (again: the tool had replaced the "
+                                                                               "link)" if e else ""))
+        if not dry:
+            vault_make(root)
+            (root / tool).mkdir(exist_ok=True); os.chmod(root / tool, 0o700)
+            mode = _vault_one(src, dst)
+            entries[rel] = {"vault": str(dst), "tool": tool, "mode": oct(mode), "since": (e or {}).get("since") or today()}
+            n += 1
+    if not dry and n:
+        _vault_save(base, entries)
+        ch = refresh_ignore_blocks(base)
+        if ch:
+            log.append(f"updated {', '.join(ch)} (exact deny lines for the links)")
+        vault_page(base)
+    if log:
+        log.append("warning: " + VAULT_WARN.format(what=what))
+    return log
+
+
+def engine_vault(base, name, undo=False, dry=False):
+    base = pathlib.Path(base).resolve()
+    d = base / "engines" / name
+    if not name or "/" in name or name in (".", "..") or not d.is_dir() or d.is_symlink():
+        raise SystemExit(f"engine vault: engines/{name} is not a folder in the base")
+    e = reg_load(base, ENGINES_REG).get("engines", {}).get(name, {})
+    if isinstance(e, dict) and e.get("mode") == "mirror":
+        raise SystemExit(f"engine vault: engines/{name} is a mirror (a copy without secrets): nothing to vault")
+    root = vault_root(base)
+    if undo:
+        files = [(base / rel, "") for rel, v in sorted(vault_entries(base).items())
+                 if rel.startswith(f"engines/{name}/") and v.get("tool") == name]
+    else:
+        files = [(p, p.relative_to(d).as_posix()) for p in vault_secrets(d)]
+    log = vault_files(base, files, name, root, undo, dry, f"{name} (every program using engines/{name})")
+    return log or [f"engines/{name}: nothing to {'bring back' if undo else 'vault'}"]
+
+
+def vault_add(base, path, undo=False, dry=False):
+    """Any secret file inside the base (e.g. data/<app>/x.token): the same symlink approach. Its vault sub-folder
+    is the first folder below data/, apps/, engines/ (the tool), else the top folder."""
+    base = pathlib.Path(base).resolve()
+    p = pathlib.Path(os.path.expanduser(path))
+    p = pathlib.Path(os.path.abspath(str(p if p.is_absolute() else base / p)))
+    if not in_dir(p.parent, base) or p == base:
+        raise SystemExit(f"vault add: {path} is not inside the base {base}")
+    p = pathlib.Path(os.path.realpath(p.parent)) / p.name
+    rel = p.relative_to(base).as_posix()
+    parts = rel.split("/")
+    if parts[0] in ("raw", ".git", ".brain") or ".git" in parts[:-1]:
+        raise SystemExit(f"vault add: {rel}: raw/, .git and .brain are never touched")
+    if not undo and (p.is_symlink() or not p.is_file()):
+        raise SystemExit(f"vault add: {rel} is not a regular file" + (" (already a link)" if p.is_symlink() else ""))
+    if not undo and (base / ".git").exists() and shutil.which("git") and subprocess.run(
+            ["git", "-C", str(base), "ls-files", "--error-unmatch", "--", rel], capture_output=True).returncode == 0:
+        raise SystemExit(f"vault add: {rel} is tracked in git: `git rm --cached {rel}` first (and rotate the secret)")
+    if parts[0] in ("data", "apps", "engines") and len(parts) > 2:
+        tool, sub = parts[1], "/".join(parts[2:])
+    else:
+        tool, sub = parts[0] if len(parts) > 1 else "base", "/".join(parts[1:]) or parts[0]
+    log = vault_files(base, [(p, sub)], tool, vault_root(base), undo, dry, f"the program that uses {rel}")
+    return log or [f"{rel}: {'not in the vault' if undo else 'nothing to do'}"]
+
+
+def vault_rows(base):
+    """[(level, text)] for doctor: real secret files under engines/ and data/, broken links, the count."""
+    base, rows = pathlib.Path(base).resolve(), []
+    entries = vault_entries(base)
+    for top in VAULT_SCAN:
+        d = base / top
+        found = []
+        for c in sorted(d.iterdir()) if d.is_dir() and not d.is_symlink() else []:
+            if c.is_symlink():
+                continue
+            if c.is_dir() and c.name not in VAULT_SKIP_DIRS:
+                found += vault_secrets(c)
+            elif c.is_file() and vault_secret_name(c.name):
+                found.append(c)
+        for p in found:
+            rel = p.relative_to(base).as_posix()
+            parts = rel.split("/")
+            reg = reg_load(base, ENGINES_REG).get("engines", {}).get(parts[1], {}) if top == "engines" else {}
+            if isinstance(reg, dict) and reg.get("mode") == "mirror":
+                continue                              # a mirror copies no secrets; not ours to vault
+            fix = f"brain.py engine vault {parts[1]}" if top == "engines" and len(parts) > 2 else \
+                f"brain.py vault add {rel}"
+            again = " (the tool replaced its link: vault it again)" if rel in entries else ""
+            rows.append(("ERROR", f"secret file in the base, not in the vault: {rel}{again} -> {fix}"))
+    ok = 0
+    for rel, e in sorted(entries.items()):
+        p, v = base / rel, e.get("vault", "")
+        if p.is_symlink() and os.readlink(p) == v and os.path.isfile(v):
+            ok += 1
+        elif p.is_symlink() or not p.exists():
+            rows.append(("WARN", f"vault link broken: {rel} -> {v} (the vault file or the link is missing)"))
+    if entries:
+        try:
+            root = vault_root(base)
+            if root.is_dir() and stat.S_IMODE(os.stat(root).st_mode) & 0o077:
+                rows.append(("WARN", f"vault {root} is readable by others: chmod 700 {root}"))
+        except SystemExit as e:
+            rows.append(("ERROR", str(e)))
+        rows.append(("INFO", f"{ok} secret(s) in the vault (links in the base; list: {VAULT_PAGE})"))
+    return rows
+
+
+def vault_page(base):
+    """Write wiki/secrets.md (tool, path in the base, path in the vault) when it changed. Never contents."""
+    base, home = pathlib.Path(base).resolve(), home_dir()
+    entries, p = vault_entries(base), pathlib.Path(base) / VAULT_PAGE
+    if not entries and not p.exists():
+        return False
+    try:
+        root = home_rel(vault_root(base), home)
+    except SystemExit:
+        root = "?"
+    rows = "\n".join(f"| {e.get('tool', '?')} | `{rel}` | `{home_rel(pathlib.Path(e.get('vault', '')), home)}` |"
+                     for rel, e in sorted(entries.items()))
+    body = (f"# Secrets in the vault\n\n{VAULT_MARK}\n\n"
+            f"The secret files of the tools live outside the base in one vault: `{root}` (mode 700, one sub-folder "
+            "per tool, never in git or Syncthing). The base keeps a link at the old path, so each tool finds its "
+            "login where it always did. Move one in: `brain.py engine vault NAME` or `brain.py vault add PATH`; "
+            "back: the same with `--undo`.\n\n"
+            + ("| tool | path in the base | path in the vault |\n|---|---|---|\n" + rows + "\n" if rows else
+               "No secret is in the vault.\n"))
+    cur = read(p) or ""
+    if cur.split("\n---\n", 1)[-1].strip() == body.strip():
+        return False
+    write(p, f"---\ntitle: Secrets in the vault\nsources: [brain.py vault]\nupdated: {today()}\nscope: private\n---\n\n{body}")
+    return True
+
+
 MIRROR_MAX = 5 * 1024 * 1024
 SOURCES_D = ".config/my-setup/sources.d"          # older mirror registrations: {"name", "sources": [{src, dest}]}
 SECRET_TEXT = re.compile(
@@ -7333,6 +7657,12 @@ ALLOWED_OUTSIDE = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Vi
                    ".cache", ".local", ".config", ".ssh", ".gnupg", ".nvm", ".cargo", ".rustup", ".npm", ".pki",
                    ".mozilla", ".pyenv", ".dotnet", ".vscode-server", "go", ".git", ".agents", ".agent",
                    BACKUPS_DIR)
+ALLOWED_WHY = {         # outside the base ON PURPOSE (doctor says why when they exist)
+    BACKUPS_DIR: "backups of the base: they must survive a broken or deleted base (archive_base refuses a folder "
+                 "inside the base)",
+}
+KIT_RECORD_WHY = ("a kit installer's record (installed.json, originals of replaced files): update and uninstall need "
+                  "it even when the base is broken or gone")
 GIT_PROBES = (("engines/x/.credentials.json", True), ("engines/x/.claude.json", True), ("engines/x/auth.json", True),
               ("engines/x/.env", True), ("engines/x/sessions/a.jsonl", True), ("engines/x/projects/k/a.jsonl", True),
               ("engines/x/state.db", True), ("engines/x/cache/a.md", True), ("engines/x/api_token.txt", True),
@@ -8197,6 +8527,16 @@ def doctor(base, strict=False):
                 rows.append(("OUTSIDE", f"code {kind} {home_rel(d, home)} -> brain.py projects move "
                                         f"{home_rel(d, home)}"))
     rows += doctor_git(base)
+    rows += vault_rows(base)
+    if vault_page(base):
+        rows.append(("INFO", f"wrote {VAULT_PAGE} (where each vaulted secret is; never contents)"))
+    for k, w in ALLOWED_WHY.items():
+        if (home / k).is_dir() and not in_dir(home / k, base):
+            rows.append(("INFO", f"allowed outside: ~/{k}: {w}"))
+    xdg = home / ".local/share"
+    for k in sorted(xdg.iterdir()) if xdg.is_dir() else []:
+        if (k / "installed.json").is_file() and not in_dir(k, base):
+            rows.append(("INFO", f"allowed outside: {home_rel(k, home)}: {KIT_RECORD_WHY}"))
     why = sync_scan_due(base)
     if why:
         rows.append(("WARN", f"sync all is on but the content scan is behind ({why}): brain.py engine sync-scan"))
@@ -8360,7 +8700,7 @@ def main(argv):
         return 0
     if cmd == "guard":
         return guard_main(root_of())
-    if cmd in ("engine", "projects", "doctor"):
+    if cmd in ("engine", "projects", "doctor", "vault"):
         base, i, rest, flags = SRC, 0, [], set()
         while i < len(args):
             if args[i] in ("--base", "--slug", "--name", "--keep") and i + 1 < len(args):
@@ -8378,10 +8718,27 @@ def main(argv):
         if cmd == "doctor":
             return doctor(base, "--strict" in flags)
         sub = rest[0] if rest else "list"
+        undo, dry = "--undo" in flags, "--dry-run" in flags
+        if cmd == "vault":
+            if sub == "add" and len(rest) == 2:
+                log = vault_add(base, rest[1], undo, dry)
+            elif sub == "root" and len(rest) in (1, 2):
+                log = vault_set_root(base, rest[1] if len(rest) == 2 else None)
+            elif sub == "list" and len(rest) == 1:
+                ent = vault_entries(base)
+                log = [f"vault: {vault_root(base)}"] + [f"{e.get('tool')}: {r} -> {e.get('vault')}"
+                                                         for r, e in sorted(ent.items())]
+            else:
+                print("usage: vault add PATH [--undo] [--dry-run] | vault root [PATH] | vault list"); return 1
+            print("\n".join(log)); return 0
         if cmd == "engine":
             if sub in ("adopt", "release", "mirror", "unmirror") and len(rest) != 2:
                 print(f"usage: engine {sub} TOOL"); return 1
-            if sub == "adopt":
+            if sub == "vault":
+                if len(rest) != 2:
+                    print("usage: engine vault NAME [--undo] [--dry-run]"); return 1
+                log = engine_vault(base, rest[1], undo, dry)
+            elif sub == "adopt":
                 log = engine_adopt(base, rest[1], force)
             elif sub == "release":
                 log = engine_release(base, rest[1], force)
@@ -8406,7 +8763,7 @@ def main(argv):
             elif sub == "list":
                 log = engine_list(base)
             else:
-                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine sync | engine list"); return 1
+                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine vault NAME [--undo] [--dry-run] | engine sync | engine list"); return 1
         else:
             if sub == "move" and "--undo" in flags:
                 log = projects_undo(base, rest[1] if len(rest) > 1 else None, force)

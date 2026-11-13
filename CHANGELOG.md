@@ -2,6 +2,22 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.2 - 2026-11-13
+- **`engine vault NAME [--undo] [--dry-run]`**: the secret files of `engines/NAME` (the same secret names the
+  `.gitignore`/`.stignore` blocks deny; not sessions, caches or logs) move to ONE vault folder outside the base,
+  `<vault>/NAME/<same path>`, and an absolute symlink stays at the old path, so the tool finds its login where it
+  always did. Modes are kept; the vault and each tool folder in it are mode 700. Vault root: `engines.json`
+  `"vault"` (`brain.py vault root PATH`, only while the vault is empty), default `~/.<base folder name>-secret`.
+  Close the tool first. `--undo` brings the files back. The exact link paths are added to the `.gitignore` and
+  `.stignore` blocks (also in sync all mode); the registry lives in `.brain/backups/` (local only).
+- **`vault add PATH [--undo] [--dry-run]`** does the same for any other secret file in the base (e.g.
+  `data/<app>/x.token`); tracked files, `raw/`, `.git` and `.brain` are refused. `vault list` shows them.
+- `doctor`: ERROR for a real (not linked) secret file under `engines/` or `data/` (with the command that fixes it,
+  and a note when a tool replaced its link with a new file); INFO with the vaulted count; it writes the generated
+  page `wiki/secrets.md` (tool, path in the base, path in the vault; never contents). It also names the folders
+  outside the base on purpose, with the reason: the backups folder and kit installer records
+  (`~/.local/share/<kit>` with `installed.json`).
+
 ## v1.6.1 - 2026-11-12
 - `engine sync-all on|off`: Syncthing shares the whole base (code, engines, logs, ops) except secrets, tool config files (settings.json, config.toml/yaml) and heavy files (node_modules, .git, venvs, DBs, archives); data/, apps/, backups/ stay on this machine; git rules unchanged.
 - **`engine share NAME SUBDIR [--remove]`**: share one more safe sub-folder of a tool folder (e.g. a team's built
