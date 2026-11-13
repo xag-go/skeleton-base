@@ -2,6 +2,21 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.5 - 2026-11-13
+- **sync all: Syncthing scans only after our scan**. A new file holding a secret could reach the other computer before
+  the next content scan, because Syncthing watched the folder itself (the base has more directories than inotify
+  allows, so brain.py cannot watch it either). Now `engine sync-all on` (and `doctor`) sets the base's Syncthing
+  folder to `fsWatcherEnabled=false`, `rescanIntervalS=0` through the REST API (old values recorded in
+  `.brain/syncthing.json`, restored by `sync-all off` and `uninstall`), and every sync-scan (the watcher's and
+  `engine sync-scan`) ends with `POST /rest/db/scan?folder=ID`. Order: our scan -> `.stignore` -> Syncthing scans.
+  The API key is read from Syncthing's config.xml at run time and is never printed, logged or stored.
+- A user systemd drop-in `~/.config/systemd/user/syncthing.service.d/skeleton-base-scan.conf` runs
+  `engine sync-scan` as `ExecStartPre` (TimeoutStartSec=600), so Syncthing's own start-up scan comes after ours.
+  Removed by `sync-all off` and `uninstall`. Not a systemd user service: skipped, doctor says so.
+- Syncthing not found or not reachable: unchanged behaviour, doctor warns that new files can sync before the scan.
+- Doctor checks the folder settings, the drop-in and that the last scan request is not older than the last sync-scan.
+- Cost: the other computer sees changes up to one watch cycle (10 min) later. Tests `SyncthingOnDemandTests`.
+
 ## v1.6.4 - 2026-11-13
 - **sync all: one rule for "not scanned yet"**. `engine sync-scan` and `doctor` now both use `sync_pending` (new or
   changed shareable files since the last scan, same mtime and size). Found on a real base: doctor warned "749 behind"

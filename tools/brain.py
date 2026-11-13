@@ -143,6 +143,7 @@ import math
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -150,9 +151,10 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.5"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -612,6 +614,10 @@ class Installer:
         if not me:
             return ["base-folder is not installed here (nothing changed)"]
         frugal = "frugal-bridge" in kits
+        try:
+            self.log += st_release(self.d)
+        except (SystemExit, Exception) as e:
+            self.log.append(f"syncthing: settings not restored ({e})")
         created = me.get("created", {})
         modes = me.get("placement", {})
         kept = []
@@ -7248,7 +7254,7 @@ def sync_pending(base, cur=None, seen=None):
     return cur, sorted(r for r, (mt, sz) in cur.items() if sz <= SYNC_SCAN_MAX and seen.get(r) != [mt, sz])
 
 
-def sync_scan(base, force=False, now=None):
+def sync_scan(base, force=False, now=None, notify=True):
     """Content gate for sync all: gitleaks over the files that sync_pending lists (only new or changed ones since the
     last scan unless FORCE); flagged files (and non-text files above 2 MB) go to .brain/sync-denied.json (paths and
     rule ids only) and into the generated deny lines of .stignore. The generated ignore files this rewrites are
@@ -7320,6 +7326,8 @@ def sync_scan(base, force=False, now=None):
     added = sorted(set(denied) - set(prev0))
     log = [f"sync scan: {shareable} shareable files, {scanned} scanned, {len(denied)} denied"
            + (f" ({len(added)} new)" if added else "") + (f"; updated {', '.join(updated)}" if updated else "")]
+    if notify:
+        log += st_scan(base)                       # always AFTER our scan, so nothing is offered before it
     return log, len(denied)
 
 
@@ -7342,6 +7350,208 @@ def sync_scan_due(base, max_age=86400.0, now=None):
     return f"{n} new or changed shareable file(s) not scanned yet" if n else None
 
 
+# -- Syncthing on demand: the base is too big to watch (more directories than inotify allows), so Syncthing must not
+# scan it by itself. Order is always: our sync-scan (writes .stignore) -> Syncthing scans the folder when we ask it.
+# REST (docs.syncthing.net, v2): GET/PATCH /rest/config/folders/<id> (rest/config), POST /rest/db/scan?folder=<id>
+# (rest/db-scan-post); header X-API-Key. The key is read at runtime only and never printed, logged or stored.
+ST_STATE = ".brain/syncthing.json"       # local: {"folder", "prev": {setting: old value}, "dropin", "scan_requested_at"}
+ST_SETTINGS = {"fsWatcherEnabled": False, "rescanIntervalS": 0}
+ST_DROPIN = "syncthing.service.d/skeleton-base-scan.conf"
+ST_SCAN_TIMEOUT = 1800.0                 # a scan request returns when Syncthing's scan is done
+
+
+def st_find(base, home=None):
+    """{url, key, folder, tls} of the Syncthing folder whose path is BASE (config.xml of the user's Syncthing), or None."""
+    import xml.etree.ElementTree as ET
+    home = pathlib.Path(home or home_dir())
+    dirs = []
+    for var, dflt in (("XDG_STATE_HOME", ".local/state"), ("XDG_CONFIG_HOME", ".config")):
+        dirs.append(pathlib.Path(os.environ.get(var) or home / dflt) / "syncthing")
+    dirs += [home / ".local/state/syncthing", home / ".config/syncthing"]
+    for d in dirs:
+        try:
+            root = ET.parse(d / "config.xml").getroot()
+        except (OSError, ET.ParseError):
+            continue
+        gui = root.find("gui")
+        key = (gui.findtext("apikey") or "").strip() if gui is not None else ""
+        addr = (gui.findtext("address") or "").strip() if gui is not None else ""
+        if not key or not addr:
+            continue
+        for f in root.findall("folder"):
+            p = os.path.expanduser(f.get("path") or "")
+            if p and os.path.realpath(p) == os.path.realpath(str(base)):
+                tls = (gui.get("tls") or "").lower() == "true"
+                return {"url": ("https://" if tls else "http://") + addr, "key": key, "folder": f.get("id"), "tls": tls}
+    return None
+
+
+def st_call(st, method, path, body=None, timeout=15.0):
+    """(status, text) of one REST call; OSError when Syncthing is not reachable. The key goes only in the header."""
+    import urllib.request, urllib.error, ssl
+    req = urllib.request.Request(st["url"] + path, method=method, headers={"X-API-Key": st["key"]},
+                                 data=None if body is None else json.dumps(body).encode())
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    ctx = ssl._create_unverified_context() if st["tls"] else None     # local GUI, self-signed
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")[:200]
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
+        raise OSError(type(e).__name__)             # never the URL or headers
+
+
+def st_folder_cfg(st):
+    code, txt = st_call(st, "GET", "/rest/config/folders/" + urllib.parse.quote(st["folder"], safe=""))
+    if code != 200:
+        raise OSError(f"HTTP {code}")
+    return json.loads(txt)
+
+
+def st_patch(st, values):
+    code, txt = st_call(st, "PATCH", "/rest/config/folders/" + urllib.parse.quote(st["folder"], safe=""), values)
+    if code // 100 != 2:
+        raise OSError(f"HTTP {code}")
+
+
+def st_unit_found(home=None):
+    """True when Syncthing is a systemd user service (a unit file in a user or system unit folder)."""
+    home = pathlib.Path(home or home_dir())
+    for d in (home / ".config/systemd/user", pathlib.Path("/usr/lib/systemd/user"), pathlib.Path("/etc/systemd/user"),
+              pathlib.Path("/lib/systemd/user")):
+        if (d / "syncthing.service").exists():
+            return True
+    return False
+
+
+def st_dropin_path(home=None):
+    return pathlib.Path(home or home_dir()) / ".config/systemd/user" / ST_DROPIN
+
+
+def st_dropin_text(base):
+    me = pathlib.Path(__file__).resolve()
+    return ("# written by brain.py (Skeleton Base): scan the base for secrets BEFORE Syncthing starts and scans it\n"
+            "[Service]\nTimeoutStartSec=600\n"
+            f"ExecStartPre={shlex.quote(sys.executable)} -S {shlex.quote(str(me))} engine sync-scan --base "
+            f"{shlex.quote(str(base))}\n")
+
+
+def st_secure(base, home=None):
+    """Syncthing scans the base only when we ask (watcher off, periodic rescan off); the old values are recorded
+    once, so st_release restores them exactly. Also the start-up drop-in. Returns log lines."""
+    base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
+    st = st_find(base, home)
+    if not st:
+        return ["syncthing: no folder for this base found: new files can sync before the scan"]
+    log = []
+    state = reg_load(base, ST_STATE)
+    try:
+        cur = st_folder_cfg(st)
+        if "prev" not in state or state.get("folder") != st["folder"]:
+            state["prev"] = {k: cur.get(k) for k in ST_SETTINGS}
+            state["folder"] = st["folder"]
+            reg_save(base, ST_STATE, state)                 # recorded before the change
+        if any(cur.get(k) != v for k, v in ST_SETTINGS.items()):
+            st_patch(st, ST_SETTINGS)
+            log.append("syncthing: folder watcher and periodic rescan off (it scans when brain.py asks)")
+    except (OSError, ValueError) as e:
+        return log + [f"syncthing: not reachable ({e}): new files can sync before the scan"]
+    if not st_unit_found(home):
+        log.append("syncthing: not a systemd user service: it scans at its own start before brain.py does")
+        return log
+    dp, want = st_dropin_path(home), st_dropin_text(base)
+    have = read(dp)
+    if have is None or have == want:
+        if have is None:
+            atomic_write(dp, want)
+            log.append(f"syncthing: wrote {dp} (scan first at start); run: systemctl --user daemon-reload")
+        state = reg_load(base, ST_STATE); state["dropin"] = str(dp); reg_save(base, ST_STATE, state)
+    else:
+        log.append(f"syncthing: {dp} exists and is not ours (another base?): left alone")
+    return log
+
+
+def st_release(base, home=None):
+    """Undo st_secure: the recorded settings back, our drop-in removed. Returns log lines."""
+    base = pathlib.Path(base).resolve()
+    state = reg_load(base, ST_STATE)
+    log = []
+    dp = pathlib.Path(state["dropin"]) if state.get("dropin") else None
+    if dp and read(dp) == st_dropin_text(base):
+        dp.unlink()
+        try:
+            dp.parent.rmdir()
+        except OSError:
+            pass
+        log.append(f"syncthing: removed {dp}; run: systemctl --user daemon-reload")
+    prev = state.get("prev")
+    if prev:
+        st = st_find(base, home)
+        try:
+            if not st:
+                raise OSError("not found")
+            st_patch(st, {k: v for k, v in prev.items() if v is not None})
+            log.append("syncthing: folder watcher and rescan interval back to their old values")
+        except (OSError, ValueError) as e:
+            log.append(f"syncthing: could not restore the folder settings ({e}); old values: {json.dumps(prev)}")
+            return log                                      # keep the record: undo can be tried again
+    (base / ST_STATE).unlink(missing_ok=True)
+    return log
+
+
+def st_scan(base, home=None):
+    """Ask Syncthing to scan the base folder now (after our scan, never before). One log line; never raises."""
+    base = pathlib.Path(base).resolve()
+    st = st_find(base, home)
+    if not st:
+        return []
+    t0 = time.time()
+    try:
+        code, _ = st_call(st, "POST", "/rest/db/scan?folder=" + urllib.parse.quote(st["folder"], safe=""),
+                          timeout=ST_SCAN_TIMEOUT)
+    except OSError as e:
+        return [f"syncthing: scan not requested, not reachable ({e})"]
+    if code != 200:
+        return [f"syncthing: scan request failed (HTTP {code})"]
+    state = reg_load(base, ST_STATE)
+    state["scan_requested_at"] = t0
+    reg_save(base, ST_STATE, state)
+    return ["syncthing: scan requested"]
+
+
+def st_doctor(base, home=None):
+    """Doctor rows for sync all: folder settings, start-up drop-in, scan request not older than our scan."""
+    base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
+    if engine_shares(base).get(SYNC_ALL) is None:
+        return []
+    st = st_find(base, home)
+    if not st:
+        return [("WARN", "sync all is on but no Syncthing folder for this base was found: new files can sync "
+                         "before the scan")]
+    rows = []
+    try:
+        if any(st_folder_cfg(st).get(k) != v for k, v in ST_SETTINGS.items()):
+            lg = st_secure(base, home)
+            rows.append(("INFO", "Syncthing folder set to scan only on request (watcher off, rescan 0)"))
+            rows += [("WARN", x) for x in lg if "not reachable" in x]
+    except (OSError, ValueError) as e:
+        rows.append(("WARN", f"sync all is on but Syncthing is not reachable ({e}): new files can sync before "
+                             "the scan"))
+    if not st_unit_found(home):
+        rows.append(("INFO", "Syncthing is not a systemd user service: it scans at its own start before brain.py does"))
+    elif read(st_dropin_path(home)) != st_dropin_text(base):
+        rows.append(("WARN", "Syncthing start-up drop-in missing: it would scan before brain.py at its start "
+                             "-> brain.py engine sync-all on"))
+    state = reg_load(base, ST_STATE)
+    last = float(sync_scan_state(base)[0].get("scanned_at", 0))
+    if last and float(state.get("scan_requested_at", 0)) < last - 1:
+        rows.append(("WARN", "the last Syncthing scan request is older than the last sync-scan "
+                             "-> brain.py engine sync-scan"))
+    return rows
+
+
 def engine_sync_all(base, on):
     """engines.json "sync": "all" on/off: Syncthing shares the whole base except secrets, tool config files and
     heavy files (git rules do not change). Returns log lines."""
@@ -7357,11 +7567,15 @@ def engine_sync_all(base, on):
     done = refresh_ignore_blocks(base)
     log = [f"sync all {'on' if on else 'off'}" + (f": {', '.join(done)} updated" if done else "")]
     if on:
+        log += st_secure(base)                     # Syncthing scans only when asked: before the first scan
         try:
             log += sync_scan(base, force=True)[0]
         except BaseException:                      # no scan, no sharing: turn it off again
             reg.pop("sync", None); reg_save(base, ENGINES_REG, reg); refresh_ignore_blocks(base)
+            st_release(base)
             raise
+    else:
+        log += st_release(base)
     return log
 
 
@@ -8919,6 +9133,7 @@ def doctor(base, strict=False):
     why = sync_scan_due(base)
     if why:
         rows.append(("WARN", f"sync all is on but the content scan is behind ({why}): brain.py engine sync-scan"))
+    rows += st_doctor(base, home)
     for lvl, text in rows:
         print(f"{lvl:8} {text}")
     n = {l: sum(1 for x, _ in rows if x == l) for l in ("ERROR", "WARN", "OUTSIDE")}

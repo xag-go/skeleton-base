@@ -4808,5 +4808,182 @@ class VaultTests(ToolHome):
         self.assertNotIn("~/.local/share/other", r.stdout)
 
 
+class SyncthingOnDemandTests(ToolHome):
+    """Syncthing scans the base only when brain.py asks, and only after its own scan. A fake Syncthing (a local HTTP
+    server) records the requests; the real one is never contacted."""
+    KEY = "TESTKEY-never-print-0123456789"
+
+    def setUp(self):
+        super().setUp()
+        import http.server, threading
+        self.events = self.tmp / "events.log"
+        self.events.write_text("")
+        self.cfg = {"id": "the-mothership-base", "fsWatcherEnabled": True, "fsWatcherDelayS": 10,
+                    "rescanIntervalS": 3600, "type": "sendonly"}
+        self.reqs = []
+        me = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, code, body=""):
+                self.send_response(code); self.end_headers(); self.wfile.write(body.encode())
+
+            def do_GET(self):
+                me.reqs.append(("GET", self.path, self.headers.get("X-API-Key")))
+                self.reply(200, json.dumps(me.cfg)) if self.path.startswith("/rest/config/folders/") else self.reply(404)
+
+            def do_PATCH(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                me.reqs.append(("PATCH", self.path, self.headers.get("X-API-Key")))
+                me.cfg.update(body); self.reply(200)
+
+            def do_POST(self):
+                me.reqs.append(("POST", self.path, self.headers.get("X-API-Key")))
+                with open(me.events, "a") as f:
+                    f.write("scan stignore=" + ((me.base / ".stignore").read_text().count("preview.sh") and "denied"
+                                                or "plain") + "\n")
+                self.reply(200)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.shutdown)
+        self.addCleanup(self.srv.server_close)
+
+    def git(self, d, *a):
+        r = subprocess.run(["git", "-C", str(d), "-c", "user.name=T", "-c", "user.email=t@example.invalid", *a],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def st_config(self, port=None, path=None):
+        d = self.home / ".local/state/syncthing"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.xml").write_text(
+            f'<configuration><folder id="the-mothership-base" path="{path or self.base}"/>'
+            f'<gui tls="false"><address>127.0.0.1:{port or self.srv.server_address[1]}</address>'
+            f'<apikey>{self.KEY}</apikey></gui></configuration>')
+
+    def unit(self):
+        u = self.home / ".config/systemd/user/syncthing.service"
+        u.parent.mkdir(parents=True, exist_ok=True)
+        u.write_text("[Service]\nExecStart=/x/syncthing serve\n")
+
+    def prep(self):
+        self.git(self.base, "init", "-q")
+        self.init(self.base)
+        self.write(self.base, ".stignore", "// mine\n")
+        self.init(self.base)
+        self.write(self.base, "ops/a/preview.sh", "echo hi\n")
+        g = self.bin / "gitleaks"
+        g.write_text(f"#!{sys.executable}\n" + """import json, os, sys
+a = sys.argv
+root = a[a.index("dir") + 1]
+open(os.environ["EVENTS"], "a").write("gitleaks\\n")
+out = [{"File": os.path.join(root, "ops/a/preview.sh"), "RuleID": "fake-key"}] if os.environ.get("FLAG") else []
+open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
+""")
+        g.chmod(0o755)
+
+    def env(self):
+        return {"EVENTS": str(self.events), "XDG_STATE_HOME": str(self.home / ".local/state"),
+                "XDG_CONFIG_HOME": str(self.home / ".config"), "FLAG": "1"}
+
+    def b(self, *args):
+        r = self.hb(*args, "--base", str(self.base), env=self.env())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(self.KEY, r.stdout + r.stderr)
+        return r
+
+    def test_settings_applied_and_undone_exactly(self):
+        self.prep(); self.st_config(); self.unit()
+        before = dict(self.cfg)
+        self.b("engine", "sync-all", "on")
+        self.assertIs(self.cfg["fsWatcherEnabled"], False)
+        self.assertEqual(self.cfg["rescanIntervalS"], 0)
+        self.assertEqual(self.cfg["fsWatcherDelayS"], 10)
+        self.b("engine", "sync-all", "on")                        # again: the old values stay the recorded ones
+        self.b("engine", "sync-all", "off")
+        self.assertEqual(self.cfg, before)
+        self.assertFalse((self.base / ".brain/syncthing.json").exists())
+        self.assertTrue(all(k == self.KEY for _, _, k in self.reqs))
+
+    def test_scan_is_requested_after_the_sync_scan_only(self):
+        self.prep(); self.st_config()
+        self.b("engine", "sync-all", "on")
+        ev = self.events.read_text().splitlines()
+        self.assertEqual(ev[-1], "scan stignore=denied", ev)        # the scan came last, .stignore already updated
+        self.assertEqual(ev.count("scan stignore=denied"), 1, ev)
+        self.assertNotIn("scan stignore=plain", ev)
+        self.assertIn("gitleaks", ev[:-1])
+        self.assertTrue(any(m == "POST" and "/rest/db/scan?folder=the-mothership-base" in p for m, p, _ in self.reqs))
+        # the watcher pass: nothing is due, so no new scan request; a forced sync-scan asks again, after gitleaks
+        n = len(self.reqs)
+        self.b("watch", "--once")
+        self.assertEqual(len(self.reqs), n)
+        self.b("engine", "sync-scan", "--force")
+        ev = self.events.read_text().splitlines()
+        self.assertEqual((ev[-2], ev[-1].split()[0]), ("gitleaks", "scan"), ev)
+        self.assertEqual([m for m, _, _ in self.reqs[n:]], ["POST"])
+
+    def test_dropin_written_and_removed(self):
+        self.prep(); self.st_config(); self.unit()
+        dp = self.home / ".config/systemd/user/syncthing.service.d/skeleton-base-scan.conf"
+        self.b("engine", "sync-all", "on")
+        t = dp.read_text()
+        self.assertIn("ExecStartPre=", t)
+        self.assertIn("engine sync-scan --base", t)
+        self.assertIn("TimeoutStartSec=600", t)
+        self.assertNotIn(self.KEY, t)
+        r = self.b("doctor")
+        self.assertNotIn("drop-in missing", r.stdout)
+        self.b("engine", "sync-all", "off")
+        self.assertFalse(dp.exists())
+        self.assertFalse(dp.parent.exists())
+
+    def test_uninstall_restores_settings_and_removes_dropin(self):
+        self.prep(); self.st_config(); self.unit()
+        before = dict(self.cfg)
+        self.b("engine", "sync-all", "on")
+        r = self.hb("uninstall", str(self.base), "--no-backup", env=self.env())
+        self.assertEqual(self.cfg, before, r.stdout + r.stderr)
+        self.assertFalse((self.home / ".config/systemd/user/syncthing.service.d").exists())
+
+    def test_no_user_unit_means_no_dropin_and_doctor_says_so(self):
+        self.prep(); self.st_config()
+        self.b("engine", "sync-all", "on")
+        self.assertFalse((self.home / ".config/systemd").exists())
+        self.assertIn("not a systemd user service", self.b("doctor").stdout)
+
+    def test_no_syncthing_keeps_old_behaviour_and_doctor_warns(self):
+        self.prep()
+        r = self.b("engine", "sync-all", "on")
+        self.assertIn("\n/ops/a/preview.sh\n", (self.base / ".stignore").read_text())
+        self.assertIn("can sync before the scan", r.stdout)
+        self.assertEqual(self.reqs, [])
+        self.assertIn("can sync before the scan", self.b("doctor").stdout)
+
+    def test_unreachable_syncthing_is_not_fatal_and_doctor_warns(self):
+        self.prep()
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        self.st_config(port=port)
+        r = self.b("engine", "sync-all", "on")
+        self.assertIn("not reachable", r.stdout)
+        self.assertIn("not reachable", self.b("doctor").stdout)
+
+    def test_doctor_sets_the_folder_and_warns_when_the_request_is_old(self):
+        self.prep(); self.st_config(); self.unit()
+        self.b("engine", "sync-all", "on")
+        self.cfg.update(fsWatcherEnabled=True, rescanIntervalS=3600)    # someone turned it back on
+        self.b("doctor")
+        self.assertIs(self.cfg["fsWatcherEnabled"], False)
+        self.assertEqual(self.cfg["rescanIntervalS"], 0)
+        stf = self.base / ".brain/syncthing.json"
+        d = json.loads(stf.read_text()); d["scan_requested_at"] = 1.0; stf.write_text(json.dumps(d))
+        self.assertIn("scan request is older", self.b("doctor").stdout)
+        self.assertEqual(json.loads(stf.read_text())["prev"], {"fsWatcherEnabled": True, "rescanIntervalS": 3600})
+
+
 def stat_mode(p):
     return os.stat(p).st_mode & 0o777

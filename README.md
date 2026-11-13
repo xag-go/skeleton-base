@@ -509,6 +509,18 @@ engines.json  projects.json                 what is where (tracked)
   the top of a tool folder (a skill called `x-token-spend` is still shared). `projects/`, `data/`, `apps/`, `runs/`,
   `scratch/`, `backups/`, `ops/` never leave (README only). Checked with a real Syncthing 2.1 scan: only the safe
   files were indexed.
+- **Sync all and Syncthing: our scan first, then Syncthing**. With `engine sync-all on`, the content scan (gitleaks)
+  writes flagged files into `.stignore`. Syncthing must not offer a new file before that scan, so brain.py finds the
+  Syncthing folder whose path is the base (its `config.xml`; the key is read at run time and never printed or
+  stored), turns the folder watcher and the periodic rescan off (`fsWatcherEnabled=false`, `rescanIntervalS=0`;
+  the old values are recorded and come back with `sync-all off` and `uninstall`), and asks Syncthing to scan the
+  folder (`POST /rest/db/scan?folder=ID`) at the end of every sync-scan. Order: our scan, `.stignore`, Syncthing's
+  scan. A user systemd drop-in (`~/.config/systemd/user/syncthing.service.d/skeleton-base-scan.conf`, then
+  `systemctl --user daemon-reload`) runs the scan before Syncthing starts, so its start-up scan comes after ours.
+  Cost: the other computer sees changes up to one watch cycle (10 min) later. Fallback: no Syncthing folder found,
+  not reachable, or not a systemd user service: nothing breaks, sharing works as before, and `doctor` warns that new
+  files can sync before the scan. A file created while our scan runs can still be offered before the next one
+  (seconds to minutes on a huge base).
 - **Pre-commit guard**: `init` writes `.git/hooks/pre-commit` in a base that is a git repo (your own hook is kept:
   rename it to `pre-commit.local` and it runs first). `brain.py guard` refuses gitlinks, `engines/` files off the
   allow list, anything in the closed folders, secret file names, files over 5 MB and key-like content (gitleaks too
