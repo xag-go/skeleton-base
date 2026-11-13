@@ -18,6 +18,10 @@ import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BRAIN = REPO / "tools" / "brain.py"
+# tests must never read the real tool homes: drop them (a test that needs one sets it itself)
+for _v in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "HERMES_HOME", "FRUGAL_HOME"):
+    os.environ.pop(_v, None)
+
 FRUGAL_SRC = pathlib.Path(os.environ.get("FRUGAL_BRIDGE_SRC") or os.path.expanduser("~/frugal-bridge"))
 HAVE_FRUGAL = (FRUGAL_SRC / "kit" / "setup.py").is_file()
 BASE_SLOTS = {"user": "wiki/me/", "now": "hot.md", "decisions": "wiki/decisions/",
