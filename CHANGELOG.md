@@ -2,6 +2,25 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.7 - 2026-11-13
+- **Mirrors from older releases go too**: a mirror registered without a `tool` field is matched to its tool by its
+  source folder, so a mirror of a tool that is not installed (e.g. `~/.gemini`, `~/.config/opencode`) is removed
+  with its engines.json entry. The cleanup (`mirror_prune`) runs on `connect` as well as on `watch`.
+- **Connect and doctor agree on leftover blocks**: in the rules files of a tool that is not installed, our block is
+  removed by its markers whether connect recorded it or not (an older release or another kit wrote it); archived
+  in `.brain/backups` first, the rest of the file kept, the file deleted only if nothing else is left.
+- **Empty folders of absent tools go**: a tool's own folder is removed when it is empty and the tool is not
+  installed: at once when connect just emptied it, else once it has been empty for 10 minutes (a tool that is
+  being installed may have just made it). An installed tool's folder is never removed.
+- **Doctor**: a tool that is not installed is not listed as OUTSIDE (its leftovers are the "has our block" WARN).
+  The hint for Gemini CLI says why it is not adopted: `GEMINI_CLI_HOME` moves the whole home `.gemini` lives in
+  (XDG tools: the variable moves every program); "no setting moves it" only where there is none.
+- **Skills written by an older connect are ours**: a copy in `~/.agents/skills` is connect's when it matches its
+  record, equals today's text, or carries the text only connect generates for this base (the "Installed by
+  Skeleton Base `connect` for the base at ..." note; base-home's own frontmatter naming this base). Such a copy is
+  updated (archived first) and counts for turning the folder into the link; any other file is still kept.
+  Tests: `LiveGapsTests`.
+
 ## v1.6.6 - 2026-11-13
 - **Installed means proof, not folders**. connect made folders itself, so a folder alone kept a tool "installed" for
   ever (the loop was self-perpetuating). Now a tool is installed when its program is on PATH (with its folder) or one of

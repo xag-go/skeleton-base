@@ -5097,7 +5097,7 @@ class BaseFirstTests(ToolHome):
                 and r != ".config/skeleton-base/AGENTS.md"]          # the base pointer, not a tool's
         self.assertEqual(left, [], "no program on PATH: connect keeps no block of ours")
         self.assertFalse((self.home / ".config/opencode/AGENTS.md").exists())    # created by us: removed
-        self.assertEqual(os.listdir(self.home / ".config/opencode"), [], "the folder is left empty, never filled")
+        self.assertFalse((self.home / ".config/opencode").exists(), "the folder it emptied goes too (1.6.7)")
         backed = [p for p in (self.base / ".brain/backups").rglob("AGENTS.md") if ".config/opencode" in str(p)]
         self.assertTrue(backed, "what connect deletes is archived first")
 
@@ -5140,7 +5140,7 @@ class BaseFirstTests(ToolHome):
         out = self.ok("doctor", "--base", str(self.base)).stdout
         line = next(x for x in out.splitlines() if x.startswith(("OK", "OUTSIDE")) and "Gemini CLI" in x)
         self.assertTrue(line.startswith("OUTSIDE"), line)
-        self.assertIn("no setting moves it", line)
+        self.assertIn("GEMINI_CLI_HOME moves the whole home", line)             # its setting moves more than it
 
     def test_doctor_warns_about_our_block_in_a_tool_that_is_not_installed(self):
         self.bins("opencode")
@@ -5420,3 +5420,126 @@ class SkillsLinkTests(ToolHome):
         self.link.mkdir()
         out = self.hb("doctor", "--base", str(self.base)).stdout
         self.assertRegex(out, r"ERROR.*~/\.agents/skills.*real folder.*brain\.py connect")
+
+
+class LiveGapsTests(ToolHome):
+    """1.6.7: what a live base kept from older releases goes on connect and on watch (fake HOME)."""
+
+    BLOCK = "<!-- base-folder:start v2 -->\nRead the base at /elsewhere/other-base first.\n<!-- base-folder:end -->"
+
+    def reg(self):
+        p = self.base / "engines.json"
+        return json.loads(p.read_text()).get("engines", {}) if p.is_file() else {}
+
+    def old_mirrors(self):
+        """Mirrors as older releases registered them: no "tool" field, only the source."""
+        for name, src in (("gemini", ".gemini"), ("opencode", ".config/opencode")):
+            self.write(self.home, f"{src}/notes.txt", "x\n")                     # not the tool's own file
+            self.write(self.base, f"engines/{name}/MIRROR", f"MIRROR: read-only copy\nsource: ~/{src}\n")
+            self.write(self.base, f"engines/{name}/settings.json", "{}\n")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {
+            "gemini": {"mode": "mirror", "src": "~/.gemini", "since": "2026-11-12"},
+            "opencode": {"mode": "mirror", "src": "~/.config/opencode", "since": "2026-11-12"}}}))
+
+    def test_old_mirrors_of_absent_tools_go_on_connect(self):
+        self.old_mirrors()
+        self.ok("connect")
+        self.assertEqual([n for n, e in self.reg().items() if e.get("mode") == "mirror"], [])
+        self.assertFalse((self.base / "engines/gemini").exists())
+        self.assertFalse((self.base / "engines/opencode").exists())
+        self.assertTrue((self.home / ".gemini/notes.txt").is_file(), "the source is never touched")
+
+    def test_old_mirrors_of_absent_tools_go_on_watch(self):
+        self.old_mirrors()
+        self.ok("watch", "--once", "--no-commit")
+        self.assertEqual(self.reg(), {})
+        self.assertFalse((self.base / "engines/gemini").exists())
+
+    def test_an_old_mirror_of_an_installed_tool_stays(self):
+        self.old_mirrors()
+        self.bins("gemini")
+        self.ok("watch", "--once", "--no-commit")
+        self.assertIn("gemini", self.reg())
+        self.assertTrue((self.base / "engines/gemini/MIRROR").is_file())
+
+    def test_an_unrecorded_block_in_an_absent_tool_goes_and_doctor_agrees(self):
+        g = self.write(self.home, ".gemini/GEMINI.md", "# my notes\n\n" + self.BLOCK + "\n")
+        o = self.write(self.home, ".config/opencode/AGENTS.md", self.BLOCK + "\n")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"WARN\s+Gemini CLI.*has our block")
+        self.ok("connect")
+        self.assertEqual(g.read_text(), "# my notes\n", "only our block goes")
+        self.assertFalse(o.exists(), "a file that held only our block goes")
+        self.assertFalse((self.home / ".config/opencode").exists(), "the folder it emptied goes")
+        self.assertTrue((self.home / ".gemini").is_dir(), "a folder with your files stays")
+        arch = [p for p in (self.base / ".brain/backups").rglob("*") if p.name in ("GEMINI.md", "AGENTS.md")]
+        self.assertEqual(len(arch), 2, "archived first")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"has our block")
+        self.assertNotRegex(out, r"OUTSIDE\s+(Gemini CLI|opencode)")
+
+    def test_an_old_empty_folder_of_an_absent_tool_goes_a_new_one_waits(self):
+        old, new = self.home / ".config/opencode", self.home / ".qwen"
+        old.mkdir(parents=True); new.mkdir()
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        self.ok("connect")
+        self.assertFalse(old.exists(), "empty for an hour, tool absent: removed")
+        self.assertTrue(new.is_dir(), "just made (a tool may be installing): left for now")
+        self.bins("codex")
+        cx = self.home / ".codex"
+        cx.mkdir()
+        os.utime(cx, (time.time() - 3600, time.time() - 3600))
+        self.ok("connect")
+        self.assertTrue(cx.is_dir(), "an installed tool's folder is never removed")
+
+    def test_doctor_does_not_list_absent_tools_as_outside(self):
+        self.write(self.home, ".config/opencode/notes.txt", "x\n")
+        self.write(self.home, ".gemini/notes.txt", "x\n")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"OUTSIDE\s+(Gemini CLI|opencode)")
+
+    def test_gemini_hint_names_its_setting(self):
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        line = next(x for x in out.splitlines() if "Gemini CLI" in x and x.startswith(("OK", "OUTSIDE")))
+        self.assertNotIn("no setting moves it", line)
+        self.assertIn("GEMINI_CLI_HOME", line)
+
+    def test_skills_written_by_an_older_connect_are_ours(self):
+        self.bins("codex")
+        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.ok("connect")
+        link = self.home / ".agents/skills"
+        os.unlink(link)                                                      # an older release: a real folder
+        os.rename(self.base / "engines/agents-skills", link)
+        k = json.loads((self.base / ".kits.json").read_text())
+        c = k["kits"]["base-folder"]["connect"]
+        c.pop("skills_link", None)
+        old = {}
+        for r in list(c["skills"]):
+            p = self.home / r
+            text = p.read_text().replace("Use when", "Use it when", 1)       # what an older release generated
+            if r.endswith("base-lint/SKILL.md"):
+                text = p.read_text()                                         # equal to today's text
+            p.write_text(text); old[r] = text
+            c["skills"][r]["sha"] = "0" * 64                                 # the record does not match either
+        (self.base / ".kits.json").write_text(json.dumps(k))
+        (self.base / "engines.json").unlink()
+        mine = self.write(self.home, ".agents/skills/base-ingest/notes.md", "mine\n")
+        mine.unlink()
+        r = self.ok("connect")
+        self.assertNotIn("changed since connect", r.stdout)
+        self.assertTrue(link.is_symlink(), "only connect's copies: the folder becomes the link")
+        for rr in old:
+            self.assertNotIn("Use it when", (self.home / rr).read_text())
+
+    def test_a_skill_file_you_edited_is_kept(self):
+        self.bins("codex")
+        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.ok("connect")
+        f = self.home / ".agents/skills/base-lint/SKILL.md"
+        f.write_text("# my own lint skill\n")
+        r = self.ok("connect")
+        self.assertIn("changed since connect", r.stdout)
+        self.assertEqual(f.read_text(), "# my own lint skill\n")

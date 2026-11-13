@@ -4551,6 +4551,7 @@ class Connector:
         self.tools, self.auto_extra = {}, []
         self.needs, self.warn, self._oc_major = {}, {}, None
         self.roots = {}              # {tool dir: real dir} while one extra dir of a tool is wired
+        self.emptied = set()         # folders connect emptied in this run (drop_block)
 
     def L(self, r):
         """Real key of a tool's default path (its own dir setting, or the extra dir being wired)."""
@@ -4663,6 +4664,7 @@ class Connector:
         for r in list(rec["blocks"]):                   # a tool not installed now: our block goes (archived first)
             if r not in plan and not skip(r) and any(fnmatch.fnmatchcase(r, pat) for pat in owned):
                 self.drop_block(rec, r)
+        self.drop_absent(found, plan, skip, rec)
         self.check_caps(plan)
         if ".aider.conf.yml" in found and "\n" not in str(self.base):
             self.units(rec["pointer"], {POINTER_MD: pointer_block(self.base) + "\n"})
@@ -4718,6 +4720,11 @@ class Connector:
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.record_base_files(me)
         self.save_kits(k)
+        try:                                            # mirrors of absent tools go here too, not only in watch
+            self.log += [f"engines/{n}: mirror removed (it must not exist)" for n in mirror_prune(self.base,
+                                                                                                 self.home)]
+        except (OSError, ValueError) as e:
+            self.log.append(f"mirrors: not checked ({e})")
         before = set(prev.get("blocks") or {})
         self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [],
                               new_dirs=[d for _, d in extra if d not in set(prev.get("dir_hooks") or {}) and
@@ -4845,6 +4852,41 @@ class Connector:
         drop = {r for r in drop if r in rec["blocks"] and r not in plan}
         return plan, drop, via
 
+    EMPTY_AGE = 600       # an empty folder of an absent tool goes after this many seconds (a tool may be installing)
+
+    def drop_absent(self, found, plan, skip, rec):
+        """Tools that are not installed: our block goes from their rules files by its markers, recorded or not (an
+        older release or another kit wrote it; doctor's WARN is the same check), archived first. Then the tool's
+        own folder goes when it is empty: at once when this run emptied it, else once it was empty EMPTY_AGE s."""
+        emptied = self.emptied                         # folders whose last file drop_block removed in this run
+        for key, t in sorted(TOOLS.items()):
+            if key in found or t.get("status") in ("discontinued", "app"):
+                continue
+            for pat, _ in t["rules"]:
+                for r in self.rules_files(pat):
+                    if r in plan or skip(r) or r in rec["blocks"]:
+                        continue
+                    if find_block(read(self.home / r) or ""):
+                        self.drop_block(rec, r)
+        for key, t in sorted(TOOLS.items()):
+            d = t["dir"] if "dir" in t else key
+            if key in found or not d or skip(d) or key in NOT_TOOLS:
+                continue
+            p = self.home / self.L(d)
+            if not p.is_dir() or p.is_symlink() or in_dir(p, self.base) or os.path.normpath(str(p)) == \
+                    os.path.normpath(str(self.home)):
+                continue
+            try:
+                if any(p.iterdir()):
+                    continue
+                old = time.time() - p.stat().st_mtime >= self.EMPTY_AGE
+            except OSError:
+                continue
+            if os.path.normpath(str(p)) in emptied or old:
+                p.rmdir()
+                self.log.append(f"{tool_tilde(path_key(p, self.home))}: empty folder of a tool that is not "
+                                "installed, removed")
+
     def drop_block(self, rec, r):
         """Take our block out of one file (another file reaches that tool now): like disconnect, for one file."""
         b = rec["blocks"].pop(r, None) or {}
@@ -4857,6 +4899,7 @@ class Connector:
         arch = self.backup(r)                           # what we delete or change is archived first
         if not new.strip():
             (self.home / r).unlink()
+            self.emptied.add(os.path.normpath(str((self.home / r).parent)))
             for d in sorted(b.get("dirs", []), key=lambda x: -x.count("/")):
                 if (self.home / d).is_dir() and not any((self.home / d).iterdir()):
                     (self.home / d).rmdir()
@@ -5222,13 +5265,14 @@ class Connector:
                 link_register(self.base, SKILLS_ENGINE, SKILLS_ENGINE, src, self.home, {"by": "connect"})
             return
         if src.is_dir():
-            other = []
+            other, texts = [], self.skill_texts()
             for dp, dns, fns in os.walk(src):
                 for n in sorted(fns) + [x for x in dns if os.path.islink(os.path.join(dp, x))]:
                     p = pathlib.Path(dp) / n
                     r = path_key(p, self.home)
                     t = mine.get(r)
-                    if p.is_symlink() or not p.is_file() or not t or sha(p.read_bytes()) != t.get("sha"):
+                    if p.is_symlink() or not p.is_file() or r not in texts or \
+                            not self.skill_ours(r, p.read_bytes().decode("utf-8", "replace"), texts[r], t):
                         other.append(p.relative_to(src).as_posix())
             if other:
                 note = sorted(other)
@@ -5312,17 +5356,32 @@ class Connector:
                 (self.base / ENGINES_REG).unlink()
         return set(sl.get("dirs", []))
 
+    def skill_ours(self, r, cur, text, t):
+        """A copy in ~/.agents/skills is connect's own when it matches its record, equals what connect writes now,
+        or carries the text only connect generates for THIS base (an older release wrote it with older text: its
+        hash is not today's and the record may hold another one)."""
+        if cur == text or (t and sha(cur) == t.get("sha")):
+            return True
+        b = str(self.base)
+        if r.endswith("/base-home/SKILL.md"):
+            return cur.startswith("---\nname: base-home\ndescription: The user's knowledge base (Skeleton Base) at "
+                                  + b + ". ")
+        return r.endswith("/SKILL.md") and f"> Installed by Skeleton Base `connect` for the base at `{b}`" in cur
+
     def install_skills(self, rec):
         self.link_skills(rec)
         store = rec.setdefault("skills", {})
         for r, text in self.skill_texts().items():
             cur, t = read(self.home / r), store.get(r)
-            if t is None and cur is not None and cur != text:
+            ours = cur is not None and self.skill_ours(r, cur, text, t)
+            if t is None and cur is not None and not ours:
                 self.log.append(f"kept your {tool_tilde(r)} (not ours; the base's copy was not installed)")
                 continue
-            if t is not None and cur is not None and sha(cur) != t.get("sha"):
+            if t is not None and cur is not None and not ours:
                 self.log.append(f"kept {tool_tilde(r)} (changed since connect)")
                 continue
+            if t is None and ours:
+                t = {"previous": None, "dirs": []}       # an older connect wrote it (its record was lost)
             if t is None:
                 t = {"previous": self.backup(r), "dirs": self.missing_dirs(r)}
             if self.put(r, text) and len(store) == 0:
@@ -9126,26 +9185,43 @@ def mirror_drop(base, name, dst, why):
     return f"engines/{name}: mirror removed ({why})" if gone else None
 
 
+def mirror_tool(e, src, home):
+    """The TOOLS key a mirror copies: its "tool" field, else (older releases wrote none) the tool whose folder is
+    its source."""
+    if isinstance(e, dict) and e.get("tool"):
+        return tool_key_of(e["tool"])
+    s = os.path.normpath(str(src))
+    return next((k for k in TOOLS if os.path.normpath(str(tool_root(k, home)[0])) == s), None)
+
+
+def mirror_prune(base, home=None):
+    """Drop every mirror that must not exist (whoever registered it, this release or an older one): its source is
+    inside the base, it is ~/.agents/skills, or its tool is not installed. Returns the names that went."""
+    base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
+    gone_names, reg = [], reg_load(base, ENGINES_REG).get("engines", {})
+    mine = Connector(base).created_files(connect_rec(base))
+    skills = os.path.normpath(str(home / SKILLS_DIR))
+    for name, src, keep in mirror_sources(base, home):
+        key = mirror_tool(reg.get(name), src, home)
+        why = ("its source is inside the base" if in_dir(src, base) else
+               "~/.agents/skills is connect's copy, not a source" if os.path.normpath(str(src)) == skills else
+               "the tool is not installed" if key in TOOLS and not tool_installed(home, TOOLS[key], mine) else None)
+        if why and mirror_drop(base, name, base / "engines" / name, why):
+            gone_names.append(name)
+    return gone_names
+
+
 def mirror_sync(base, home=None, quiet=True):
     """Bring every mirror up to date (copy changed files, drop removed ones, leave out secret-looking text).
     A mirror that must not exist goes: its source is inside the base, it is ~/.agents/skills, or its tool is not
     installed. Returns the names of the mirrors that changed."""
     base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
-    changed, reg = [], reg_load(base, ENGINES_REG).get("engines", {})
-    mine = Connector(base).created_files(connect_rec(base))
+    changed = mirror_prune(base, home)
     skills = os.path.normpath(str(home / SKILLS_DIR))
     for name, src, keep in mirror_sources(base, home):
         dst = base / "engines" / name
-        e = reg.get(name) if isinstance(reg.get(name), dict) else {}
-        key = tool_key_of(e.get("tool")) if e.get("tool") else None
-        why = ("its source is inside the base" if in_dir(src, base) else
-               "~/.agents/skills is connect's copy, not a source" if os.path.normpath(str(src)) == skills else
-               "the tool is not installed" if key in TOOLS and not tool_installed(home, TOOLS[key], mine) else None)
-        if why:
-            gone = mirror_drop(base, name, dst, why)
-            if gone:
-                changed.append(name)
-            continue
+        if in_dir(src, base) or os.path.normpath(str(src)) == skills:
+            continue                                  # never a mirror (mirror_prune said why)
         want = mirror_files(src, keep, name) if src.exists() else {}
         n, skipped = 0, []
         dst.mkdir(parents=True, exist_ok=True)
@@ -9566,6 +9642,17 @@ def leftover_rows(base, home):
     return out
 
 
+def setting_note(key):
+    """Why a tool's folder cannot be adopted by its own setting (the doctor hint): the setting it has moves more
+    than this folder (Gemini CLI's GEMINI_CLI_HOME is the home it lives in; XDG_* moves every program), or none."""
+    for var, how in TOOL_HOMES.get(key, ()):
+        if how == "home":
+            return f"its setting {var} moves the whole home this folder lives in, not the folder alone"
+        if how == "xdg":
+            return f"its setting {var} moves every program's folder there, not this one alone"
+    return "no setting moves it"
+
+
 def link_rows(base, home):
     """F7: each tool adopted by a link (engines.json "link"): the link at its old place must resolve into
     engines/NAME. Broken, pointing elsewhere or replaced by a real folder: an ERROR with the fix."""
@@ -9604,6 +9691,7 @@ def doctor(base, strict=False):
     allow = set(ALLOWED_OUTSIDE) | {x.removeprefix("~/") for x in
                                     reg_load(base, ".brain/outside.json").get("allow", []) if isinstance(x, str)}
     mirrors = {os.path.normpath(str(s)) for _, s, _ in mirror_sources(base, home)}
+    mine = Connector(base).created_files(connect_rec(base))
     guarded = set()                                    # engines/ dirs whose default place holds our guard
     for key, d, extra in tool_instances(home, base):
         name = TOOLS.get(key, {}).get("name", key)
@@ -9616,6 +9704,8 @@ def doctor(base, strict=False):
             if extra:
                 rows.append(("WARN", f"{name}: registered dir {d} does not exist"))
             continue
+        if not extra and key in TOOLS and not in_dir(d, base) and not tool_installed(home, TOOLS[key], mine):
+            continue                                   # not installed: its leftovers are leftover_rows' WARN
         tag = "in the base" if in_dir(d, base) else "OUTSIDE the base"
         lvl = "OK" if in_dir(d, base) else "OUTSIDE"
         how = f"set by {var}" if var and not extra else ("extra dir" if extra else "default place")
@@ -9624,9 +9714,9 @@ def doctor(base, strict=False):
             if engine_var(key) and not extra:
                 hint = f" -> brain.py engine adopt {next((i for i, k in TOOL_IDS.items() if k == key), key)}"
             elif os.path.normpath(str(d)) in mirrors:
-                hint = " -> no setting moves it: it stays outside (engines/ keeps a read-only copy)"
+                hint = f" -> {setting_note(key)}: it stays outside (engines/ keeps a read-only copy)"
             else:
-                hint = " -> brain.py engine mirror " + home_rel(d, home)
+                hint = f" -> {setting_note(key)}: brain.py engine mirror " + home_rel(d, home)
         rows.append((lvl, f"{name}: {home_rel(d, home)} ({how}, {tag}){hint}"))
         default = pathlib.Path(home) / key
         if var and not extra and default.is_dir() and not in_dir(default, d):
@@ -9644,7 +9734,8 @@ def doctor(base, strict=False):
         if key in TOOL_IDS.values() or key.split("/")[0] in TOOL_HOMES:
             continue
         p = home / key
-        if p.is_dir() and not p.is_symlink() and not in_dir(p, base) and key not in allow:
+        if p.is_dir() and not p.is_symlink() and not in_dir(p, base) and key not in allow and \
+                tool_installed(home, TOOLS[key], mine):
             hint = (f" -> brain.py engine adopt {TOOLS[key]['id']} (quit the app first; moves it into the base "
                     "and leaves a link)" if TOOLS[key].get("adopt") == "link" else
                     " -> no setting moves it: it stays outside (engines/ keeps a read-only copy)"
