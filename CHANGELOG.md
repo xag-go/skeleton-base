@@ -2,6 +2,13 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.3 - 2026-11-13
+- Role rule ("Your role and name", in every tool's pointer block and the base's AGENTS.md): a tool's product name
+  and its built-in "You are <tool>" line are not a role or a name; only an identity the user set counts (a custom
+  system prompt or SOUL.md that names a role, a project ROLE.md). For "who are you?" the tool reads `agents/*.md`
+  and answers with the ONE role that lists it. Found by the real matrix: Codex answered "I'm Codex" while
+  `agents/engineer.md` listed `codex`. Regression test `test_tool_product_identity_is_not_a_role`.
+
 ## v1.6.2 - 2026-11-13
 - **`engine vault NAME [--undo] [--dry-run]`**: the secret files of `engines/NAME` (the same secret names the
   `.gitignore`/`.stignore` blocks deny; not sessions, caches or logs) move to ONE vault folder outside the base,
