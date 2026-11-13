@@ -5836,3 +5836,86 @@ class FullScanFollowUpTests(ToolHome):
         self.assertTrue(B.st_dropin_ok(self.base, self.home))
         self.write(ops, d.name, "[Service]\n")
         self.assertFalse(B.st_dropin_ok(self.base, self.home))
+
+
+class ElectronProfileTests(ToolHome):
+    """1.6.9: Chromium/Electron profiles keep logins in sub-profiles (Default/, Partitions/*/): vaulted there too,
+    their caches heavy there too, and doctor's secret scan sees them."""
+
+    SECRETS = ("Default/Cookies", "Default/Cookies-journal", "Default/Login Data", "Default/Login Data-journal",
+               "Default/Login Data For Account", "Default/Web Data", "Default/Account Web Data",
+               "Default/Trust Tokens", "Partitions/a/Cookies", "Partitions/b/Trust Tokens-journal")
+    SECRET_DIRS = ("Default/Local Storage", "Default/Session Storage", "Default/IndexedDB", "Partitions/a/Local Storage")
+    HEAVY = ("Default/Cache", "Default/Code Cache", "Default/Service Worker", "Partitions/a/GPUCache",
+             "Partitions/b/blob_storage")
+
+    def profile(self, d):
+        for f in self.SECRETS:
+            self.write(d, f, f"SECRET-VALUE {f}\n").chmod(0o600)
+        for x in self.SECRET_DIRS:
+            self.write(d, f"{x}/leveldb/000003.log", "SECRET-VALUE\n")
+        for x in self.HEAVY:
+            self.write(d, f"{x}/data_0", "heavy\n")
+        for p in ("", "Default/", "Partitions/a/", "Partitions/b/"):
+            self.write(d, f"{p}Preferences", "{}\n")
+        self.write(d, "Local State", "{}\n")
+        return d
+
+    def test_codex_desktop_vaults_every_profile_and_keeps_caches_out(self):
+        src = self.profile(self.home / ".config/Codex")
+        r = self.hb("engine", "adopt", "codex-desktop", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.base / "engines/codex-desktop"
+        for f in self.SECRETS + self.SECRET_DIRS:
+            self.assertTrue((dest / f).is_symlink(), f)
+        self.assertEqual((src / "Default/Login Data").read_text(), "SECRET-VALUE Default/Login Data\n")
+        for x in self.HEAVY:
+            self.assertFalse((dest / x).is_symlink(), x)
+        for f in ("Default/Preferences", "Local State"):
+            self.assertFalse((dest / f).is_symlink(), f)
+        gi, st = (self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()
+        for h in ("Cache", "Code Cache", "Service Worker", "GPUCache", "blob_storage"):
+            self.assertIn(f"/engines/codex-desktop/**/{h}/", gi)
+            self.assertIn(f"/engines/codex-desktop/**/{h}\n", st)
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"ERROR.*codex-desktop")
+        r = self.hb("engine", "adopt", "--undo", "codex-desktop", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((src / "Default/Cookies").is_symlink())
+        self.assertEqual((src / "Default/Cookies").read_text(), "SECRET-VALUE Default/Cookies\n")
+
+    def test_doctor_errors_on_an_unvaulted_nested_login(self):
+        d = self.profile(self.base / "engines/hermes-desktop")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {"hermes-desktop": {
+            "tool": "hermes-desktop", "mode": "adopted", "link": True, "from": "~/.config/Hermes"}}}))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        for f in ("Default/Login Data", "Partitions/a/Cookies", "Partitions/a/Local Storage/leveldb/000003.log"):
+            self.assertRegex(out, rf"ERROR.*engines/hermes-desktop/{re.escape(f)}\b.*engine vault hermes-desktop", f)
+        self.assertNotRegex(out, r"ERROR.*hermes-desktop/Default/Cache/")
+
+    def test_a_generic_adopted_engine_is_scanned_at_any_depth(self):
+        d = self.base / "engines/someapp"
+        self.write(d, "deep/profile/Cookies", "SECRET-VALUE\n")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {"someapp": {
+            "tool": "someapp", "mode": "adopted", "link": True, "from": "~/someapp"}}}))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"ERROR.*engines/someapp/deep/profile/Cookies")
+
+    def test_claude_desktop_row_is_a_profile_row(self):
+        self.assertTrue(B.TOOLS[".config/Claude"].get("profiles"))
+        for i in ("codex-desktop", "hermes-desktop"):
+            self.assertTrue(B.ADOPT_ROWS[i].get("profiles"), i)
+
+
+class CacheAllowTests(ToolHome):
+    def test_a_path_reason_entry_silences_the_product_cache_check(self):
+        for n in ("codex-runtimes", "claude-big"):
+            d = self.home / ".cache" / n
+            d.mkdir(parents=True)
+            with open(d / "blob", "wb") as f:
+                f.truncate(60 * 1024 * 1024)
+        self.write(self.base, ".brain/outside.json", json.dumps({"allow": [
+            {"path": "~/.cache/codex-runtimes", "reason": "cache"}]}))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotIn("codex-runtimes", out)
+        self.assertRegex(out, r"OUTSIDE\s+~/\.cache/claude-big: a cache named after a product")

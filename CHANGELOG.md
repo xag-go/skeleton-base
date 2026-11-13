@@ -2,6 +2,20 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.9 - 2026-11-13
+- **Secrets in Chromium/Electron sub-profiles**: a profile row (claude-desktop, codex-desktop, hermes-desktop:
+  `profiles` in the row) and any folder adopted by a link get the Chromium login names at ANY depth, so `Default/`,
+  `Profile N/` and `Partitions/*/` are covered, not only the top: Cookies, Cookies-journal, Login Data*, Web Data*,
+  Account Web Data*, Trust Tokens* (files) and Local Storage/, Session Storage/, IndexedDB/, WebStorage/ (each one
+  link). `engine vault` moves them and doctor's secret scan reports each one not yet vaulted as an ERROR (1.6.8 saw
+  only the top: `engine adopt codex-desktop` found nothing to vault).
+- Their caches are heavy in every profile too: Cache, Code Cache, GPUCache, Dawn*Cache, Service Worker (CacheStorage),
+  blob_storage, Shared Dictionary, shader caches: `/engines/<id>/**/<name>` lines in the generated .gitignore and
+  .stignore blocks, never walked by the vault. claude-desktop keeps its profile at the top (re-checked: no
+  sub-profile), so it changes only by these any-depth lines.
+- doctor: a `.brain/outside.json` entry for a path (e.g. `{"path": "~/.cache/codex-runtimes", "reason": "cache"}`)
+  also silences the "cache named after a product, over 50 MB" check for that path.
+
 ## v1.6.8 - 2026-11-13
 - **`~/.agents/skills` moves whole into the base**, whatever it holds (connect's copies, other kits' skills such as
   Frugal-Bridge's, your own skills, the Claude app's `synced/`): connect moves it with the same mover and checks as

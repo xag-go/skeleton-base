@@ -164,7 +164,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.8"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.9"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -4482,6 +4482,7 @@ TOOLS = {t["key"]: t for t in (
          status="app",
          # no setting moves its folder: `engine adopt claude-desktop` moves it into engines/ and leaves a link
          adopt="link", locks=("SingletonLock",),          # Electron: a link "<host>-<pid>" while the app runs
+         profiles=True,       # Chromium profile names apply in every sub-profile too (CHROMIUM_*)
          vault=("Cookies", "Cookies-journal", "buddy-tokens.json", "ant-did", "ant-device-registry.json",
                 "Trust Tokens*", "claude_desktop_config.json", "config.json",   # MCP env keys; oauth:tokenCache
                 "Local Storage/", "Session Storage/", "IndexedDB/", "WebStorage/"),
@@ -7130,9 +7131,9 @@ _ELECTRON = TOOLS[".config/Claude"]           # an Electron profile: the same lo
 # (`engine adopt ID`); doctor hints them. Owner decision: they all move, used or not.
 ADOPT_ROWS = {r["id"]: r for r in (
     dict(id="codex-desktop", name="Codex desktop app", dir=".config/Codex", locks=("SingletonLock",),
-         marks=(".config/Codex/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"]),
+         marks=(".config/Codex/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"], profiles=True),
     dict(id="hermes-desktop", name="Hermes desktop app", dir=".config/Hermes", locks=("SingletonLock",),
-         marks=(".config/Hermes/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"]),
+         marks=(".config/Hermes/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"], profiles=True),
     dict(id="google-workspace-mcp", name="Google Workspace MCP", dir=".google_workspace_mcp",
          vault=("credentials/", "credentials*", "*token*"), heavy=("logs/",)),
     dict(id="fastmcp", name="FastMCP (OAuth proxy tokens)", dir=".local/share/fastmcp", vault=("oauth-proxy/",)),
@@ -7151,6 +7152,28 @@ ENGINE_VAULT = {t["id"]: tuple(t["vault"]) for t in list(TOOLS.values()) + list(
 ENGINE_HEAVY = {**{t["id"]: tuple(t["heavy"]) for t in list(TOOLS.values()) + list(ADOPT_ROWS.values())
                    if t.get("heavy")},
                 SKILLS_ENGINE: ("synced/",)}     # ~/.agents/skills/synced: skills the Claude app syncs (regenerated)
+
+
+# Chromium/Electron keep logins in every profile folder (the top, Default/, "Profile N"/, Partitions/*/): these
+# names are secrets and caches at ANY depth of a profile row's folder, and of any folder adopted by a link.
+CHROMIUM_FILES = ("Cookies", "Cookies-journal", "Login Data*", "Web Data*", "Account Web Data*", "Trust Tokens*")
+CHROMIUM_DIRS = ("Local Storage", "Session Storage", "IndexedDB", "WebStorage")
+CHROMIUM_HEAVY = ("Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache", "Service Worker",
+                  "blob_storage", "Shared Dictionary", "GrShaderCache", "ShaderCache", "GraphiteDawnCache")
+ENGINE_PROFILES = {t["id"] for t in list(TOOLS.values()) + list(ADOPT_ROWS.values()) if t.get("profiles")}
+
+
+def chromium_scan(d):
+    """True when the tool folder D (engines/NAME) gets the any-depth Chromium names: a profile row, or any
+    folder adopted by a link (engines.json "link")."""
+    d = pathlib.Path(d)
+    if d.name in ENGINE_PROFILES:
+        return True
+    try:
+        e = json.loads(read(d.parent.parent / ENGINES_REG) or "{}").get("engines", {}).get(d.name)
+    except ValueError:
+        return False
+    return isinstance(e, dict) and e.get("mode") == "adopted" and bool(e.get("link"))
 
 
 def link_row(name):
@@ -7290,6 +7313,7 @@ def gitignore_layout(shares=None):
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
     out += [f"/engines/{n}/{g}" for n, pats in sorted({**ENGINE_HEAVY, **(shares or {}).get(HEAVY, {})}.items())
             for g in pats]                                                                     # regenerated, heavy
+    out += [f"/engines/{n}/**/{h}/" for n in sorted(ENGINE_PROFILES) for h in CHROMIUM_HEAVY]  # in every profile
     if (shares or {}).get(VAULTED):
         out.append("# vault links (generated: brain.py vault): the secrets live outside the base")
         out += ["/" + _st_escape(x) for x in shares[VAULTED]]
@@ -7317,6 +7341,7 @@ def stignore_layout(shares=None):
     out += [f"/engines/*/{g}" for g in ENGINE_DENY_TOP]
     out += [f"/engines/{n}/{g.rstrip('/')}" for n, pats in sorted({**ENGINE_HEAVY, **(shares or {}).get(HEAVY, {})}
                                                                   .items()) for g in pats]          # even sync all
+    out += [f"/engines/{n}/**/{h}" for n in sorted(ENGINE_PROFILES) for h in CHROMIUM_HEAVY]
     out.append("!/engines/README.md")
     for k, pats in ENGINE_SAFE.items():
         out += [f"!/engines/{k}/{g.rstrip('/')}" for g in pats]
@@ -8018,15 +8043,19 @@ def vault_secrets(d):
     d, out = pathlib.Path(d), []
     heavy = {g.rstrip("/") for g in engine_pats(d, "heavy")}
     own = engine_pats(d, "vault")                     # the tool row's own secret names (top of its folder)
+    chrom = chromium_scan(d)
     for dp, dns, fns in os.walk(d):
         dns[:] = sorted(x for x in dns if x not in VAULT_SKIP_DIRS and not os.path.islink(os.path.join(dp, x))
                         and not os.path.lexists(os.path.join(dp, x, ".git"))      # code checkouts are not logins
-                        and not (dp == str(d) and (x in VAULT_SAFE_TOP or x in heavy)))
+                        and not (dp == str(d) and (x in VAULT_SAFE_TOP or x in heavy))
+                        and not (chrom and x in CHROMIUM_HEAVY))                  # a profile's caches, any depth
         rel_parts = pathlib.Path(dp).relative_to(d).parts
-        sec = any(x in VAULT_SECRET_DIRS for x in rel_parts) or bool(rel_parts) and vault_own(rel_parts[0], own, True)
+        sec = any(x in VAULT_SECRET_DIRS for x in rel_parts) or bool(rel_parts) and vault_own(rel_parts[0], own, True) \
+            or chrom and any(x in CHROMIUM_DIRS for x in rel_parts)
         for f in fns:
             fp = pathlib.Path(dp) / f
-            if (vault_secret_name(f, not rel_parts, sec) or not rel_parts and vault_own(f, own)) \
+            if (vault_secret_name(f, not rel_parts, sec) or not rel_parts and vault_own(f, own) or
+                    chrom and any(fnmatch.fnmatchcase(f, g) for g in CHROMIUM_FILES)) \
                     and not fp.is_symlink() and fp.is_file():
                 out.append(fp)
     return sorted(out)
@@ -8046,7 +8075,15 @@ def vault_units(d):
     own = engine_pats(d, "vault")
     whole = [d / x for x in sorted(os.listdir(d)) if vault_own(x, own, True) and (d / x).is_dir()
              and not (d / x).is_symlink()] if own else []      # a tool row's secret folder moves as ONE link
-    out = [(x, x.name) for x in whole]
+    if chromium_scan(d):                                    # a profile's login folders, at any depth: ONE link each
+        for f in files:
+            parts = f.relative_to(d).parts
+            i = next((j for j, x in enumerate(parts[:-1]) if x in CHROMIUM_DIRS), None)
+            if i is not None:
+                w = d.joinpath(*parts[:i + 1])
+                if w not in whole and not any(in_dir(w, x) for x in whole):
+                    whole.append(w)
+    out = [(x, x.relative_to(d).as_posix()) for x in whole]
     files = [f for f in files if not any(in_dir(f, x) for x in whole)]
     by = {}
     for f in files:
@@ -10042,7 +10079,7 @@ def outside_scan(base, home, handled=()):
                                         "(moves it into the base and leaves a link)"))
                 continue
             w = why_of(r)
-            if root == ".cache" and (w in (None, "cache", "listed")) and any(
+            if root == ".cache" and r not in allow and w in (None, "cache") and any(
                     fnmatch.fnmatchcase(e.name.lower(), g) for g in products) and p.is_dir() and \
                     not p.is_symlink() and _cached_size(base, p, cache) > CACHE_BIG:
                 rows.append(("OUTSIDE", f"~/{r}: a cache named after a product, over 50 MB "
