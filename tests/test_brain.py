@@ -5402,17 +5402,59 @@ class SkillsLinkTests(ToolHome):
         self.assertFalse((self.dest / "MIRROR").exists())
         self.assertEqual(self.reg()["agents-skills"]["mode"], "adopted")
         self.ok("disconnect")
-        self.assertFalse(os.path.lexists(self.link))
+        self.assertTrue(self.link.is_dir() and not self.link.is_symlink(), "it was a folder: it comes back")
 
-    def test_a_folder_with_other_files_is_reported_and_left(self):
+    def test_a_folder_with_any_content_moves_whole_and_comes_back_on_disconnect(self):
         self.write(self.home, ".agents/skills/mine/SKILL.md", "---\nname: mine\n---\nmine\n")
+        self.write(self.home, ".agents/skills/frugal-handoff/SKILL.md", "---\nname: frugal-handoff\n---\nx\n")
+        self.write(self.home, ".agents/skills/synced/app-skill/SKILL.md", "synced by the app\n")
+        (self.home / ".agents/skills/empty-dir").mkdir()
+        before = ltree(self.home / ".agents")
+        self.ok("connect")
+        self.assertTrue(self.link.is_symlink(), "moved whole: your skills too")
+        self.assertEqual((self.dest / "mine/SKILL.md").read_text(), "---\nname: mine\n---\nmine\n")
+        self.assertTrue((self.link / "frugal-handoff/SKILL.md").is_file(), "other kits' skills work through the link")
+        self.assertTrue((self.dest / "base-home/SKILL.md").is_file())
+        self.assertIn("/engines/agents-skills/synced/", (self.base / ".gitignore").read_text())
+        self.assertIn("/engines/agents-skills/synced\n", (self.base / ".stignore").read_text())
+        self.ok("disconnect")
+        self.assertFalse(self.link.is_symlink())
+        self.assertEqual(ltree(self.home / ".agents"), before, "a real folder again, same content")
+        self.assertFalse(self.dest.exists())
+        self.assertNotIn("agents-skills", self.reg())
+
+    def test_an_empty_folder_from_before_comes_back(self):
+        self.link.mkdir(parents=True)
+        self.ok("connect")
+        self.assertTrue(self.link.is_symlink())
+        self.ok("disconnect")
+        self.assertTrue(self.link.is_dir() and not self.link.is_symlink())
+        self.assertEqual(os.listdir(self.link), [])
+
+    def test_refused_moves_are_reported_and_the_folder_stays(self):
+        self.write(self.home, ".agents/skills/mine/SKILL.md", "mine\n")
+        self.write(self.base, "engines/agents-skills/x.md", "someone else's\n")
         r = self.ok("connect")
         self.assertFalse(self.link.is_symlink())
-        self.assertIn("~/.agents/skills", r.stdout)
-        self.assertIn("mine/SKILL.md", r.stdout)
+        self.assertIn("exists", r.stdout)
         self.assertTrue((self.link / "base-home/SKILL.md").is_file(), "the copies are still written there")
-        self.assertTrue((self.link / "mine/SKILL.md").is_file())
-        self.assertNotIn("agents-skills", self.reg())
+        self.assertEqual((self.base / "engines/agents-skills/x.md").read_text(), "someone else's\n")
+        r = self.ok("connect")
+        self.assertNotIn("exists", r.stdout, "reported once")
+
+    def test_another_filesystem_is_refused(self):
+        shm = pathlib.Path("/dev/shm")
+        if not shm.is_dir() or os.stat(shm).st_dev == os.stat(self.base).st_dev:
+            self.skipTest("no second filesystem")
+        h = pathlib.Path(tempfile.mkdtemp(prefix="skb-xfs-", dir=shm))
+        self.addCleanup(shutil.rmtree, h, True)
+        self.write(h, ".codex/config.toml", 'model = "x"\n')
+        self.write(h, ".agents/skills/mine/SKILL.md", "mine\n")
+        r = self.hb("connect", env={"HOME": str(h)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("different filesystem", r.stdout)
+        self.assertFalse((h / ".agents/skills").is_symlink())
+        self.assertFalse(self.dest.exists())
 
     def test_doctor_errors_when_the_skills_link_is_replaced(self):
         self.ok("connect")

@@ -158,7 +158,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.7"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.8"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -4645,7 +4645,7 @@ class Connector:
                "skills": dict(prev.get("skills", {})), "mcp": bool(mcp or prev.get("mcp")),
                "dirs": {k: list(v) for k, v in (prev.get("dirs") or {}).items()},
                "dir_hooks": dict(prev.get("dir_hooks", {})), "registry": dict(prev.get("registry", {})),
-               **{x: prev[x] for x in ("skills_link", "skills_kept") if x in prev}}
+               **{x: prev[x] for x in ("skills_link", "skills_refused") if x in prev}}
 
         never = [x.removeprefix("~/") for x in watch_cfg(self.base).get("never", []) if isinstance(x, str)]
         skip = lambda r: any(fnmatch.fnmatchcase(r, g) or r.startswith(g.rstrip("/") + "/") for g in never)
@@ -5253,11 +5253,13 @@ class Connector:
         return out
 
     def link_skills(self, rec):
-        """~/.agents/skills is a link to BASE/engines/agents-skills (adopted, never a mirror): the copies connect
-        writes live in the base. A folder there becomes the link only when it holds nothing but connect's own
-        copies (else it is reported and left as it is)."""
+        """~/.agents/skills moves WHOLE into BASE/engines/agents-skills (adopted, like the Claude app: link_move,
+        the same checks as `engine adopt`) and a symlink stays at ~/.agents/skills. Whatever it holds moves (your
+        skills, other kits' skills, the app's synced/): they keep working through the link. A refused move is
+        reported and the folder stays as it is."""
         src, dest = self.home / SKILLS_DIR, self.base / "engines" / SKILLS_ENGINE
-        mine = rec.get("skills", {})
+        e = reg_load(self.base, ENGINES_REG).get("engines", {}).get(SKILLS_ENGINE)
+        ours = isinstance(e, dict) and bool(e.get("link"))
         if src.is_symlink():
             if os.path.realpath(src) == os.path.realpath(dest):
                 dest.mkdir(parents=True, exist_ok=True)
@@ -5265,42 +5267,30 @@ class Connector:
                 link_register(self.base, SKILLS_ENGINE, SKILLS_ENGINE, src, self.home, {"by": "connect"})
             return
         if src.is_dir():
-            other, texts = [], self.skill_texts()
-            for dp, dns, fns in os.walk(src):
-                for n in sorted(fns) + [x for x in dns if os.path.islink(os.path.join(dp, x))]:
-                    p = pathlib.Path(dp) / n
-                    r = path_key(p, self.home)
-                    t = mine.get(r)
-                    if p.is_symlink() or not p.is_file() or r not in texts or \
-                            not self.skill_ours(r, p.read_bytes().decode("utf-8", "replace"), texts[r], t):
-                        other.append(p.relative_to(src).as_posix())
-            if other:
-                note = sorted(other)
-                if rec.get("skills_kept") != note:
-                    self.log.append(f"kept ~/{SKILLS_DIR} as a folder (not linked into the base): it holds files "
-                                    "connect did not write: " + ", ".join(note[:8]) + (" ..." if len(note) > 8 else "")
-                                    + f". Move them (e.g. into the base's skills/), then run connect again")
-                rec["skills_kept"] = note
+            if ours and os.path.lexists(dest):
+                note = (f"~/{SKILLS_DIR} is a real folder again and {dest} exists: move what is new into "
+                        f"{dest}, remove ~/{SKILLS_DIR}, then run connect again")
+                if rec.get("skills_refused") != note:
+                    self.log.append(note)
+                rec["skills_refused"] = note
                 return
-            rec.pop("skills_kept", None)
-            e = reg_load(self.base, ENGINES_REG).get("engines", {}).get(SKILLS_ENGINE)
-            if dest.is_dir() and not dest.is_symlink() and isinstance(e, dict) and e.get("link"):
-                shutil.rmtree(src)                    # only connect's copies: they are written again in the base
-                os.symlink(str(dest), str(src))
-                self.log.append(f"~/{SKILLS_DIR} is a link to {dest} again")
-            else:
-                try:
-                    self.log += link_move(self.base, src, SKILLS_ENGINE, self.home, what="connect")
-                except SystemExit as x:
-                    self.log.append(f"kept ~/{SKILLS_DIR} as a folder: {x}")
-                    return
-            rec.setdefault("skills_link", {"dirs": []})
+            try:
+                self.log += link_move(self.base, src, SKILLS_ENGINE, self.home, what="connect")
+            except SystemExit as x:
+                note = f"kept ~/{SKILLS_DIR} as a folder: {x}"
+                if rec.get("skills_refused") != note:
+                    self.log.append(note)
+                rec["skills_refused"] = note
+                return
+            rec["skills_link"] = {"dirs": [], "moved": True}     # disconnect moves it back as a real folder
         else:
             made = self.missing_dirs(SKILLS_DIR + "/x")[1:]     # ~/.agents (when connect makes it)
-            e = reg_load(self.base, ENGINES_REG).get("engines", {}).get(SKILLS_ENGINE)
-            if os.path.lexists(dest) and not (isinstance(e, dict) and e.get("link")):
+            if os.path.lexists(dest) and not ours:
                 if not (isinstance(e, dict) and e.get("mode") == "mirror" and (dest / "MIRROR").is_file()):
-                    self.log.append(f"{dest} exists and is not connect's: ~/{SKILLS_DIR} is a plain folder")
+                    note = f"{dest} exists and is not connect's: ~/{SKILLS_DIR} is a plain folder"
+                    if rec.get("skills_refused") != note:
+                        self.log.append(note)
+                    rec["skills_refused"] = note
                     return
                 shutil.rmtree(dest)                   # watch's old mirror of it: the real folder replaces it
             dest.mkdir(parents=True, exist_ok=True)
@@ -5308,13 +5298,15 @@ class Connector:
             os.symlink(str(dest), str(src))
             self.log.append(f"~/{SKILLS_DIR} -> {dest} (the base's skills, read by most tools)")
             rec["skills_link"] = {"dirs": made}
+        rec.pop("skills_refused", None)
         link_register(self.base, SKILLS_ENGINE, SKILLS_ENGINE, src, self.home, {"by": "connect"})
         self.log += link_drop_mirrors(self.base, src, self.home, SKILLS_ENGINE)
 
     def record_base_files(self, me, gone=False):
-        """The files connect itself made in the base (the skills copies in engines/agents-skills, an engines.json
-        that holds only their entry) are listed with their hash in the kit's "created" record, like the kit's own
-        files: an installer that guards your data then knows they are ours, not yours."""
+        """What lives in the base only while it is connected (every file of engines/agents-skills: disconnect moves
+        it back to ~/.agents/skills or removes connect's copies; an engines.json that holds only its entry) is
+        listed with its hash in the kit's "created" record: an installer that guards your data then knows these
+        files leave the base on purpose (they are back in your home, not lost)."""
         created = me.setdefault("created", {})
         for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r == ENGINES_REG]:
             created.pop(r)
@@ -5331,18 +5323,20 @@ class Connector:
             created[ENGINES_REG] = sha((self.base / ENGINES_REG).read_bytes())
 
     def unlink_skills(self, rec):
-        """disconnect: the link goes; what is left in engines/agents-skills (not ours) comes back as the folder."""
+        """disconnect: the link goes and ~/.agents/skills is a real folder again with what it held (a folder that
+        was there before connect comes back even if empty; one connect made goes when nothing is left in it)."""
         sl = rec.get("skills_link")
         if sl is None:
             return set()
         src, dest = self.home / SKILLS_DIR, self.base / "engines" / SKILLS_ENGINE
-        if src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest):
+        if src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest) and dest.is_dir():
             os.unlink(src)
-            for dp, dns, fns in os.walk(dest, topdown=False):
-                if not os.listdir(dp):
-                    os.rmdir(dp)
+            if not sl.get("moved"):
+                for dp, dns, fns in os.walk(dest, topdown=False):
+                    if not os.listdir(dp):
+                        os.rmdir(dp)
             if dest.is_dir():
-                os.rename(dest, src); self.log.append(f"~/{SKILLS_DIR}: a folder again (it held your files)")
+                os.rename(dest, src); self.log.append(f"~/{SKILLS_DIR}: a real folder again (moved back from {dest})")
             else:
                 self.log.append(f"removed the link ~/{SKILLS_DIR}")
         reg = reg_load(self.base, ENGINES_REG)
@@ -7119,7 +7113,8 @@ SKILLS_ENGINE = "agents-skills"             # ~/.agents/skills -> engines/agents
 # per tool folder under engines/ (exact name), from the TOOLS rows: secret names at its top ("x/" = a whole folder,
 # vaulted as one link) and heavy regenerated sub-folders that never go to git, Syncthing or the vault
 ENGINE_VAULT = {t["id"]: tuple(t["vault"]) for t in TOOLS.values() if t.get("vault")}
-ENGINE_HEAVY = {t["id"]: tuple(t["heavy"]) for t in TOOLS.values() if t.get("heavy")}
+ENGINE_HEAVY = {**{t["id"]: tuple(t["heavy"]) for t in TOOLS.values() if t.get("heavy")},
+                SKILLS_ENGINE: ("synced/",)}     # ~/.agents/skills/synced: skills the Claude app syncs (regenerated)
 ADOPT_WARN = {".hermes": "Hermes keeps absolute paths to its home in its launcher and venv (bin/hermes, "
                          "pyvenv.cfg): it must be re-bootstrapped at the new home; rehearse on a copy first"}
 ENV_START, ENV_END = "# skeleton-base engines:start", "# skeleton-base engines:end"
@@ -9673,7 +9668,8 @@ def link_rows(base, home):
             rows.append(("ERROR", f"{e['from']}: the link is broken or points elsewhere ({os.readlink(src)}), not "
                                   f"into engines/{n} -> {fix_ln}"))
         elif src.is_dir():
-            how = fix_ln if n == SKILLS_ENGINE else \
+            how = (f"move what is new in it into {dest}, remove {e['from']}, then brain.py connect"
+                   if n == SKILLS_ENGINE else None) or \
                 f"quit the tool, mv {shq(str(src))} {shq(str(src) + '.new')} && {fix_ln}, then merge what it wrote"
             rows.append(("ERROR", f"{e['from']}: a real folder replaced the link into engines/{n} (the tool, or "
                                   f"something else, made a fresh one) -> {how}"))

@@ -54,6 +54,7 @@ graphify-out
 /engines/*/auth*
 /engines/*/*token*
 /engines/*/*secret*
+/engines/agents-skills/synced
 /engines/claude-desktop/vm_bundles
 /engines/claude-desktop/claude-code-vm
 /engines/claude-desktop/claude-code
