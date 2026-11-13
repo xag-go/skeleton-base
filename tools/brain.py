@@ -85,7 +85,13 @@ Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's g
                                move the secret files of engines/NAME (credentials, .claude.json, auth.json, .env,
                                tokens, keys, oauth; not sessions or caches) to the vault <vault>/NAME/<same path>
                                (engines.json "vault", default ~/.<base name>-secret, mode 700) and leave a symlink;
-                               modes kept; close the tool first; --undo moves them back
+                               modes kept; close the tool first; --undo moves them back; NAME may be the tool id
+                               (claude-code = engines/claude)
+  engine revault [NAME|--all] [--dry-run]
+                               a tool that rewrote its secret file (write-temp-then-rename, O_NOFOLLOW) put a real
+                               file back where the vault link was: copy the new bytes into the vault (temp, fsync,
+                               rename, mode 600) and put the link back in one rename (the path is never missing);
+                               a file that changes during the copy is left for the next run; watch runs it each pass
   vault add PATH [--undo] [--dry-run] | vault root [PATH] | vault list
                                the same for any secret file in the base (e.g. data/<app>/x.token); root shows or
                                sets the vault folder (only while the vault is empty)
@@ -6215,6 +6221,12 @@ def watch_once(base, commit=True, connect=True):
             out["mirror"] = mirrored
     except (SystemExit, Exception) as e:
         mirrored, out["error"] = [], f"mirror: {e}"
+    try:                                                  # a tool replaced a vault link with a real file: put it back
+        rv = revault(base)
+        if rv:
+            out["revault"] = "; ".join(rv)
+    except (SystemExit, Exception) as e:
+        out["error"] = f"revault: {e}"
     try:                                                  # sync all: scan new files for secrets (at most every 10 min)
         if engine_shares(base).get(SYNC_ALL) is not None:
             st = json.loads(read(base / SYNC_SCAN_STATE) or "{}")
@@ -7359,7 +7371,7 @@ VAULT_FILES = SYNC_ALL_DENY_FILES          # the product's secret file names (an
 VAULT_TOP = ENGINE_DENY_TOP                 # loose secret names, only at the top of a tool folder
 VAULT_SECRET_DIRS = ("vault", "pairing", "mcp-tokens")   # deny folders that hold logins: every file in them
 VAULT_NOT = ("*.example", "*.sample", "*.template", "*.dist", "*.pub", "*.lock", "*.tmp", "*.md", "*.vault-tmp",
-             "*.vault-link", "*.vault-back", "cacert.pem", "*.py", "*.pyc", "*.js", "*.mjs", "*.cjs", "*.ts", "*.tsx",
+             "*.vault-link", "*.vault-back", "*.vault-hold", "*.vault-old", "cacert.pem", "*.py", "*.pyc", "*.js", "*.mjs", "*.cjs", "*.ts", "*.tsx",
              "*.jsx", "*.go", "*.rs", "*.rb", "*.java", "*.sh", "*.html", "*.css")
              # templates, public keys and CA bundles, notes, source code named after secrets, our own temp names
 VAULT_SKIP_DIRS = tuple(x for x in ENGINE_DENY_DIRS if x not in VAULT_SECRET_DIRS) + (
@@ -7629,8 +7641,218 @@ def vault_files(base, files, tool, root, undo=False, dry=False, what="the tool")
     return log
 
 
+def engine_folder(base, name):
+    """engines/ folder name for NAME: the folder itself (claude, claude-worker) or a tool id as `engine adopt`
+    takes it (claude-code -> claude)."""
+    if name and "/" not in name and name not in (".", "..") and (pathlib.Path(base) / "engines" / name).is_dir():
+        return name
+    key = tool_key_of(name) if name else None
+    return ENGINE_NAMES.get(key, key.strip(".").replace("/", "-")) if key else name
+
+
+# -- revault: tools write their secret files with O_NOFOLLOW or write-temp-then-rename, so a token refresh puts a
+# REAL file (or folder) back where the vault link was. revault copies the new bytes into the vault and puts the link
+# back; the path is never missing (a file: one rename of a link over it; a folder: an atomic exchange).
+def _fsync_dir(d):
+    try:
+        fd = os.open(str(d), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _file_sig(p):
+    """(inode, size, mtime, sha256) of the real file P (lstat: a link is a different file)."""
+    st = os.lstat(p)
+    return (st.st_ino, st.st_size, st.st_mtime_ns, _file_sha(p) if stat.S_ISREG(st.st_mode) else "")
+
+
+def _revault_copy(src, tmp, mode=0o600):
+    """Copy the bytes of SRC (never through a link) into the NEW file TMP (mode MODE) and fsync it."""
+    fi = os.open(str(src), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        fo = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        try:
+            while True:
+                b = os.read(fi, 1 << 20)
+                if not b:
+                    break
+                while b:
+                    b = b[os.write(fo, b):]
+            os.fchmod(fo, mode)
+            os.fsync(fo)
+        finally:
+            os.close(fo)
+    finally:
+        os.close(fi)
+
+
+def _rename_exchange(a, b):
+    """Swap the paths A and B atomically (Linux renameat2 RENAME_EXCHANGE). False when the system cannot."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        f = libc.renameat2
+    except (OSError, AttributeError, ImportError):
+        return False
+    f.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    return f(-100, os.fsencode(str(a)), -100, os.fsencode(str(b)), 2) == 0     # AT_FDCWD, RENAME_EXCHANGE
+
+
+def _vault_dirs(dst):
+    for p in reversed([x for x in dst.parents if not x.exists()]):
+        p.mkdir(); os.chmod(p, 0o700)
+
+
+def _revault_file(src, dst):
+    """SRC is a real file again where the link to DST was: copy it to DST (temp in the vault folder, fsync, rename;
+    mode 600), then rename a new link over SRC. "changed" (nothing swapped) when SRC changed meanwhile."""
+    before = _file_sig(src)
+    _vault_dirs(dst)
+    tmp = dst.with_name(f".{dst.name}.vault-tmp")
+    try:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        _revault_copy(src, tmp)
+        if _file_sig(src) != before or _file_sha(tmp) != before[3]:
+            return "changed"
+        os.replace(tmp, dst)
+        _fsync_dir(dst.parent)
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+    link, hold = src.with_name(f".{src.name}.vault-link"), src.with_name(f".{src.name}.vault-hold")
+    for x in (link, hold):
+        if os.path.lexists(x):
+            os.unlink(x)
+    try:
+        os.symlink(str(dst), link)
+        try:
+            os.link(src, hold, follow_symlinks=False)  # keeps the inode: a write in the last instant is not lost
+        except OSError:
+            hold = None
+        if _file_sig(src) != before:
+            return "changed"
+        os.replace(link, src)                          # one rename: the path is a file, then the link
+        _fsync_dir(src.parent)
+        if hold is not None and _file_sha(hold) != before[3]:     # written in place during the swap: keep it
+            tmp2 = dst.with_name(f".{dst.name}.vault-tmp")
+            _revault_copy(hold, tmp2); os.replace(tmp2, dst); _fsync_dir(dst.parent)
+    finally:
+        for x in (link, hold):
+            if x is not None and os.path.lexists(x) and (x == hold or os.path.islink(x)):
+                os.unlink(x)
+    return "done"
+
+
+def _revault_dir(src, dst):
+    """SRC is a real folder again where the link to the vault folder DST was: merge it into DST (the base's files
+    win; files only in the vault stay), then swap SRC for a link in one atomic exchange."""
+    before = _tree_sig(src)
+    _vault_dirs(dst)
+    tmp = dst.with_name(f".{dst.name}.vault-tmp")
+    if os.path.lexists(tmp):
+        shutil.rmtree(tmp)
+    try:
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.copytree(dst, tmp, symlinks=True)
+        else:
+            tmp.mkdir()
+        for r_, _sha in before:
+            t = tmp / r_
+            t.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.lexists(t):
+                os.unlink(t)
+            if os.path.islink(src / r_):
+                os.symlink(os.readlink(src / r_), t)
+            else:
+                _revault_copy(src / r_, t)
+        os.chmod(tmp, 0o700)
+        if _tree_sig(src) != before or any(_sha and _file_sha(tmp / r_) != _sha for r_, _sha in before):
+            return "changed"
+        if dst.is_dir() and not dst.is_symlink() and _rename_exchange(tmp, dst):
+            pass                                        # tmp now holds the older vault copy: removed below
+        else:
+            if os.path.lexists(dst):
+                shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else os.unlink(dst)
+            os.replace(tmp, dst)
+        _fsync_dir(dst.parent)
+    finally:
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp)
+    link = src.with_name(f".{src.name}.vault-link")
+    if os.path.lexists(link):
+        shutil.rmtree(link) if link.is_dir() and not link.is_symlink() else os.unlink(link)
+    os.symlink(str(dst), link)
+    if _tree_sig(src) != before:
+        os.unlink(link)
+        return "changed"
+    if not _rename_exchange(link, src):                 # no renameat2: two renames (missing for an instant)
+        old = src.with_name(f".{src.name}.vault-old")
+        os.rename(src, old); os.replace(link, src); link = old
+    _fsync_dir(src.parent)
+    if _tree_sig(link) != before:                       # written during the swap: keep the newest bytes
+        for r_, _sha in _tree_sig(link):
+            if _sha:
+                (dst / r_).parent.mkdir(parents=True, exist_ok=True)
+                t = dst / f".{pathlib.Path(r_).name}.vault-tmp"
+                _revault_copy(link / r_, t); os.replace(t, dst / r_)
+    shutil.rmtree(link)
+    return "done"
+
+
+def revault(base, name=None, dry=False):
+    """For every vaulted path (the vault registry) that a tool replaced with a real file or folder: put the new
+    bytes in the vault and the link back. Cheap when nothing changed: one lstat per recorded path. NAME limits it to
+    one tool (engines/ folder name or tool id). Log lines never show contents."""
+    base = pathlib.Path(base).resolve()
+    entries = vault_entries(base)
+    tool = engine_folder(base, name) if name else None
+    log, changed = [], False
+    for rel, e in sorted(entries.items()):
+        if tool and e.get("tool") != tool and not rel.startswith(f"engines/{tool}/"):
+            continue
+        p, v = base / rel, e.get("vault")
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue                                      # missing: doctor reports the broken link
+        if stat.S_ISLNK(st.st_mode) or not isinstance(v, str) or not v:
+            continue
+        isdir, dst = e.get("kind") == "dir", pathlib.Path(v)
+        if not (stat.S_ISDIR(st.st_mode) if isdir else stat.S_ISREG(st.st_mode)):
+            log.append(f"skipped {rel}: it is not a {'folder' if isdir else 'file'} now (left as it is)")
+            continue
+        if in_dir(dst, base) or not dst.is_absolute():
+            log.append(f"skipped {rel}: its vault path {dst} is not outside the base")
+            continue
+        if dry:
+            log.append(f"would re-vault: {rel}{'/' if isdir else ''} -> {dst}")
+            continue
+        try:
+            r = _revault_dir(p, dst) if isdir else _revault_file(p, dst)
+        except OSError as x:
+            log.append(f"skipped {rel}: {x.strerror or x} (tried again on the next run)")
+            continue
+        if r == "changed":
+            log.append(f"skipped {rel}: it changed during the copy (tried again on the next run)")
+            continue
+        log.append(f"re-vaulted: {rel}{'/' if isdir else ''} -> {dst} (the tool had replaced its link)")
+        e["revaulted"] = today()
+        changed = True
+    if changed:
+        _vault_save(base, entries)
+    return log
+
+
 def engine_vault(base, name, undo=False, dry=False):
     base = pathlib.Path(base).resolve()
+    name = engine_folder(base, name)
     d = base / "engines" / name
     if not name or "/" in name or name in (".", "..") or not d.is_dir() or d.is_symlink():
         raise SystemExit(f"engine vault: engines/{name} is not a folder in the base")
@@ -7695,7 +7917,10 @@ def vault_rows(base):
                 continue                              # a mirror copies no secrets; not ours to vault
             fix = f"brain.py engine vault {parts[1]}" if top == "engines" and len(parts) > 2 else \
                 f"brain.py vault add {rel}"
-            again = " (the tool replaced its link: vault it again)" if rel in entries else ""
+            again = ""
+            if any("/".join(parts[:i]) in entries for i in range(len(parts), 1, -1)):     # it, or its vaulted folder
+                again = " (the tool replaced its link: re-vault it; watch does it on its next pass)"
+                fix = f"brain.py engine revault {parts[1]}" if top == "engines" else "brain.py engine revault --all"
             rows.append(("ERROR", f"secret file in the base, not in the vault: {rel}{again} -> {fix}"))
     ok = 0
     for rel, e in sorted(entries.items()):
@@ -8562,15 +8787,40 @@ def doctor_git(base):
     return out
 
 
+def adopt_guard(base, key, d, home):
+    """The default place D of an adopted tool, when it is the guard `engine adopt` left there (an empty file that
+    stops a launcher without the variable from making a fresh folder, or a link into engines/NAME): (row, engine
+    dir); else None. Asked only when the tool's variable is not set in this shell."""
+    if os.path.normpath(str(d)) != os.path.normpath(str(pathlib.Path(home) / key)):
+        return None
+    for n, e in sorted(reg_load(base, ENGINES_REG).get("engines", {}).items()):
+        if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("from") == f"~/{key}"):
+            continue
+        tool, env, eng = TOOLS.get(key, {}).get("name", key), e.get("env") or "its variable", base / "engines" / n
+        load = "load ~/.config/environment.d/60-base-engines.conf or start a login shell"
+        if d.is_symlink() and in_dir(d, eng):
+            return ("OK", f"{tool}: ~/{key} is the guard link into engines/{n} ({env} is not set in this shell; "
+                          f"the link keeps the tool in the base)"), str(eng)
+        if d.is_file() and not d.is_symlink():
+            return ("WARN", f"{tool}: ~/{key} is the guard file of engines/{n} ({env} is not set in this shell: "
+                            f"{load})"), str(eng)
+    return None
+
+
 def doctor(base, strict=False):
     base, home = pathlib.Path(base).resolve(), home_dir()
     rows = []                                          # (level, text)
     allow = set(ALLOWED_OUTSIDE) | {x.removeprefix("~/") for x in
                                     reg_load(base, ".brain/outside.json").get("allow", []) if isinstance(x, str)}
     mirrors = {os.path.normpath(str(s)) for _, s, _ in mirror_sources(base, home)}
+    guarded = set()                                    # engines/ dirs whose default place holds our guard
     for key, d, extra in tool_instances(home, base):
         name = TOOLS.get(key, {}).get("name", key)
         root, var = tool_root(key, home)
+        g = None if var or extra else adopt_guard(base, key, d, home)
+        if g:
+            guarded.add(os.path.realpath(g[1]))
+            rows.append(g[0]); continue
         if not d.exists():
             if extra:
                 rows.append(("WARN", f"{name}: registered dir {d} does not exist"))
@@ -8588,6 +8838,8 @@ def doctor(base, strict=False):
             rows.append(("WARN", f"{name}: {var} points to {home_rel(d, home)} but {home_rel(default, home)} exists "
                                  "too (split brain: a launcher without the variable made or kept it)"))
     for key, d, where in configured_dirs(home):
+        if os.path.realpath(d) in guarded:
+            continue                                   # the guard row above says to load the variable
         if not any(os.path.normpath(str(x)) == d for _, x, _ in tool_instances(home, base)):
             rows.append(("WARN", f"{TOOLS.get(key, {}).get('name', key)}: dir {home_rel(d, home)} configured in "
                                  f"{where} is not wired by connect (add it: connect --tool-dir "
@@ -8835,6 +9087,11 @@ def main(argv):
                 if len(rest) != 2:
                     print("usage: engine vault NAME [--undo] [--dry-run]"); return 1
                 log = engine_vault(base, rest[1], undo, dry)
+            elif sub == "revault":
+                if len(rest) > 2 or (len(rest) == 2 and "--all" in flags):
+                    print("usage: engine revault [NAME|--all] [--dry-run]"); return 1
+                log = revault(base, rest[1] if len(rest) == 2 else None, dry) or ["re-vault: every vaulted path is "
+                                                                                  "still a link: nothing to do"]
             elif sub == "adopt":
                 log = engine_adopt(base, rest[1], force)
             elif sub == "release":
@@ -8860,7 +9117,7 @@ def main(argv):
             elif sub == "list":
                 log = engine_list(base)
             else:
-                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine vault NAME [--undo] [--dry-run] | engine sync | engine list"); return 1
+                print("usage: engine adopt|release|mirror|unmirror TOOL | engine share NAME SUBDIR [--remove] | engine vault NAME [--undo] [--dry-run] | engine revault [NAME|--all] [--dry-run] | engine sync | engine list"); return 1
         else:
             if sub == "move" and "--undo" in flags:
                 log = projects_undo(base, rest[1] if len(rest) > 1 else None, force)

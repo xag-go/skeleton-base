@@ -4158,6 +4158,31 @@ class EverythingInBaseTests(ToolHome):
         r = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(cl)})
         self.assertNotIn("repo1", r.stdout)
 
+    def test_doctor_knows_adopt_guard_files(self):
+        self.write(self.home, ".codex/AGENTS.md", "x\n")
+        r = self.hb("engine", "adopt", "codex", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.write(self.home, ".claude/CLAUDE.md", "x\n")
+        r = self.hb("engine", "adopt", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        guard = self.home / ".codex"                    # the guard file: a launcher without CODEX_HOME cannot
+        guard.write_text(""); guard.chmod(0)           # make a fresh ~/.codex
+        self.addCleanup(lambda: guard.chmod(0o600))
+        os.symlink(self.eng / "claude", self.home / ".claude")                 # the guard link into the base
+        r = self.hb("doctor", "--strict", "--base", str(self.base))            # no CODEX_HOME / CLAUDE_CONFIG_DIR
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rows = r.stdout.splitlines()
+        self.assertFalse([x for x in rows if x.startswith("OUTSIDE") and "~/.codex" in x], r.stdout)
+        self.assertTrue([x for x in rows if x.startswith("WARN") and "guard file" in x and "CODEX_HOME" in x],
+                        r.stdout)
+        self.assertTrue([x for x in rows if x.startswith("OK") and "guard link" in x and "~/.claude" in x], r.stdout)
+        self.assertNotIn("not wired by connect", r.stdout)
+        self.assertNotIn("engine adopt", r.stdout)
+        env = {"CODEX_HOME": str(self.eng / "codex"), "CLAUDE_CONFIG_DIR": str(self.eng / "claude")}
+        r = self.hb("doctor", "--strict", "--base", str(self.base), env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("~/.codex", r.stdout)
+
     def test_watch_discover_lists_configured_dirs_not_wired(self):
         team = self.tmp / "teamdir2"
         team.mkdir()
@@ -4593,7 +4618,7 @@ class VaultTests(ToolHome):
         cred = self.base / "engines/w/.credentials.json"                         # the tool wrote a new file
         os.unlink(cred); cred.write_text("NEW\n")
         r = self.hb("doctor", "--base", str(self.base))
-        self.assertIn("engines/w/.credentials.json (the tool replaced its link: vault it again)", r.stdout)
+        self.assertIn("engines/w/.credentials.json (the tool replaced its link: re-vault it", r.stdout)
         self.write(self.base, "wiki/n.md", "x\n")
         subprocess.run(["git", "-C", str(self.base), "add", "-f", "wiki/n.md"], check=True)
         r = self.hb("vault", "add", "wiki/n.md", "--base", str(self.base))
@@ -4602,6 +4627,131 @@ class VaultTests(ToolHome):
             self.write(self.base, "raw/a.token", "x\n")
             (self.tmp / "outside.token").write_text("x\n")
             self.assertNotEqual(self.hb("vault", "add", bad, "--base", str(self.base)).returncode, 0, bad)
+
+    def tool_rewrite(self, rel, text):
+        """What Claude Code does on a token refresh: write a temp file, rename it over the path (the link goes)."""
+        p = self.base / rel
+        tmp = p.with_name(p.name + ".tool-tmp")
+        tmp.write_text(text); tmp.chmod(0o600)
+        os.replace(tmp, p)
+        return p
+
+    def test_revault_puts_the_link_back_with_the_new_content(self):
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        cred = self.tool_rewrite("engines/w/.credentials.json", "SECRET-VALUE refreshed\n")
+        bk = self.base / "engines/w/backups"                                   # a vaulted folder, replaced too
+        os.unlink(bk); bk.mkdir()
+        (bk / ".claude.json.backup.9").write_text("SECRET-VALUE b9\n")
+        self.assertFalse(cred.is_symlink())
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("secret file in the base, not in the vault: engines/w/.credentials.json (the tool replaced its "
+                      "link: re-vault it; watch does it on its next pass) -> brain.py engine revault w", r.stdout)
+        before = tree(self.base)
+        vbefore = tree(self.vault)
+        r = self.ok_env("engine", "revault", "w", "--dry-run", "--base", str(self.base))
+        self.assertIn("would re-vault: engines/w/.credentials.json ->", r.stdout)
+        self.assertIn("would re-vault: engines/w/backups/ ->", r.stdout)
+        self.assertEqual(tree(self.base), before)
+        self.assertEqual(tree(self.vault), vbefore)
+        self.assertFalse(cred.is_symlink())
+        r = self.ok_env("engine", "revault", "--all", "--base", str(self.base))
+        self.assertIn("re-vaulted: engines/w/.credentials.json", r.stdout)
+        self.assertNotIn("SECRET-VALUE", r.stdout + r.stderr)
+        v = self.vault / "w/.credentials.json"
+        self.assertTrue(cred.is_symlink())
+        self.assertEqual(os.readlink(cred), str(v))
+        self.assertEqual(v.read_text(), "SECRET-VALUE refreshed\n")
+        self.assertEqual(stat_mode(v), 0o600)
+        self.assertTrue(bk.is_symlink())
+        self.assertEqual((self.vault / "w/backups/.claude.json.backup.9").read_text(), "SECRET-VALUE b9\n")
+        self.assertFalse([n for n in os.listdir(self.base / "engines/w") if ".vault-" in n or ".tool-tmp" in n])
+        self.assertFalse([n for n in os.listdir(self.vault / "w") if ".vault-" in n])
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("not in the vault", r.stdout)
+        r = self.ok_env("engine", "revault", "--base", str(self.base))      # nothing left: says so
+        self.assertIn("nothing to do", r.stdout)
+
+    def test_revault_never_leaves_the_path_missing(self):
+        import threading
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        rel, drel = "engines/w/.credentials.json", "engines/w/backups"
+        p, d = self.base / rel, self.base / drel
+        stop, misses, reads, phase = threading.Event(), [], [0], [0]     # phase odd: revault is running
+
+        def reader():
+            while not stop.is_set():
+                for x, f in ((p, lambda: p.read_text()), (d, lambda: os.listdir(d))):
+                    g = phase[0]
+                    try:
+                        f(); reads[0] += 1
+                    except FileNotFoundError:             # the fake tool's own unlink + mkdir is not revault's gap
+                        if g % 2 and phase[0] == g:
+                            misses.append(x.name)
+        th = threading.Thread(target=reader)
+        th.start()
+        try:
+            for i in range(60):
+                self.tool_rewrite(rel, f"SECRET-VALUE {i}\n")
+                os.unlink(d); d.mkdir(); (d / f"b{i}").write_text("x\n")
+                phase[0] += 1
+                log = B.revault(self.base, "w")
+                phase[0] += 1
+                self.assertIn(f"re-vaulted: {rel}", "\n".join(log))
+                self.assertTrue(p.is_symlink() and d.is_symlink())
+        finally:
+            stop.set(); th.join()
+        self.assertGreater(reads[0], 100)
+        self.assertEqual(misses, [])
+        self.assertEqual((self.vault / "w/.credentials.json").read_text(), "SECRET-VALUE 59\n")
+
+    def test_revault_skips_a_file_that_changes_during_the_copy(self):
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        rel = "engines/w/.credentials.json"
+        p = self.tool_rewrite(rel, "SECRET-VALUE new\n")
+        real = B._revault_copy
+
+        def busy_tool(src, tmp, mode=0o600):          # the tool writes again while revault copies
+            real(src, tmp, mode)
+            if pathlib.Path(src) == p:
+                with open(p, "a") as fh:
+                    fh.write("more\n")
+        B._revault_copy = busy_tool
+        try:
+            log = B.revault(self.base)
+        finally:
+            B._revault_copy = real
+        self.assertIn(f"skipped {rel}: it changed during the copy (tried again on the next run)", log)
+        self.assertFalse(p.is_symlink())
+        self.assertEqual((self.vault / "w/.credentials.json").read_text(), f"SECRET-VALUE {rel}\n")   # old copy
+        self.assertFalse([n for n in os.listdir(self.vault / "w") if ".vault-" in n])
+        self.assertIn(f"re-vaulted: {rel} ->", "\n".join(B.revault(self.base)))       # the next run does it
+        self.assertEqual((self.vault / "w/.credentials.json").read_text(), "SECRET-VALUE new\nmore\n")
+
+    def test_watch_pass_revaults(self):
+        self.ok_env("engine", "vault", "w", "--base", str(self.base))
+        p = self.tool_rewrite("engines/w/.credentials.json", "SECRET-VALUE w\n")
+        r = self.ok_env("watch", "--once", "--no-commit", "--no-connect", "--base", str(self.base))
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertIn("re-vaulted: engines/w/.credentials.json", out.get("revault", ""))
+        self.assertNotIn("SECRET-VALUE", r.stdout)
+        self.assertTrue(p.is_symlink())
+        self.assertEqual((self.vault / "w/.credentials.json").read_text(), "SECRET-VALUE w\n")
+        r = self.ok_env("watch", "--once", "--no-commit", "--no-connect", "--base", str(self.base))
+        self.assertNotIn("revault", json.loads(r.stdout.strip().splitlines()[-1]))      # nothing to do: no line
+
+    def test_engine_vault_takes_the_tool_id(self):
+        self.write(self.base, "engines/claude/.credentials.json", "SECRET-VALUE c\n")
+        r = self.ok_env("engine", "vault", "claude-code", "--dry-run", "--base", str(self.base))
+        self.assertIn("would vault: engines/claude/.credentials.json", r.stdout)
+        self.ok_env("engine", "vault", "claude-code", "--base", str(self.base))
+        p = self.base / "engines/claude/.credentials.json"
+        self.assertEqual(os.readlink(p), str(self.vault / "claude/.credentials.json"))
+        self.tool_rewrite("engines/claude/.credentials.json", "SECRET-VALUE c2\n")
+        r = self.ok_env("engine", "revault", "claude-code", "--base", str(self.base))
+        self.assertIn("re-vaulted: engines/claude/.credentials.json", r.stdout)
+        self.assertNotIn("engines/w/", r.stdout)
+        self.assertTrue(p.is_symlink())
 
     def test_doctor_names_folders_outside_on_purpose(self):
         (self.home / B.BACKUPS_DIR).mkdir()

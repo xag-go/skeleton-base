@@ -480,6 +480,9 @@ engines.json  projects.json                 what is where (tracked)
   leaves a symlink, so the tool keeps working. Close the tool first; `--dry-run` shows the list, `--undo` brings them
   back. `brain.py vault add data/<app>/x.token` does the same for any other secret file. `doctor` reports a secret
   file still in `engines/` or `data/` as an ERROR and keeps `wiki/secrets.md` (where each one is, never contents).
+  A tool that rewrites its login (write a temp file, rename it over the link) puts a real file back in the base:
+  `brain.py engine revault [NAME|--all]` moves the new bytes into the vault and puts the link back (the path is never
+  missing), and `watch` does it on every pass. NAME is the folder (`claude`) or the tool id (`claude-code`).
 - **Tools without such a setting** (Gemini CLI, Qwen, Kilo, Goose, Cursor, desktop apps, ...): `engine mirror TOOL`
   keeps a read-only copy of their rules, agents, skills, memories and hooks in `engines/<tool>/` (a `MIRROR` file
   says so; keys, logins and sessions are never copied; text that looks like a key is left out and listed in

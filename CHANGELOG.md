@@ -8,6 +8,23 @@ Changes to the skeleton structure and tools (not to anyone's content).
   system prompt or SOUL.md that names a role, a project ROLE.md). For "who are you?" the tool reads `agents/*.md`
   and answers with the ONE role that lists it. Found by the real matrix: Codex answered "I'm Codex" while
   `agents/engineer.md` listed `codex`. Regression test `test_tool_product_identity_is_not_a_role`.
+- **`engine revault [NAME|--all] [--dry-run]`**: tools write their secret files with O_NOFOLLOW or
+  write-temp-then-rename, so a token refresh replaced the vault link (`engines/claude/.credentials.json`,
+  `.claude.json`) with a real file in the base: the vault copy went stale and doctor reported an ERROR. revault
+  copies the new bytes of every recorded vault path that is a real file again into the vault (temp file in the vault
+  folder, fsync, rename, mode 600) and puts the link back in ONE rename (a link made at a temp name, then renamed
+  over the path), so the path is never missing; a vaulted folder that came back as a real folder is merged into the
+  vault and swapped for its link in one atomic exchange. A file that changes during the copy (size, mtime, inode or
+  sha256 differ) is left as it is and tried again on the next run. Contents are never printed.
+- `watch` runs revault on every pass (one lstat per recorded path when nothing changed) and logs one line
+  (`"revault"` in the run record) when it re-vaults.
+- `doctor`: the ERROR for a tool that replaced its link stays while the file is real, and now points to
+  `brain.py engine revault NAME`. It also knows the guards `engine adopt` leaves at a tool's old place: with the
+  tool's variable missing in this shell (e.g. `env -i`), an empty guard FILE at `~/.codex` or `~/.hermes` is a WARN
+  that names the variable and how to load it (no OUTSIDE row, no `engine adopt` hint), and `~/.claude` as a link
+  into `engines/claude` is OK; the dirs set in the environment files are no longer reported as "not wired".
+  Test `test_doctor_knows_adopt_guard_files`.
+- `engine vault` (and `engine revault`) take the tool id as well as the folder name (`claude-code` = `engines/claude`).
 
 ## v1.6.2 - 2026-11-13
 - **`engine vault NAME [--undo] [--dry-run]`**: the secret files of `engines/NAME` (the same secret names the
