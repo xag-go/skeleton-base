@@ -4647,6 +4647,8 @@ class VaultTests(ToolHome):
         self.assertEqual(r.returncode, 2)
         self.assertIn("secret file in the base, not in the vault: engines/w/.credentials.json (the tool replaced its "
                       "link: re-vault it; watch does it on its next pass) -> brain.py engine revault w", r.stdout)
+        own = self.vault / "w/oauth-token"                                     # the owner's own file in the vault
+        own.write_text("SECRET-VALUE mine\n"); own.chmod(0o600)
         before = tree(self.base)
         vbefore = tree(self.vault)
         r = self.ok_env("engine", "revault", "w", "--dry-run", "--base", str(self.base))
@@ -4669,6 +4671,10 @@ class VaultTests(ToolHome):
         self.assertFalse([n for n in os.listdir(self.vault / "w") if ".vault-" in n])
         r = self.hb("doctor", "--base", str(self.base))
         self.assertNotIn("not in the vault", r.stdout)
+        self.assertEqual(own.read_text(), "SECRET-VALUE mine\n")             # never touches what it does not own
+        self.assertEqual(sorted(x.name for x in (self.vault / "w").iterdir()),
+                         sorted([".claude.json", ".credentials.json", "api_token.txt", "backups", "mcp-tokens",
+                                 "oauth-token", "team"]))
         r = self.ok_env("engine", "revault", "--base", str(self.base))      # nothing left: says so
         self.assertIn("nothing to do", r.stdout)
 
