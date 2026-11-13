@@ -50,13 +50,22 @@ fake_bin(_FRUGAL_BIN.name, "claude", "codex", "gemini")
 FRUGAL_PATH = os.pathsep.join([_FRUGAL_BIN.name, os.path.dirname(sys.executable), "/usr/bin", "/bin"])
 
 
-def run(*args, cwd=None, env=None, inp=None):
+REAL_TOOL_VARS = ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
+                  "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR",
+                  "COPILOT_HOME", "GEMINI_CLI_HOME")
+
+
+def test_env(**over):
+    """The environment every child process gets: never the real user's kits or tools."""
     e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=_ISOLATED_HOME.name, PATH=TEST_PATH)
-    for v in ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
-              "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR",
-              "COPILOT_HOME", "GEMINI_CLI_HOME"):   # never the real user's kits or tools
+    for v in REAL_TOOL_VARS:
         e.pop(v, None)
-    e.update(env or {})
+    e.update(over)
+    return e
+
+
+def run(*args, cwd=None, env=None, inp=None):
+    e = test_env(**(env or {}))
     return subprocess.run([sys.executable, *map(str, args)], capture_output=True, text=True, cwd=cwd, env=e,
                           input=inp)
 
@@ -1115,8 +1124,7 @@ def proc_status(pid):
 class WatchBase(HomeBase):
     def start(self, *extra):
         self.log = self.tmp / "watch.log"
-        e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home))
-        e.pop("BRAIN_ROOT", None)
+        e = test_env(HOME=str(self.home), PATH=os.environ["PATH"])
         w = subprocess.Popen([sys.executable, str(self.base / "tools" / "brain.py"), "watch", "--base", str(self.base),
                               "--quiet-s", QUIET, "--max-s", "2", "--log", str(self.log), *extra],
                              env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1339,12 +1347,12 @@ class ZeroTouchTests(WatchBase):
         self.assertIn("SessionEnd", s["hooks"])
         # the hook really pokes the watcher: memory path in -> kick written; other path -> nothing, exit 0
         p = subprocess.run(["sh", "-c", kick], input='{"tool_input": {"file_path": "/x/memory/a.md"}}',
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=test_env(HOME=str(self.home)))
         self.assertEqual(p.returncode, 0)
         self.assertTrue((self.base / ".brain/kick").is_file())
         (self.base / ".brain/kick").unlink()
         p = subprocess.run(["sh", "-c", kick], input='{"tool_input": {"file_path": "/x/src/a.py"}}',
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=test_env(HOME=str(self.home)))
         self.assertEqual(p.returncode, 0)
         self.assertFalse((self.base / ".brain/kick").exists())
         snap = tree(self.home)
@@ -2460,7 +2468,7 @@ class SpacePathTests(Base):
         s = json.loads((self.home / ".claude/settings.json").read_text())
         collect = s["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
         kick = s["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-        e = dict(os.environ, HOME=str(self.home), BRAIN_TODAY="2026-11-11")
+        e = test_env(HOME=str(self.home), PATH=os.environ["PATH"])
         r = subprocess.run(["sh", "-c", collect], capture_output=True, text=True, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue((self.base / ".brain/collector.json").is_file(), "the hook's collect ran in the base")
@@ -2929,7 +2937,7 @@ class HookTwiceTests(ToolHome):
         payloads = ('{"hook_event_name": "SessionEnd", "session_id": "c1"}',
                     '{"hook_event_name": "sessionEnd", "cursor_version": "3.2", "conversation_id": "x"}',
                     '{"hookEventName": "SessionEnd", "devin": true}', "", "not json at all")
-        env = dict(os.environ, HOME=str(self.home), PATH=self.path())
+        env = test_env(HOME=str(self.home), PATH=self.path())
         procs = [subprocess.Popen(["sh", "-c", collect], cwd=self.home / ".cursor", stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
                  for _ in payloads]
@@ -2950,7 +2958,7 @@ class HookTwiceTests(ToolHome):
 
 class McpSession:
     def __init__(self, base, *extra, home=None):
-        env = dict(os.environ, HOME=str(home or _ISOLATED_HOME.name), PATH=TEST_PATH)
+        env = test_env(HOME=str(home or _ISOLATED_HOME.name))
         self.p = subprocess.Popen([sys.executable, str(base / "tools/brain.py"), "mcp", "--base", str(base), *extra],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.n = 0
@@ -4429,7 +4437,7 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         self.git(self.base, "add", "-A")
         r = subprocess.run(["git", "-C", str(self.base), "-c", "user.name=T", "-c", "user.email=t@example.invalid",
                             "commit", "-qm", "leak"], capture_output=True, text=True,
-                           env=dict(os.environ, PATH=TEST_PATH, HOME=str(self.home)))
+                           env=test_env(HOME=str(self.home)))
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("wiki/leak.md: content looks like a key", r.stderr)
         self.assertIn("engines/claude/settings.json: content looks like a key", r.stderr)
