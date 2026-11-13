@@ -1689,7 +1689,9 @@ class UninstallKeepsDataTests(HomeBase):
         self.ok("disconnect")
         t2 = full_tree(b)
         diff = sorted(k for k in set(t1) | set(t2) if t1.get(k) != t2.get(k))
-        self.assertEqual(diff, [".kits.json"])                                # only its own record
+        own = [k for k in diff if k == "engines.json" or k.startswith("engines/agents-skills")]
+        self.assertTrue(own and all(k not in t2 for k in own), own)          # connect's skills folder goes with it
+        self.assertEqual([k for k in diff if k not in own], [".kits.json"])  # else only its own record
         self.assertEqual(git(b, "rev-list", "--count", "HEAD").strip(), "3")
 
 
@@ -2593,6 +2595,7 @@ ALL_FILES = {     # each tool's own (fake) user config before connect: comments 
     ".config/zed/settings.json": '// zed\n{\n  "theme": "One Dark", // keep\n}\n',
     ".junie/allowlist.json": '{\n  "defaultBehavior": "ask", // mine\n  "rules": {}\n}\n',
     ".config/Claude/claude_desktop_config.json": '{"mcpServers": {"fs": {"command": "npx"}}}',
+    ".config/Claude/Local State": '{"os_crypt": {}}',                     # the app's own file: proof it is installed
 }
 ALL_RULES = (".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md", ".qwen/QWEN.md",
              ".config/opencode/AGENTS.md", ".grok/rules/skeleton-base.md",
@@ -5156,3 +5159,263 @@ class BaseFirstTests(ToolHome):
         self.ok("watch", "--once", "--no-commit")
         self.assertTrue((self.base / "engines/claude/settings.json").is_file(), "adopted, not mirrored")
         self.assertNotIn("claude", [k for k, v in self.registry().items() if v.get("mode") == "mirror"])
+
+
+def ltree(d):
+    """{rel: sha | 'dir' | 'link:<target>'} without following links (a dangling Electron lock is a link)."""
+    d, out = pathlib.Path(d), {}
+    for dp, dns, fns in os.walk(d):
+        for n in sorted(dns + fns):
+            p = pathlib.Path(dp) / n
+            r = p.relative_to(d).as_posix()
+            if p.is_symlink():
+                out[r] = "link:" + os.readlink(p)
+            elif p.is_dir():
+                out[r] = "dir"
+            else:
+                out[r] = hashlib.sha256(p.read_bytes()).hexdigest() + oct(p.stat().st_mode & 0o777)
+    return out
+
+
+def dead_pid():
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+class AdoptByLinkTests(ToolHome):
+    """engine adopt for a tool with no setting that moves its folder: the folder moves into engines/<name> and a
+    symlink stays at the old place; secrets go to the vault, heavy folders stay out of git and Syncthing (fake HOME)."""
+
+    APP = ".config/Claude"
+    SECRETS = ("Cookies", "Cookies-journal", "buddy-tokens.json", "ant-did", "ant-device-registry.json",
+               "Trust Tokens", "Trust Tokens-journal", "claude_desktop_config.json", "config.json")
+    SECRET_DIRS = ("Local Storage", "Session Storage", "IndexedDB")
+    HEAVY = ("vm_bundles", "claude-code-vm", "claude-code", "Cache", "Code Cache", "GPUCache", "DawnGraphiteCache",
+             "DawnWebGPUCache", "Crashpad", "logs", "sentry", "blob_storage", "Shared Dictionary")
+
+    def setUp(self):
+        super().setUp()
+        self.eng = self.base / "engines"
+        self.vault = self.home / ".base-secret"
+
+    def app(self, home=None, lock=None):
+        """A small ~/.config/Claude that looks like the real Claude desktop app."""
+        a = pathlib.Path(home or self.home) / self.APP
+        for f in self.SECRETS:
+            self.write(a, f, f"SECRET-VALUE {f}\n").chmod(0o600)
+        self.write(a, "config.json", '{"locale": "en-US", "oauth:tokenCache": "SECRET-VALUE"}\n').chmod(0o600)
+        self.write(a, "Local State", '{"os_crypt": {}}\n')
+        self.write(a, "Preferences", "{}\n")
+        self.write(a, "window-state.json", "{}\n")
+        self.write(a, "fcache", "x\n")
+        for d in self.SECRET_DIRS:
+            self.write(a, f"{d}/leveldb/000003.log", f"SECRET-VALUE {d}\n")
+        for d in self.HEAVY:
+            self.write(a, f"{d}/blob.bin", "heavy\n")
+        os.symlink(lock or f"{os.uname().nodename}-{dead_pid()}", a / "SingletonLock")
+        os.symlink("/tmp/scoped_dir-nothing/SingletonSocket", a / "SingletonSocket")
+        return a
+
+    def reg(self):
+        p = self.base / "engines.json"
+        return json.loads(p.read_text()).get("engines", {}) if p.is_file() else {}
+
+    def adopt(self, *extra):
+        return self.hb("engine", "adopt", "claude-desktop", "--base", str(self.base), *extra)
+
+    def test_claude_desktop_adopt_vault_heavy_doctor_and_undo(self):
+        a = self.app()
+        before = ltree(a)
+        self.write(self.eng, "Claude/MIRROR", "MIRROR: old copy\n")             # today's mirror of the app
+        self.write(self.eng, "Claude/Preferences", "{}\n")
+        (self.base / "engines.json").write_text(json.dumps(
+            {"engines": {"Claude": {"mode": "mirror", "src": "~/.config/Claude", "since": "2026-11-12"}}}))
+        r = self.adopt()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.eng / "claude-desktop"
+        self.assertTrue(a.is_symlink(), "a link stays at the old place")
+        self.assertEqual(os.path.realpath(a), str(dest.resolve()))
+        self.assertEqual((a / "Local State").read_text(), '{"os_crypt": {}}\n', "readable through the link")
+        e = self.reg()["claude-desktop"]
+        self.assertEqual((e["mode"], e.get("link"), e["from"]), ("adopted", True, "~/.config/Claude"))
+        self.assertNotIn("Claude", self.reg(), "the mirror's registry entry goes")
+        self.assertFalse((self.eng / "Claude").exists(), "the mirror folder goes")
+        for f in self.SECRETS + self.SECRET_DIRS:                              # F3: secrets are links into the vault
+            self.assertTrue((dest / f).is_symlink(), f)
+            self.assertTrue(in_dir_of(os.readlink(dest / f), self.vault / "claude-desktop"), f)
+        self.assertEqual((a / "Cookies").read_text(), "SECRET-VALUE Cookies\n")
+        self.assertEqual((a / "Local Storage/leveldb/000003.log").read_text(), "SECRET-VALUE Local Storage\n")
+        for d in self.HEAVY:                                                   # heavy: never walked into the vault
+            self.assertFalse((dest / d).is_symlink(), d)
+        self.assertFalse((dest / "Local State").is_symlink())
+        moves = json.loads((self.base / ".brain/moves.json").read_text())["moves"]
+        self.assertEqual(moves[-1]["kind"], "engine")
+        gi, st = (self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()
+        for d in self.HEAVY:                                                   # F4: out of git and Syncthing
+            self.assertIn(f"/engines/claude-desktop/{d}/", gi)
+            self.assertIn(f"/engines/claude-desktop/{d}\n", st)
+        pats = [l.strip() for l in B.stignore_layout({B.SYNC_ALL: ["all"]}).splitlines()
+                if l.strip() and not l.startswith("//")]
+        self.assertFalse(B.syncthing_allows(pats, "engines/claude-desktop/vm_bundles/blob.bin"), "not even sync all")
+        self.assertFalse(B.syncthing_allows(pats, "engines/claude-desktop/Code Cache/blob.bin"))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"ERROR.*(claude-desktop|Claude app)")
+        r = self.hb("vault", "list", "--base", str(self.base))
+        self.assertIn("engines/claude-desktop/Cookies", r.stdout)
+        # F7: the link replaced by a real folder (the app made a fresh one) is an ERROR with the fix
+        os.unlink(a)
+        a.mkdir()
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"ERROR.*~/\.config/Claude.*real folder.*ln -s")
+        a.rmdir()
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"ERROR.*~/\.config/Claude.*(missing|broken).*ln -s")
+        os.symlink(str(dest), a)
+        # undo: the folder comes back exactly, the vault gives the secrets back
+        r = self.adopt("--undo")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(a.is_symlink())
+        self.assertEqual(ltree(a), before)
+        self.assertFalse(dest.exists())
+        self.assertNotIn("claude-desktop", self.reg())
+        self.assertFalse(any(p.is_file() for p in self.vault.rglob("*")) if self.vault.exists() else False)
+
+    def test_refuses_while_the_app_runs(self):
+        p = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        a = self.app(lock=f"{os.uname().nodename}-{p.pid}")
+        before = ltree(a)
+        for extra in ((), ("--force",)):
+            r = self.adopt(*extra)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("running", r.stdout + r.stderr)
+        self.assertFalse(a.is_symlink())
+        self.assertEqual(ltree(a), before)
+        self.assertFalse((self.eng / "claude-desktop").exists())
+
+    def test_refuses_target_exists_and_a_link_already_in_the_base(self):
+        a = self.app()
+        self.write(self.eng, "claude-desktop/x", "x\n")
+        r = self.adopt()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("exists", r.stdout + r.stderr)
+        self.assertFalse(a.is_symlink())
+        shutil.rmtree(self.eng / "claude-desktop")
+        self.assertEqual(self.adopt().returncode, 0)
+        r = self.adopt()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already a link into the base", r.stdout + r.stderr)
+
+    def test_a_failed_check_undoes_the_move(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads every file")
+        a = self.app()
+        (a / "Preferences").chmod(0)
+        self.addCleanup(lambda: [x.chmod(0o600) for x in (a / "Preferences", self.eng / "claude-desktop/Preferences")
+                                 if os.path.lexists(x) and not x.is_symlink()])
+        r = self.adopt()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("undone", r.stdout + r.stderr)
+        self.assertTrue(a.is_dir() and not a.is_symlink())
+        self.assertFalse(os.path.lexists(self.eng / "claude-desktop"))
+        self.assertNotIn("claude-desktop", self.reg())
+
+    def test_refuses_a_copy_to_another_filesystem(self):
+        shm = pathlib.Path("/dev/shm")
+        if not shm.is_dir() or os.stat(shm).st_dev == os.stat(self.base).st_dev:
+            self.skipTest("no second filesystem")
+        h = pathlib.Path(tempfile.mkdtemp(prefix="skb-xfs-", dir=shm))
+        self.addCleanup(shutil.rmtree, h, True)
+        a = self.app(home=h)
+        before = ltree(a)
+        r = self.hb("engine", "adopt", "claude-desktop", "--base", str(self.base), env={"HOME": str(h)})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stdout + r.stderr, r"different filesystem.*needs .*B")
+        self.assertEqual(ltree(a), before)
+        self.assertFalse(os.path.lexists(self.eng / "claude-desktop"))
+
+    def test_the_claude_app_row_proves_an_install_by_its_own_files(self):
+        t = B.TOOLS[".config/Claude"]
+        self.assertEqual((t["status"], t["bins"]), ("app", ()))
+        self.assertIn(".config/Claude/Local State", t["marks"])
+        self.assertIn(".config/Claude/config.json", t["marks"])
+        self.assertIn("SingletonLock", t["locks"])
+
+
+def in_dir_of(p, d):
+    p, d = os.path.realpath(str(p)), os.path.realpath(str(d))
+    return p == d or p.startswith(d + "/")
+
+
+class SkillsLinkTests(ToolHome):
+    """connect writes the base's skills into engines/agents-skills and ~/.agents/skills is a link to it (F6)."""
+
+    def setUp(self):
+        super().setUp()
+        self.bins("codex")
+        self.write(self.home, ".codex/config.toml", 'model = "x"\n')
+        self.link, self.dest = self.home / ".agents/skills", self.base / "engines/agents-skills"
+
+    def reg(self):
+        p = self.base / "engines.json"
+        return json.loads(p.read_text()).get("engines", {}) if p.is_file() else {}
+
+    def test_connect_links_skills_into_the_base_and_disconnect_removes_it(self):
+        home0 = ltree(self.home)
+        self.ok("connect")
+        self.assertTrue(self.link.is_symlink())
+        self.assertEqual(os.path.realpath(self.link), str(self.dest.resolve()))
+        self.assertTrue((self.dest / "base-home/SKILL.md").is_file())
+        self.assertIn(str(self.base), (self.link / "base-home/SKILL.md").read_text())
+        e = self.reg()["agents-skills"]
+        self.assertEqual((e["mode"], e.get("link"), e["from"]), ("adopted", True, "~/.agents/skills"))
+        self.ok("connect")                                                     # twice: same result
+        self.assertTrue(self.link.is_symlink())
+        self.ok("watch", "--once", "--no-commit")                              # never mirrored back (no circle)
+        self.assertFalse((self.dest / "MIRROR").exists())
+        self.assertEqual(self.reg()["agents-skills"]["mode"], "adopted")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"ERROR.*agents/skills")
+        self.ok("disconnect")
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertFalse(self.dest.exists())
+        self.assertNotIn("agents-skills", self.reg())
+        after = {k: v for k, v in ltree(self.home).items()}
+        self.assertEqual({k for k in after if k.startswith(".agents")}, {k for k in home0 if k.startswith(".agents")})
+
+    def test_an_old_folder_with_only_connects_copies_becomes_the_link(self):
+        self.ok("connect")
+        os.unlink(self.link)                                                   # how older versions left it
+        os.rename(self.dest, self.link)
+        k = json.loads((self.base / ".kits.json").read_text())
+        k["kits"]["base-folder"]["connect"].pop("skills_link", None)
+        (self.base / ".kits.json").write_text(json.dumps(k))
+        (self.base / "engines.json").unlink()
+        self.write(self.base, "engines/agents-skills/MIRROR", "MIRROR: old copy\n")  # and watch's mirror of it
+        (self.base / "engines.json").write_text(json.dumps(
+            {"engines": {"agents-skills": {"mode": "mirror", "src": "~/.agents/skills", "since": "2026-11-12"}}}))
+        self.ok("connect")
+        self.assertTrue(self.link.is_symlink())
+        self.assertTrue((self.dest / "base-home/SKILL.md").is_file())
+        self.assertFalse((self.dest / "MIRROR").exists())
+        self.assertEqual(self.reg()["agents-skills"]["mode"], "adopted")
+        self.ok("disconnect")
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_a_folder_with_other_files_is_reported_and_left(self):
+        self.write(self.home, ".agents/skills/mine/SKILL.md", "---\nname: mine\n---\nmine\n")
+        r = self.ok("connect")
+        self.assertFalse(self.link.is_symlink())
+        self.assertIn("~/.agents/skills", r.stdout)
+        self.assertIn("mine/SKILL.md", r.stdout)
+        self.assertTrue((self.link / "base-home/SKILL.md").is_file(), "the copies are still written there")
+        self.assertTrue((self.link / "mine/SKILL.md").is_file())
+        self.assertNotIn("agents-skills", self.reg())
+
+    def test_doctor_errors_when_the_skills_link_is_replaced(self):
+        self.ok("connect")
+        os.unlink(self.link)
+        self.link.mkdir()
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"ERROR.*~/\.agents/skills.*real folder.*brain\.py connect")

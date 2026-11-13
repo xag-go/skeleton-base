@@ -471,6 +471,12 @@ engines.json  projects.json                 what is where (tracked)
   `~/.bashrc`. It refuses while a program uses the folder. `engine release TOOL` is the exact reverse (your shell
   files come back byte for byte). A broken symlink would silently start a tool logged out with an empty folder; a
   missing variable is caught by `doctor` (the old folder came back: "split brain").
+- **No setting: adopt by a link.** The Claude desktop app has no setting that moves `~/.config/Claude`:
+  `brain.py engine adopt claude-desktop` (app quit) moves it to `engines/claude-desktop/` and leaves a symlink at the
+  old place, checked before it counts (else undone); its logins go to the vault and its caches and app-managed
+  binaries never reach git or Syncthing. `engine adopt --undo claude-desktop` puts it back. `connect` keeps
+  `~/.agents/skills` as a link to `engines/agents-skills/` the same way. `doctor` reports a broken or replaced link
+  as an ERROR with the fix.
 - **Share one more sub-folder** of a tool folder (say a worker's built team in `engines/claude-worker/team`):
   `brain.py engine share claude-worker team` (`--remove` undoes it). The secret rules still win inside it; names
   like `auth`, `token`, `sessions` or `.git` are refused.

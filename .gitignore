@@ -129,4 +129,18 @@ graphify-out/
 /engines/*/auth*
 /engines/*/*token*
 /engines/*/*secret*
+/engines/claude-desktop/vm_bundles/
+/engines/claude-desktop/claude-code-vm/
+/engines/claude-desktop/claude-code/
+/engines/claude-desktop/Cache/
+/engines/claude-desktop/Code Cache/
+/engines/claude-desktop/GPUCache/
+/engines/claude-desktop/DawnGraphiteCache/
+/engines/claude-desktop/DawnWebGPUCache/
+/engines/claude-desktop/Crashpad/
+/engines/claude-desktop/logs/
+/engines/claude-desktop/sentry/
+/engines/claude-desktop/blob_storage/
+/engines/claude-desktop/fcache
+/engines/claude-desktop/Shared Dictionary/
 # base-folder:end

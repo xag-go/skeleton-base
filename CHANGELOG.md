@@ -24,9 +24,32 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - **Auto-connect adopts**: a tool that becomes installed and has a setting is moved into `engines/<tool>` by the watch
   cycle (existing installs are not moved: the first run only records what is installed; `watch.json` `seen_tools`).
   If adopt cannot run safely, it is reported and left where it is.
-- Not in this release: `~/.agents/skills` as a symlink to the base's skills (the installed copies carry generated text
-  that `skills/` does not hold); `engine adopt` for tools without a setting (`~/.config/Claude`). Tests:
-  `BaseFirstTests`, and the older fixtures that used a bare folder as proof now write the tool's own file.
+- Tests: `BaseFirstTests`, and the older fixtures that used a bare folder as proof now write the tool's own file.
+- **Adopt by symlink** (`engine adopt <tool>` for a tool with no setting that moves its folder): the folder moves
+  into `engines/<name>` (one rename), a symlink is left at the old place, then checked (it resolves, files are
+  readable); any failure undoes it all. It refuses while the tool runs (the lock/pid files its TOOLS row names,
+  e.g. Electron's `SingletonLock` `<host>-<pid>` with that pid alive; `--force` does not skip this), when the target
+  exists, when the source is already a link into the base, and across filesystems (it says how much space a copy
+  would need and copies nothing). `engine adopt --undo <tool>` is the exact reverse (secrets back from the vault
+  first). engines.json records it (`mode: adopted`, `link: true`); `.brain/moves.json` logs it (`kind: engine`;
+  `projects move --undo` skips those).
+- The adopted folder **replaces its mirror**: the mirror folder and its engines.json entry go.
+- **Secrets to the vault**: the same `engine vault` mechanism, with per-tool secret names in the TOOLS row
+  (`vault`: a name, or `x/` for a folder that moves as one link). **Heavy folders** (TOOLS row `heavy`) get hard deny
+  lines in the generated `.gitignore` and `.stignore` blocks (also under sync all, so the sync scan never walks them)
+  and are never walked by the vault.
+- **Claude desktop app** (`claude-desktop`, `~/.config/Claude`, status app, no program): installed when its own
+  `config.json` or `Local State` is there. Vaulted: Cookies(-journal), buddy-tokens.json, ant-did,
+  ant-device-registry.json, Trust Tokens*, claude_desktop_config.json (MCP env keys), config.json (holds
+  `oauth:tokenCache`), Local Storage/, Session Storage/, IndexedDB/, WebStorage/. Kept out of git and Syncthing:
+  vm_bundles/, claude-code-vm/, claude-code/, Cache/, Code Cache/, GPUCache/, Dawn*Cache/, Crashpad/, logs/, sentry/,
+  blob_storage/, fcache, Shared Dictionary/. Doctor's hint for it is now `engine adopt claude-desktop`.
+- **`~/.agents/skills` is a link** to `engines/agents-skills` (`mode: adopted`, written by connect; no more
+  mirror circle): connect makes the link and writes its copies there; an old folder becomes the link only when it
+  holds nothing but connect's own copies (else it is reported once and left as it is); disconnect removes the link
+  and the folder.
+- **Doctor**: a tool adopted by a link whose link is broken, missing, points elsewhere or was replaced by a real
+  folder is an ERROR with the fix command. Tests: `AdoptByLinkTests` (a fake `~/.config/Claude`), `SkillsLinkTests`.
 
 ## v1.6.5 - 2026-11-13
 - **sync all: Syncthing scans only after our scan**. A new file holding a secret could reach the other computer before
