@@ -7356,8 +7356,14 @@ VAULT_FILES = SYNC_ALL_DENY_FILES          # the product's secret file names (an
 VAULT_TOP = ENGINE_DENY_TOP                 # loose secret names, only at the top of a tool folder
 VAULT_SECRET_DIRS = ("vault", "pairing", "mcp-tokens")   # deny folders that hold logins: every file in them
 VAULT_NOT = ("*.example", "*.sample", "*.template", "*.dist", "*.pub", "*.lock", "*.tmp", "*.md", "*.vault-tmp",
-             "*.vault-link", "*.vault-back")   # templates, public keys, notes, our own temp names
-VAULT_SKIP_DIRS = tuple(x for x in ENGINE_DENY_DIRS if x not in VAULT_SECRET_DIRS)   # sessions, caches, code
+             "*.vault-link", "*.vault-back", "cacert.pem", "*.py", "*.pyc", "*.js", "*.mjs", "*.cjs", "*.ts", "*.tsx",
+             "*.jsx", "*.go", "*.rs", "*.rb", "*.java", "*.sh", "*.html", "*.css")
+             # templates, public keys and CA bundles, notes, source code named after secrets, our own temp names
+VAULT_SKIP_DIRS = tuple(x for x in ENGINE_DENY_DIRS if x not in VAULT_SECRET_DIRS) + (
+    "site-packages", "dist-packages", ".tmp", "vendor", "workspace", ".provenance")
+    # sessions, caches, installed or vendored code (a code checkout, with .git, is skipped too)
+VAULT_SAFE_TOP = tuple(g.rstrip("/") for g in ENGINE_SAFE["*"] if g.endswith("/"))   # skills/, agents/, ...: no
+                                                                                     # secrets live there
 VAULT_SCAN = ("engines", "data")            # doctor: a real secret file here is an ERROR (it belongs in the vault)
 
 
@@ -7407,7 +7413,9 @@ def vault_secrets(d):
     folders skipped."""
     d, out = pathlib.Path(d), []
     for dp, dns, fns in os.walk(d):
-        dns[:] = sorted(x for x in dns if x not in VAULT_SKIP_DIRS and not os.path.islink(os.path.join(dp, x)))
+        dns[:] = sorted(x for x in dns if x not in VAULT_SKIP_DIRS and not os.path.islink(os.path.join(dp, x))
+                        and not os.path.lexists(os.path.join(dp, x, ".git"))      # code checkouts are not logins
+                        and not (dp == str(d) and x in VAULT_SAFE_TOP))
         rel_parts = pathlib.Path(dp).relative_to(d).parts
         sec = any(x in VAULT_SECRET_DIRS for x in rel_parts)
         for f in fns:
@@ -7415,6 +7423,68 @@ def vault_secrets(d):
             if vault_secret_name(f, not rel_parts, sec) and not fp.is_symlink() and fp.is_file():
                 out.append(fp)
     return sorted(out)
+
+
+def vault_units(d):
+    """What `engine vault` moves for the tool folder D: a sub-folder whose files are ALL secrets (no sub-folders,
+    e.g. Claude's backups/ of .claude.json that it rotates, or mcp-tokens/) moves as ONE folder link, so new files the
+    tool writes there land in the vault too; every other secret file moves alone. [(path, path below D)]"""
+    d, files = pathlib.Path(d), vault_secrets(d)
+    by = {}
+    for f in files:
+        by.setdefault(f.parent, []).append(f)
+    out = []
+    for par, fs in sorted(by.items()):
+        try:
+            names = sorted(os.listdir(par))
+        except OSError:
+            names = []
+        whole = par != d and len(names) == len(fs) and all(not os.path.islink(par / n) and (par / n).is_file()
+                                                          for n in names)
+        out += [(par, par.relative_to(d).as_posix())] if whole else [(f, f.relative_to(d).as_posix()) for f in fs]
+    return sorted(out)
+
+
+def _tree_sig(d):
+    out = []
+    for dp, dns, fns in os.walk(d):
+        dns.sort()
+        for f in sorted(fns):
+            fp = pathlib.Path(dp) / f
+            out.append((fp.relative_to(d).as_posix(), "" if fp.is_symlink() else _file_sha(fp)))
+    return out
+
+
+def _vault_dir(src, dst):
+    """A whole folder: copy it to DST (modes kept), check it did not change meanwhile, then put a symlink in its
+    place (two renames: the path is missing for an instant, so close the tool first)."""
+    mode = stat.S_IMODE(os.lstat(src).st_mode)
+    for p in reversed([x for x in dst.parents if not x.exists()]):
+        p.mkdir(); os.chmod(p, 0o700)
+    for _ in range(3):
+        before = _tree_sig(src)
+        tmp = dst.with_name(f".{dst.name}.vault-tmp")
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp)
+        shutil.copytree(src, tmp, symlinks=True)
+        if _tree_sig(src) != before or _tree_sig(tmp) != before:
+            shutil.rmtree(tmp); continue
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)                        # an older vault copy of the same folder (vault it again)
+        os.replace(tmp, dst)
+        os.chmod(dst, mode & 0o700 or 0o700)
+        link, old = src.with_name(f".{src.name}.vault-link"), src.with_name(f".{src.name}.vault-old")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(str(dst), link)
+        os.rename(src, old)
+        os.replace(link, src)
+        if _tree_sig(old) != before:                  # written during the swap: keep the newest bytes in the vault
+            for r_, _sha in _tree_sig(old):
+                shutil.copy2(old / r_, dst / r_)
+        shutil.rmtree(old)
+        return mode
+    raise SystemExit(f"vault: {src} keeps changing (close the tool first)")
 
 
 def _file_sha(p):
@@ -7448,8 +7518,21 @@ def _vault_one(src, dst):
     raise SystemExit(f"vault: {src} keeps changing (close the tool first)")
 
 
-def _unvault_one(src, dst):
-    """The reverse: the vault file comes back over the symlink in one rename, then leaves the vault."""
+def _unvault_one(src, dst, mode_was=None):
+    """The reverse: the vault file comes back over the symlink in one rename, then leaves the vault (a folder:
+    copied back next to the link, then swapped in)."""
+    if dst.is_dir():
+        tmp = src.with_name(f".{src.name}.vault-back")
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp)
+        shutil.copytree(dst, tmp, symlinks=True)
+        if mode_was:
+            os.chmod(tmp, mode_was)
+        if os.path.lexists(src):
+            os.unlink(src)
+        os.rename(tmp, src)
+        shutil.rmtree(dst)
+        return
     mode = stat.S_IMODE(os.stat(dst).st_mode)
     tmp = src.with_name(f".{src.name}.vault-back")
     shutil.copy2(dst, tmp)
@@ -7498,10 +7581,14 @@ def vault_files(base, files, tool, root, undo=False, dry=False, what="the tool")
             if not e:
                 continue
             dst = pathlib.Path(e["vault"])
-            if src.is_symlink() and os.readlink(src) == str(dst) and dst.is_file():
-                log.append(f"{'would bring back' if dry else 'back'}: {rel} <- {dst}")
+            linked = src.is_symlink() and os.readlink(src) == str(dst)
+            if (linked or not os.path.lexists(src)) and dst.exists() and not dst.is_symlink():
+                log.append(f"{'would bring back' if dry else 'back'}: {rel} <- {dst}"
+                           + ("" if linked else " (the link was gone)"))
                 if not dry:
-                    _unvault_one(src, dst); _vault_prune(root, dst.parent); entries.pop(rel); n += 1
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    mw = int(e["mode"], 8) if isinstance(e.get("mode"), str) and e["mode"].startswith("0o") else None
+                    _unvault_one(src, dst, mw); _vault_prune(root, dst.parent); entries.pop(rel); n += 1
             elif src.is_file() and not src.is_symlink():
                 log.append(f"kept {rel}: the tool wrote a new file there; the older vault copy stays at {dst} "
                            "(delete it by hand)")
@@ -7516,13 +7603,17 @@ def vault_files(base, files, tool, root, undo=False, dry=False, what="the tool")
         if os.path.lexists(dst) and not (e and e.get("vault") == str(dst)):
             log.append(f"refused {rel}: {dst} already exists in the vault (not from this base); move it away first")
             continue
-        log.append(f"{'would vault' if dry else 'vaulted'}: {rel} -> {dst}" + (" (again: the tool had replaced the "
+        fd = f"/ (the whole folder: {len(os.listdir(src))} file(s))" if src.is_dir() else ""
+        log.append(f"{'would vault' if dry else 'vaulted'}: {rel}{fd} -> {dst}" + (" (again: the tool had replaced the "
                                                                                "link)" if e else ""))
         if not dry:
             vault_make(root)
             (root / tool).mkdir(exist_ok=True); os.chmod(root / tool, 0o700)
-            mode = _vault_one(src, dst)
+            isdir = src.is_dir()
+            mode = _vault_dir(src, dst) if isdir else _vault_one(src, dst)
             entries[rel] = {"vault": str(dst), "tool": tool, "mode": oct(mode), "since": (e or {}).get("since") or today()}
+            if isdir:
+                entries[rel]["kind"] = "dir"
             n += 1
     if not dry and n:
         _vault_save(base, entries)
@@ -7548,7 +7639,7 @@ def engine_vault(base, name, undo=False, dry=False):
         files = [(base / rel, "") for rel, v in sorted(vault_entries(base).items())
                  if rel.startswith(f"engines/{name}/") and v.get("tool") == name]
     else:
-        files = [(p, p.relative_to(d).as_posix()) for p in vault_secrets(d)]
+        files = vault_units(d)
     log = vault_files(base, files, name, root, undo, dry, f"{name} (every program using engines/{name})")
     return log or [f"engines/{name}: nothing to {'bring back' if undo else 'vault'}"]
 
@@ -7606,7 +7697,8 @@ def vault_rows(base):
     ok = 0
     for rel, e in sorted(entries.items()):
         p, v = base / rel, e.get("vault", "")
-        if p.is_symlink() and os.readlink(p) == v and os.path.isfile(v):
+        if p.is_symlink() and os.readlink(p) == v and (os.path.isdir(v) if e.get("kind") == "dir" else
+                                                       os.path.isfile(v)):
             ok += 1
         elif p.is_symlink() or not p.exists():
             rows.append(("WARN", f"vault link broken: {rel} -> {v} (the vault file or the link is missing)"))
@@ -7631,7 +7723,9 @@ def vault_page(base):
         root = home_rel(vault_root(base), home)
     except SystemExit:
         root = "?"
-    rows = "\n".join(f"| {e.get('tool', '?')} | `{rel}` | `{home_rel(pathlib.Path(e.get('vault', '')), home)}` |"
+    sl = lambda e: "/" if e.get("kind") == "dir" else ""
+    rows = "\n".join(f"| {e.get('tool', '?')} | `{rel}{sl(e)}` | "
+                     f"`{home_rel(pathlib.Path(e.get('vault', '')), home)}{sl(e)}` |"
                      for rel, e in sorted(entries.items()))
     body = (f"# Secrets in the vault\n\n{VAULT_MARK}\n\n"
             f"The secret files of the tools live outside the base in one vault: `{root}` (mode 700, one sub-folder "

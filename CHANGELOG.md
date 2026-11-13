@@ -6,7 +6,9 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - **`engine vault NAME [--undo] [--dry-run]`**: the secret files of `engines/NAME` (the same secret names the
   `.gitignore`/`.stignore` blocks deny; not sessions, caches or logs) move to ONE vault folder outside the base,
   `<vault>/NAME/<same path>`, and an absolute symlink stays at the old path, so the tool finds its login where it
-  always did. Modes are kept; the vault and each tool folder in it are mode 700. Vault root: `engines.json`
+  always did. A sub-folder that holds only secret files (Claude's rotating `backups/` of `.claude.json`,
+  `mcp-tokens/`) moves as ONE folder link (source code named after secrets, code checkouts, vendored or installed
+  packages and the safe folders such as `skills/` are never moved), so the new files the tool writes there land in the vault too. Modes are kept; the vault and each tool folder in it are mode 700. Vault root: `engines.json`
   `"vault"` (`brain.py vault root PATH`, only while the vault is empty), default `~/.<base folder name>-secret`.
   Close the tool first. `--undo` brings the files back. The exact link paths are added to the `.gitignore` and
   `.stignore` blocks (also in sync all mode); the registry lives in `.brain/backups/` (local only).

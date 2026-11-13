@@ -4441,7 +4441,11 @@ class VaultTests(ToolHome):
                "engines/w/api_token.txt", "engines/w/mcp-tokens/srv.json", "engines/w/team/.env")
     KEEP = ("engines/w/CLAUDE.md", "engines/w/settings.json", "engines/w/skills/x-token-spend/SKILL.md",
             "engines/w/sessions/a.jsonl", "engines/w/projects/k/a.jsonl", "engines/w/cache/token.json",
-            "engines/w/team/agents.json", "engines/w/.env.example")
+            "engines/w/team/agents.json", "engines/w/.env.example", "engines/w/lib/git_credentials.py",
+            "engines/w/skills/s/default-credentials.json", "engines/w/repo/.git/HEAD", "engines/w/repo/.env",
+            "engines/w/venv2/lib/site-packages/certifi/cacert.pem")
+    UNITS = ("engines/w/.claude.json", "engines/w/.credentials.json", "engines/w/api_token.txt", "engines/w/backups",
+             "engines/w/mcp-tokens", "engines/w/team/.env")
 
     def setUp(self):
         super().setUp()
@@ -4452,6 +4456,8 @@ class VaultTests(ToolHome):
             p = self.write(self.base, f, f"SECRET-VALUE {f}\n")
             p.chmod(0o600 if f in self.SECRETS else 0o644)
         self.vault = self.home / ".base-secret"
+        (self.base / "engines/w/backups").chmod(0o751)
+        self.bmode = 0o751
 
     def ok_env(self, *args, env=None):
         r = self.hb(*args, env=env)
@@ -4466,22 +4472,29 @@ class VaultTests(ToolHome):
         r = self.ok_env("engine", "vault", "w", "--dry-run", "--base", str(self.base))
         self.assertEqual(tree(self.base), before)
         self.assertFalse(self.vault.exists())
-        for f in self.SECRETS:
+        for f in self.UNITS:
             self.assertIn(f"would vault: {f}", r.stdout)
+        self.assertIn("would vault: engines/w/backups/ (the whole folder: 1 file(s))", r.stdout)
         for f in self.KEEP:
             self.assertNotIn(f + " ", r.stdout)
         r = self.ok_env("engine", "vault", "w", "--base", str(self.base))
         self.assertIn("close w", r.stdout)
         self.assertEqual(stat_mode(self.vault), 0o700)
         self.assertEqual(stat_mode(self.vault / "w"), 0o700)
-        for f in self.SECRETS:
+        for f in self.UNITS:                          # a folder of only secrets moves as one folder link
             p, v = self.base / f, self.vault / "w" / f[len("engines/w/"):]
             self.assertTrue(p.is_symlink(), f)
             self.assertEqual(os.readlink(p), str(v))
             self.assertTrue(os.path.isabs(os.readlink(p)))
+        self.assertEqual(stat_mode(self.vault / "w" / "backups"), 0o700)
+        for f in self.SECRETS:
+            p, v = self.base / f, self.vault / "w" / f[len("engines/w/"):]
+            self.assertFalse(os.path.isfile(p) and not any(self.base / u == p or (self.base / u) in p.parents
+                                                            for u in self.UNITS), f)
             self.assertEqual(v.read_text(), f"SECRET-VALUE {f}\n")
             self.assertEqual(p.read_text(), f"SECRET-VALUE {f}\n")          # the tool still reads it there
             self.assertEqual(stat_mode(v), 0o600)
+        for f in self.UNITS:
             self.assertTrue(self.ignored(f), f)
         for f in self.KEEP:
             self.assertFalse((self.base / f).is_symlink(), f)
@@ -4491,20 +4504,27 @@ class VaultTests(ToolHome):
         st = (self.base / ".stignore").read_text().split("// base-folder:end")[0]
         pats = [l for l in st.splitlines() if l and not l.startswith("//")]
         shares = B.engine_shares(self.base)
-        self.assertEqual(shares[B.VAULTED], sorted(self.SECRETS))
+        self.assertEqual(shares[B.VAULTED], sorted(self.UNITS))
         allpats = [l for l in B.stignore_layout({**shares, B.SYNC_ALL: ["all"]}).splitlines()
                    if l and not l.startswith("//")]
         for f in self.SECRETS:
             self.assertFalse(B.syncthing_allows(pats, f), f)
             self.assertFalse(B.syncthing_allows(allpats, f), f)                 # sync all mode too
+        for f in self.UNITS:
             self.assertIn("/" + B._st_escape(f), pats)
         self.assertTrue(B.syncthing_allows(allpats, "engines/w/team/agents.json"))
         r = self.hb("doctor", "--base", str(self.base))
         self.assertNotIn("not in the vault", r.stdout)
-        self.assertIn(f"{len(self.SECRETS)} secret(s) in the vault", r.stdout)
+        self.assertIn(f"{len(self.UNITS)} secret(s) in the vault", r.stdout)
+        self.write(self.base, "engines/w/backups/.claude.json.backup.2", "SECRET-VALUE new\n")   # the tool rotates
+        os.unlink(self.base / "engines/w/backups/.claude.json.backup.1")
+        self.assertEqual((self.vault / "w/backups/.claude.json.backup.2").read_text(), "SECRET-VALUE new\n")
+        r = self.hb("doctor", "--base", str(self.base))
+        self.assertNotIn("not in the vault", r.stdout)
         page = (self.base / B.VAULT_PAGE).read_text()
         self.assertIn("~/.base-secret", page)
         self.assertIn("`engines/w/.credentials.json`", page)
+        self.assertIn("`engines/w/backups/`", page)
         self.assertNotIn("SECRET-VALUE", page)
         self.assertTrue(page.startswith("---\ntitle: Secrets in the vault\n"))
         self.assertTrue(self.ignored(B.VAULT_REG))
@@ -4515,11 +4535,14 @@ class VaultTests(ToolHome):
         self.assertIn("would bring back: engines/w/.credentials.json", r.stdout)
         self.assertTrue((self.base / self.SECRETS[0]).is_symlink())
         self.ok_env("engine", "vault", "w", "--undo", "--base", str(self.base))
-        for f in self.SECRETS:
+        for f in self.SECRETS[:2] + self.SECRETS[3:]:
             p = self.base / f
             self.assertFalse(p.is_symlink(), f)
             self.assertEqual(p.read_text(), f"SECRET-VALUE {f}\n")
             self.assertEqual(stat_mode(p), 0o600)
+        self.assertFalse((self.base / "engines/w/backups").is_symlink())
+        self.assertEqual(stat_mode(self.base / "engines/w/backups"), self.bmode)
+        self.assertEqual(sorted(os.listdir(self.base / "engines/w/backups")), [".claude.json.backup.2"])
         self.assertEqual(list(self.vault.iterdir()), [])
         self.assertNotIn(B.VAULTED, B.engine_shares(self.base))
         self.assertNotIn("/engines/w/.credentials.json\n", (self.base / ".stignore").read_text())
