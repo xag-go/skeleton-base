@@ -154,7 +154,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.5"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.6"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -4295,7 +4295,7 @@ def same_path(x, v):
 #   status   "legacy" / "discontinued" (detected, never newly connected) / "app".
 #   access, mcp, memory, hooks: what connect does or why it cannot (shown by `connect --print` and the README).
 TOOLS = {t["key"]: t for t in (
-    dict(key=".claude", name="Claude Code", bins=("claude",), marks=(".claude",),
+    dict(key=".claude", name="Claude Code", bins=("claude",), marks=(".claude.json",),
          rules=((".claude/CLAUDE.md", "create"),),
          access="`permissions.additionalDirectories` + `Bash(python3 BASE/tools/brain.py *)` in "
                 "`~/.claude/settings.json`",
@@ -4306,7 +4306,7 @@ TOOLS = {t["key"]: t for t in (
                      "its `skills/`",
          src="code.claude.com/docs/en/memory, /permissions, /mcp, /hooks"),
     dict(key=".codex", name="Codex (CLI, IDE and the ChatGPT desktop app, one Codex host)", bins=("codex",),
-         marks=(".codex",), rules=((".codex/AGENTS.override.md", "existing"), (".codex/AGENTS.md", "create")),
+         marks=(".codex/auth.json", ".codex/config.toml"), rules=((".codex/AGENTS.override.md", "existing"), (".codex/AGENTS.md", "create")),
          pick="first", cap=(32768, "bytes", "Codex loads at most 32 KiB of AGENTS.md text, this file and the "
                                             "project's together (project_doc_max_bytes)"),
          skills=True, access="`[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`",
@@ -4322,14 +4322,14 @@ TOOLS = {t["key"]: t for t in (
          note="`~/.gemini` alone is not proof (Antigravity makes it too): the `gemini` program or its settings "
               "file must be there",
          src="github.com/google-gemini/gemini-cli docs/cli/gemini-md.md, docs/reference/configuration.md"),
-    dict(key=".qwen", name="Qwen Code", bins=("qwen",), marks=(".qwen",), rules=((".qwen/QWEN.md", "create"),),
+    dict(key=".qwen", name="Qwen Code", bins=("qwen",), marks=(".qwen/oauth_creds.json", ".qwen/settings.json"), rules=((".qwen/QWEN.md", "create"),),
          skills=True, access="`context.includeDirectories` in `~/.qwen/settings.json`",
          mcp="`mcpServers` in `~/.qwen/settings.json`",
          memory="`~/.qwen/QWEN.md`, auto-memory `~/.qwen/projects/*/memory/**/*.md`, `~/.qwen/memories/**/*.md`",
          note="the block goes in QWEN.md, not `~/.qwen/rules/` (rules files lose HTML comments, so the marked "
               "block could not be found again)",
          src="github.com/QwenLM/qwen-code docs/users/features/memory.md, rules.md, configuration/settings.md"),
-    dict(key=".config/opencode", name="opencode (v1 and v2)", bins=("opencode",), marks=(".config/opencode",),
+    dict(key=".config/opencode", name="opencode (v1 and v2)", bins=("opencode",), marks=(".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"),
          rules=((".config/opencode/AGENTS.md", "create"),), skills=True,
          access="v2: an `external_directory` allow rule in `permissions` (only where it has rules: v2 lets agents "
                 "out by default); v1: `permission.external_directory` (its default asks)",
@@ -4359,14 +4359,14 @@ TOOLS = {t["key"]: t for t in (
          memory="server-side (GitHub): not a local file, not collected",
          hooks="runs a repo's `.claude/settings*.json` hooks (ours are safe to run twice)",
          src="docs.github.com copilot-cli (custom instructions, config dir reference, hooks)"),
-    dict(key=".openclaw", name="OpenClaw", bins=("openclaw",), marks=(".openclaw",),
+    dict(key=".openclaw", name="OpenClaw", bins=("openclaw",), marks=(".openclaw/workspace/AGENTS.md",),
          rules=((".openclaw/workspace/AGENTS.md", "existing"),),
          cap=(20000, "chars", "OpenClaw injects at most 20,000 characters per bootstrap file"), skills=True,
          access="no wall (its sandbox is off by default)",
          mcp="needs you: `openclaw mcp` (config format not verified)",
          memory="`workspace/MEMORY.md`, `USER.md`, `DREAMS.md`, `memory/*.md`",
          src="docs.openclaw.ai (agent workspace, memory, sandboxing)"),
-    dict(key=".hermes", name="Hermes Agent", bins=("hermes",), marks=(".hermes",),
+    dict(key=".hermes", name="Hermes Agent", bins=("hermes",), marks=(".hermes/config.yaml", ".hermes/SOUL.md"),
          rules=((".hermes/SOUL.md", "existing"), (".hermes/profiles/*/SOUL.md", "existing")),
          cap=(20000, "chars", "Hermes cuts a context file at 20,000 characters"),
          access="no wall (its file tools reach any path you can)",
@@ -4409,7 +4409,7 @@ TOOLS = {t["key"]: t for t in (
          memory="cloud (Agent Memory preview): not collected",
          note="the app's global rules are cloud settings: paste `connect --print` there by hand",
          src="docs.warp.dev (agents, warp-agent-cli, mcp)"),
-    dict(key=".cursor", name="Cursor (editor and cursor-agent)", bins=("cursor-agent",), marks=(".cursor",),
+    dict(key=".cursor", name="Cursor (editor and cursor-agent)", bins=("cursor-agent",), marks=(".cursor/cli-config.json", ".cursor/sandbox.json", ".cursor/mcp.json"),
          rules=(), skills=True,
          access="`additionalReadwritePaths` and `additionalReadPaths` in `~/.cursor/sandbox.json`; "
                 "`Read(BASE/**)`, `Write(BASE/**)` in `~/.cursor/cli-config.json` when it exists",
@@ -4429,16 +4429,16 @@ TOOLS = {t["key"]: t for t in (
          note="it loads `~/.claude/CLAUDE.md` unless `read_config_from.claude` is false: the block there reaches it",
          src="docs.devin.ai (cli/extensibility/rules, cli/reference/permissions, read-config-from, mcp)"),
     dict(key=".codeium/windsurf", name="Windsurf Cascade (legacy, now Devin Desktop)", bins=(),
-         marks=(".codeium/windsurf",), rules=((".codeium/windsurf/memories/global_rules.md", "create"),),
+         marks=(".codeium/windsurf/mcp_config.json",), rules=((".codeium/windsurf/memories/global_rules.md", "create"),),
          status="legacy", access="no file setting", mcp="-", memory="internal, not collected",
          src="docs.devin.ai/desktop/cascade (Cascade is the legacy agent)"),
-    dict(key=".kiro", name="Kiro (IDE and kiro-cli)", bins=("kiro-cli",), marks=(".kiro",),
+    dict(key=".kiro", name="Kiro (IDE and kiro-cli)", bins=("kiro-cli",), marks=(".kiro/settings/mcp.json", ".kiro/settings/permissions.yaml"),
          rules=((".kiro/steering/skeleton-base.md", "create"),),
          access="`fs_read` and `fs_write` allow rules in `~/.kiro/settings/permissions.yaml`",
          mcp="`mcpServers` in `~/.kiro/settings/mcp.json`", memory="Kiro Memory is opaque: not collected",
          skills_note="reads `~/.kiro/skills` (not `~/.agents/skills`)",
          src="kiro.dev/docs (steering, permissions, mcp/configuration, memory)"),
-    dict(key=".cline", name="Cline (VS Code, JetBrains, CLI)", bins=("cline",), marks=(".cline", "Documents/Cline"),
+    dict(key=".cline", name="Cline (VS Code, JetBrains, CLI)", bins=("cline",), marks=(".cline/data/settings/cline_mcp_settings.json", ".cline/data/settings/global-settings.json"),
          rules=(("Documents/Cline/Rules/skeleton-base.md", "create"),), group=".agents/AGENTS.md", skills=True,
          access="needs you: only the all-or-nothing \"Read all files\" / \"Edit all files\" auto-approve, or add "
                 "the base as a workspace folder",
@@ -4447,7 +4447,7 @@ TOOLS = {t["key"]: t for t in (
     dict(key=".roo", name="Roo Code (discontinued 2026-05-15)", bins=(), marks=(".roo",), rules=(),
          status="discontinued", access="-", mcp="-", memory="-",
          src="github.com/RooCodeInc/Roo-Code-Docs docs/sunset.md"),
-    dict(key=".continue", name="Continue (extension and cn)", bins=("cn",), marks=(".continue",),
+    dict(key=".continue", name="Continue (extension and cn)", bins=("cn",), marks=(".continue/permissions.yaml", ".continue/config.yaml"),
          rules=((".continue/rules/skeleton-base.md", "create"),),
          access="`Read(BASE/**)`, `Write(BASE/**)` in `allow` of `~/.continue/permissions.yaml` (cn)",
          mcp="needs you: `mcpServers` in its config.yaml (a user-level block folder is not documented)",
@@ -4459,7 +4459,7 @@ TOOLS = {t["key"]: t for t in (
          access="needs you: no extra-folder setting (add the base as a project folder)",
          mcp="`context_servers` in `~/.config/zed/settings.json` (comments kept)", memory="none",
          src="zed.dev/docs/ai (instructions, mcp, tools, skills)"),
-    dict(key=".junie", name="JetBrains Junie (CLI and IDE)", bins=("junie",), marks=(".junie",),
+    dict(key=".junie", name="JetBrains Junie (CLI and IDE)", bins=("junie",), marks=(".junie/allowlist.json", ".junie/mcp/mcp.json"),
          rules=((".junie/AGENTS.md", "create"),), skills=True,
          access="`readOutsideProject` and `fileEditing` allow rules in `~/.junie/allowlist.json`",
          mcp="`mcpServers` in `~/.junie/mcp/mcp.json`", memory="none native",
@@ -4642,9 +4642,10 @@ class Connector:
             if self.block_into(rec, r, p["how"] == "create"):
                 for key in p["tools"]:
                     wrote.setdefault(key, []).append(r)
-        for r in list(rec["blocks"]):                   # a tool not found now: its block is kept current only
-            if r not in plan and find_block(read(self.home / r) or ""):
-                self.block_into(rec, r, False)
+        owned = [pat for t in TOOLS.values() for pat, _ in t["rules"]] + list(GROUPS)
+        for r in list(rec["blocks"]):                   # a tool not installed now: our block goes (archived first)
+            if r not in plan and not skip(r) and any(fnmatch.fnmatchcase(r, pat) for pat in owned):
+                self.drop_block(rec, r)
         self.check_caps(plan)
         if ".aider.conf.yml" in found and "\n" not in str(self.base):
             self.units(rec["pointer"], {POINTER_MD: pointer_block(self.base) + "\n"})
@@ -4680,7 +4681,7 @@ class Connector:
                                        "why": "looks like an AI tool (it has a memory store, now watched) but no "
                                               "rules file we know: add the pointer in its settings by hand"}
 
-        if (self.home / self.L(".claude")).is_dir():
+        if ".claude" in found and (self.home / self.L(".claude")).is_dir():
             self.merge_hooks(rec, kick)
         for key, d in extra:                            # every extra dir of a tool: same block, settings, hooks
             self.connect_extra(rec, key, d, kick, found)
@@ -4759,8 +4760,8 @@ class Connector:
     # -- which tools are here, and which rules file each one gets (loaded ONCE per tool)
     def created_files(self, rec):
         """Files our own connect created: never taken as proof that a tool is installed."""
-        mine = {r for r, b in rec["blocks"].items() if b.get("created")}
-        mine |= {r for r, a in rec["access"].items() if a.get("created")}
+        mine = {r for r, b in rec.get("blocks", {}).items() if b.get("created")}
+        mine |= {r for r, a in rec.get("access", {}).items() if a.get("created")}
         for store in ("timer", "watch", "pointer", "skills", "registry"):
             mine |= {r for r, t in rec.get(store, {}).items() if not t.get("previous")}
         return mine
@@ -4835,14 +4836,16 @@ class Connector:
             return
         new = (t[:span[0]] + b["previous"] + t[span[1]:]) if b.get("mode") == "replaced" else \
             Installer.strip_block(t, b.get("mode", "append"))[0]
-        if b.get("created") and not new:
+        arch = self.backup(r)                           # what we delete or change is archived first
+        if not new.strip():
             (self.home / r).unlink()
             for d in sorted(b.get("dirs", []), key=lambda x: -x.count("/")):
                 if (self.home / d).is_dir() and not any((self.home / d).iterdir()):
                     (self.home / d).rmdir()
         else:
             write(self.home / r, new)
-        self.log.append(f"{tool_tilde(r)}: base block removed (the tool gets it from another file now, loaded once)")
+        self.log.append(f"{tool_tilde(r)}: base block removed (archived in {arch or 'nothing to archive'}; "
+                        "the tool gets it from another file now, loaded once, or is not installed)")
 
     def check_caps(self, plan):
         for r, p in plan.items():
@@ -5886,6 +5889,15 @@ def autoconnect(base):
     for e in c.auto_extra:
         if e["root"] not in have:
             extra.append(e); have.add(e["root"]); log.append(f"watching {e['root']} (source {e['source']})")
+    seen = cfg.get("seen_tools")                    # adopt what became installed since the last run, never on the
+    if seen is not None:                            # first run (existing installs stay where they are)
+        for key in sorted(set(c.tools) - set(seen)):
+            if engine_var(key) and not in_dir(tool_root(key, home_dir())[0], base):
+                try:
+                    log += engine_adopt(base, key)
+                except SystemExit as e:
+                    log.append(f"not adopted {TOOLS[key]['name']} (left where it is): {e}")
+    cfg["seen_tools"] = sorted(set(seen or []) | set(c.tools))
     cfg["tools"], cfg["extra"] = tools, extra
     if not cfg["extra"]:
         cfg.pop("extra")
@@ -8712,15 +8724,51 @@ def mirror_files(src, keep, name="x"):
     return out
 
 
+def connect_rec(base):
+    """Our connect record from .kits.json ({} when the base is not connected)."""
+    try:
+        k = json.loads(read(pathlib.Path(base) / ".kits.json") or "{}")
+    except ValueError:
+        return {}
+    return ((k.get("kits") or {}).get("base-folder") or {}).get("connect") or {}
+
+
+def mirror_drop(base, name, dst, why):
+    """Remove a mirror we made (its MIRROR marker) and its engines.json entry. The source is never touched and a
+    source registered by someone else (sources.d) keeps its registration. Returns why, or None when nothing went."""
+    reg = reg_load(base, ENGINES_REG)
+    gone = False
+    e = reg.get("engines", {}).get(name)
+    if isinstance(e, dict) and e.get("mode") == "mirror":
+        reg["engines"].pop(name)
+        reg_save(base, ENGINES_REG, reg)
+        gone = True
+    if (dst / "MIRROR").is_file():
+        shutil.rmtree(dst, ignore_errors=True)
+        gone = True
+    return f"engines/{name}: mirror removed ({why})" if gone else None
+
+
 def mirror_sync(base, home=None, quiet=True):
     """Bring every mirror up to date (copy changed files, drop removed ones, leave out secret-looking text).
-    Returns the names of the mirrors that changed."""
+    A mirror that must not exist goes: its source is inside the base, it is ~/.agents/skills, or its tool is not
+    installed. Returns the names of the mirrors that changed."""
     base, home = pathlib.Path(base).resolve(), pathlib.Path(home or home_dir())
-    changed = []
+    changed, reg = [], reg_load(base, ENGINES_REG).get("engines", {})
+    mine = Connector(base).created_files(connect_rec(base))
+    skills = os.path.normpath(str(home / SKILLS_DIR))
     for name, src, keep in mirror_sources(base, home):
         dst = base / "engines" / name
-        if in_dir(src, base):
-            continue                                    # never mirror the base into itself
+        e = reg.get(name) if isinstance(reg.get(name), dict) else {}
+        key = tool_key_of(e.get("tool")) if e.get("tool") else None
+        why = ("its source is inside the base" if in_dir(src, base) else
+               "~/.agents/skills is connect's copy, not a source" if os.path.normpath(str(src)) == skills else
+               "the tool is not installed" if key in TOOLS and not tool_installed(home, TOOLS[key], mine) else None)
+        if why:
+            gone = mirror_drop(base, name, dst, why)
+            if gone:
+                changed.append(name)
+            continue
         want = mirror_files(src, keep, name) if src.exists() else {}
         n, skipped = 0, []
         dst.mkdir(parents=True, exist_ok=True)
@@ -8769,6 +8817,8 @@ def engine_mirror(base, tool, name=None, keep=None):
     else:
         src = pathlib.Path(os.path.abspath(os.path.expanduser(tool)))
         name = name or src.name.strip(".") or "tool"
+    if key in TOOLS and not tool_installed(home, TOOLS[key], Connector(base).created_files(connect_rec(base))):
+        raise SystemExit(f"engine mirror: {tool} is not installed (no program on PATH): nothing to mirror")
     if not src.exists():
         raise SystemExit(f"engine mirror: {src} does not exist")
     if in_dir(src, base):
@@ -9123,6 +9173,21 @@ def adopt_guard(base, key, d, home):
     return None
 
 
+def leftover_rows(base, home):
+    """Our block still in the rules file of a tool that is not installed: WARN, and the command that removes it."""
+    c, out = Connector(base), []
+    mine = c.created_files(connect_rec(base))
+    for key, t in sorted(TOOLS.items()):
+        if t.get("status") in ("discontinued", "app") or tool_installed(home, t, mine):
+            continue
+        for pat, _ in t["rules"]:
+            for r in c.rules_files(pat):
+                if find_block(read(home / r) or ""):
+                    out.append(("WARN", f"{t['name']}: ~/{r} has our block but it is not installed -> brain.py connect "
+                                        "(archives it, then removes only our block)"))
+    return out
+
+
 def doctor(base, strict=False):
     base, home = pathlib.Path(base).resolve(), home_dir()
     rows = []                                          # (level, text)
@@ -9142,12 +9207,16 @@ def doctor(base, strict=False):
                 rows.append(("WARN", f"{name}: registered dir {d} does not exist"))
             continue
         tag = "in the base" if in_dir(d, base) else "OUTSIDE the base"
-        lvl = "OK" if in_dir(d, base) else ("OUTSIDE" if os.path.normpath(str(d)) not in mirrors else "OK")
+        lvl = "OK" if in_dir(d, base) else "OUTSIDE"
         how = f"set by {var}" if var and not extra else ("extra dir" if extra else "default place")
         hint = ""
         if lvl == "OUTSIDE":
-            hint = f" -> brain.py engine adopt {next((i for i, k in TOOL_IDS.items() if k == key), key)}" \
-                if engine_var(key) and not extra else " -> brain.py engine mirror " + home_rel(d, home)
+            if engine_var(key) and not extra:
+                hint = f" -> brain.py engine adopt {next((i for i, k in TOOL_IDS.items() if k == key), key)}"
+            elif os.path.normpath(str(d)) in mirrors:
+                hint = " -> no setting moves it: it stays outside (engines/ keeps a read-only copy)"
+            else:
+                hint = " -> brain.py engine mirror " + home_rel(d, home)
         rows.append((lvl, f"{name}: {home_rel(d, home)} ({how}, {tag}){hint}"))
         default = pathlib.Path(home) / key
         if var and not extra and default.is_dir() and not in_dir(default, d):
@@ -9165,10 +9234,10 @@ def doctor(base, strict=False):
         if key in TOOL_IDS.values() or key.split("/")[0] in TOOL_HOMES:
             continue
         p = home / key
-        if p.is_dir() and not p.is_symlink() and not in_dir(p, base) and os.path.normpath(str(p)) not in mirrors \
-                and key not in allow:
-            rows.append(("OUTSIDE", f"{TOOLS[key]['name']}: ~/{key} (no setting moves it) -> brain.py engine mirror "
-                                    f"~/{key}"))
+        if p.is_dir() and not p.is_symlink() and not in_dir(p, base) and key not in allow:
+            hint = (" -> no setting moves it: it stays outside (engines/ keeps a read-only copy)"
+                    if os.path.normpath(str(p)) in mirrors else f" -> brain.py engine mirror ~/{key}")
+            rows.append(("OUTSIDE", f"{TOOLS[key]['name']}: ~/{key} (no setting moves it){hint}"))
     for key, d in tool_dirs(home, base):
         rules, mem = ai_signals(d)
         if (rules or mem) and os.path.normpath(str(d)) not in mirrors:
@@ -9191,6 +9260,7 @@ def doctor(base, strict=False):
                 kind = "worktree" if (d / ".git").is_file() else "repo"
                 rows.append(("OUTSIDE", f"code {kind} {home_rel(d, home)} -> brain.py projects move "
                                         f"{home_rel(d, home)}"))
+    rows += leftover_rows(base, home)
     rows += doctor_git(base)
     rows += vault_rows(base)
     if vault_page(base):

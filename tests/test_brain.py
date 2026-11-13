@@ -953,10 +953,10 @@ class CollectTests(HomeBase):
     def test_missing_stores_and_odd_schemas_do_not_crash(self):
         r = self.ok("collect")
         self.assertIn("collect: 0 new", r.stdout)
-        (self.home / ".hermes").mkdir()
+        self.write(self.home, ".hermes/config.yaml", "x: 1\n")
         con = sqlite3.connect(self.home / ".hermes/memory_store.db")
         con.execute("CREATE TABLE facts (id INTEGER, body TEXT)"); con.commit(); con.close()
-        (self.home / ".codex").mkdir()
+        self.write(self.home, ".codex/auth.json", "x")
         sqlite3.connect(self.home / ".codex/memories_9.sqlite").close()
         self.write(self.home, ".hermes/memories/MEMORY.md", "still collected\n")
         r = self.ok("collect")
@@ -984,6 +984,8 @@ class ConnectTests(HomeBase):
         settings = ('{"model": "x", "hooks": {"SessionEnd": [{"hooks": [{"type": "command", '
                     '"command": "echo bye"}]}]}}')        # compact on purpose: must come back byte-identical
         self.write(self.home, ".claude/settings.json", settings)
+        self.write(self.home, ".claude.json", "{}\n")                  # Claude Code's own file: its proof
+        self.write(self.home, ".codex/auth.json", "{}\n")
         return settings
 
     def test_connect_where_tools_exist_idempotent_and_disconnect_restores(self):
@@ -1049,8 +1051,8 @@ class ConnectTests(HomeBase):
                       "Stop": [{"hooks": [{"type": "command", "command": "echo stop"}]}]}})
 
     def test_new_files_created_and_removed_and_timer(self):
-        for d in (".claude", ".codex", ".gemini"):
-            (self.home / d).mkdir()
+        for f in (".claude.json", ".codex/auth.json", ".gemini/oauth_creds.json"):
+            self.write(self.home, f, "{}\n")                          # each tool's own file: its proof
         home0 = tree(self.home)
         r = self.ok("connect", "--timer")
         for f in (".claude/CLAUDE.md", ".codex/AGENTS.md", ".gemini/GEMINI.md"):
@@ -1078,7 +1080,7 @@ class ConnectTests(HomeBase):
         self.assertFalse((self.home / ".config").exists())
 
     def test_init_keeps_connect_record_and_uninstall_disconnects(self):
-        (self.home / ".claude").mkdir()
+        self.write(self.home, ".claude.json", "{}")
         home0 = tree(self.home)
         self.ok("connect")
         r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
@@ -1327,6 +1329,7 @@ class WatchTests(WatchBase):
 
 class ZeroTouchTests(WatchBase):
     def test_connect_watch_writes_service_kick_hook_and_disconnect_restores(self):
+        self.write(self.home, ".claude.json", "{}\n")
         settings = '{"model": "x"}'
         self.write(self.home, ".claude/settings.json", settings)
         home0 = tree(self.home)
@@ -1365,6 +1368,7 @@ class ZeroTouchTests(WatchBase):
 
     def test_auto_connect_known_unknown_non_ai_needs_user_then_disconnect_byte_identical(self):
         self.write(self.home, ".claude/CLAUDE.md", "# my rules\n")
+        self.write(self.home, ".claude.json", "{}\n")                  # Claude Code's own file: its proof
         (self.home / ".hermes/memories").mkdir(parents=True)     # Hermes without SOUL.md: needs-user
         home0 = tree(self.home)
         self.ok("connect", "--watch", "--kick")
@@ -1376,7 +1380,7 @@ class ZeroTouchTests(WatchBase):
             p = self.write(self.home, r, text); user[r] = text
             return p
         # 1. a known tool installed later: Qwen Code
-        (self.home / ".qwen").mkdir()
+        put(".qwen/oauth_creds.json", "{}")                                  # Qwen Code's own file: installed
         time.sleep(0.2)
         q = put(".qwen/QWEN.md", "## Qwen Added Memories\n- token-qwen-9 prefers tea\n")
         self.assertLess(self.collected_within("token-qwen-9"), 5)
@@ -1429,7 +1433,7 @@ class ZeroTouchTests(WatchBase):
         self.assertEqual(exp, tree(self.home))
 
     def test_watch_without_connect_does_not_touch_home(self):
-        (self.home / ".qwen").mkdir()
+        self.write(self.home, ".qwen/oauth_creds.json", "x")
         home0 = tree(self.home)
         self.start()
         self.settle()
@@ -1679,7 +1683,7 @@ class UninstallKeepsDataTests(HomeBase):
 
     def test_disconnect_never_touches_the_base_data(self):
         b = self.rich_base()
-        (self.home / ".claude").mkdir(exist_ok=True)
+        self.write(self.home, ".claude.json", "{}")
         self.ok("connect")
         t1 = full_tree(b)
         self.ok("disconnect")
@@ -1697,6 +1701,8 @@ class AccessTests(HomeBase):
         return json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"].get("access", {})
 
     def test_pointer_save_step_is_one_allowed_command(self):
+
+        self.write(self.home, ".claude.json", "{}\n")
         """Real Claude Code run: the agent chained `brain.py index` with an `echo >> progress/agents.log` in one shell
         command, which the allow rule connect writes does not match, so the index step was refused. The block now
         says to run the index command on its own (the exact allowed form) and log with the file tools."""
@@ -1715,6 +1721,8 @@ class AccessTests(HomeBase):
         self.assertFalse(fnmatch.fnmatchcase(f"B=x; {cmd}; echo y >> log", rule))
 
     def test_pointer_says_remember_goes_to_the_base_first(self):
+
+        self.write(self.home, ".claude.json", "{}\n")
         """Real Qwen Code run (OpenAI-compatible Gemini): told "remember ...", it saved only to its own memory.
         The block names the request and where a fact about the user goes."""
         self.write(self.home, ".claude/settings.json", "{}")
@@ -1726,6 +1734,7 @@ class AccessTests(HomeBase):
     def test_claude_additional_directories_merged_idempotent_and_given_back(self):
         mine = ('{"model": "x", "permissions": {"allow": ["Read(~/notes/**)"], "additionalDirectories": '
                 '["/srv/other"]}, "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}')
+        self.write(self.home, ".claude.json", "{}\n")                  # Claude Code's own file: its proof
         p = self.write(self.home, ".claude/settings.json", mine)
         r = self.ok("connect")
         self.assertIn("permissions.additionalDirectories", r.stdout)
@@ -1761,6 +1770,8 @@ class AccessTests(HomeBase):
                                                      "theme": "dark"})
 
     def test_codex_writable_roots_text_merge_every_other_byte_kept(self):
+
+        self.write(self.home, ".codex/auth.json", "{}\n")
         import tomllib
         b = json.dumps(str(self.base))
         cases = {
@@ -1811,7 +1822,7 @@ class AccessTests(HomeBase):
 
     def test_gemini_and_qwen_include_directories(self):
         g = self.write(self.home, ".gemini/settings.json", '{"context": {"fileName": ["AGENTS.md"]}, "theme": "x"}')
-        (self.home / ".qwen").mkdir()
+        self.write(self.home, ".qwen/oauth_creds.json", "x")
         self.ok("connect")
         self.assertEqual(json.loads(g.read_text()), {"context": {"fileName": ["AGENTS.md"],
                                                                  "includeDirectories": [str(self.base)]},
@@ -1876,6 +1887,24 @@ class AccessTests(HomeBase):
         self.assertIn("no wall (its file tools reach any path you can)", out)
 
     def test_every_known_tool_is_found_readable_writable_and_collected(self):
+
+        self.write(self.home, ".claude.json", "{}\n")
+
+        self.write(self.home, ".codex/auth.json", "{}\n")
+
+        self.write(self.home, ".gemini/oauth_creds.json", "{}\n")
+
+        self.write(self.home, ".config/opencode/opencode.json", "{}\n")
+
+        self.write(self.home, ".codeium/windsurf/mcp_config.json", "{}\n")
+
+        self.write(self.home, ".kiro/settings/mcp.json", "{}\n")
+
+        self.write(self.home, ".cursor/cli-config.json", "{}\n")
+
+        self.write(self.home, ".qwen/oauth_creds.json", "{}\n")
+
+        self.write(self.home, ".hermes/config.yaml", "{}\n")
         """The README matrix, one row per known tool: (a) rules block, (b/c) its own access setting, (d) memory."""
         self.make_stores()
         for d in (".qwen", ".config/opencode", ".codeium/windsurf", ".kiro", ".cursor"):
@@ -1954,7 +1983,7 @@ class FrugalGlobalTests(Base):
         self.caps = brain.frugal_caps(self.setup_py)     # what this Frugal-Bridge build can do (from its source)
         self.base = self.fresh()
         self.write(self.home, ".claude/CLAUDE.md", "# my global rules\nUse tabs.\n")
-        (self.home / ".codex").mkdir()
+        self.write(self.home, ".codex/auth.json", "x")
 
     def x(self, *args, extra=None):
         e = dict(os.environ, BRAIN_TODAY="2026-11-11", HOME=str(self.home), FRUGAL_HOME=str(self.fh), PATH=FRUGAL_PATH)
@@ -2262,8 +2291,8 @@ class FrugalGlobalTests(Base):
         self.sb("connect")                          # settle (Frugal changed settings.json after us)
         old = {f: f.read_bytes() for f in self.rules() + [self.home / ".claude/settings.json"]}
         tools0 = json.loads((self.fh / "global.json").read_text())["tools"]
-        (self.home / ".gemini").mkdir()                     # a tool Frugal supports
-        (self.home / ".qwen").mkdir()                       # a tool it does not
+        self.write(self.home, ".gemini/oauth_creds.json", "x")                     # a tool Frugal supports
+        self.write(self.home, ".qwen/oauth_creds.json", "x")                       # a tool it does not
         r = self.x(self.base / "tools" / "brain.py", "watch", "--base", self.base, "--once", "--no-commit")
         g = self.home / ".gemini/GEMINI.md"
         self.assert_order(g)
@@ -2452,6 +2481,8 @@ class SpacePathTests(Base):
         return r
 
     def test_blocks_hooks_and_units_quote_the_path_and_disconnect_restores(self):
+
+        self.write(self.home, ".claude.json", "{}\n")
         home0 = tree(self.home)
         self.hb("connect", "--base", self.base, "--watch", "--kick")
         b = str(self.base)
@@ -2677,6 +2708,7 @@ class WriterTests(unittest.TestCase):
 
 class EveryToolTests(ToolHome):
     def test_every_known_tool_at_once_finds_reads_writes_mcp_then_disconnect_byte_identical(self):
+        self.write(self.home, ".codeium/windsurf/mcp_config.json", "{}\n")
         """The README matrix, one row per tool, all tools at once (fake HOME, fake programs on PATH)."""
         self.every_tool()
         home0 = tree(self.home)
@@ -2882,7 +2914,7 @@ class SharedFileTests(ToolHome):
 
     def test_kilo_and_devin_through_claude_md_unless_they_have_their_own(self):
         self.bins("claude", "kilo", "devin")
-        (self.home / ".claude").mkdir()
+        self.write(self.home, ".claude.json", "{}")
         self.write(self.home, ".config/kilo/kilo.json", "{}")
         self.write(self.home, ".config/devin/config.json", '{"read_config_from": {"claude": false}}')
         self.ok("connect")
@@ -2897,6 +2929,8 @@ class SharedFileTests(ToolHome):
         self.assertEqual((self.home / ".config/kilo/AGENTS.md").read_text(), "# my kilo rules\n")
 
     def test_codex_override_file_wins_and_size_caps_are_checked(self):
+
+        self.write(self.home, ".codex/auth.json", "{}\n")
         self.write(self.home, ".codex/AGENTS.override.md", "x" * 17000 + "\n")
         self.write(self.home, ".hermes/SOUL.md", "s" * 19500 + "\n")
         r = self.ok("connect")
@@ -2926,6 +2960,7 @@ class SharedFileTests(ToolHome):
 
 class HookTwiceTests(ToolHome):
     def test_our_hooks_run_by_a_second_tool_do_nothing_harmful(self):
+        self.write(self.home, ".claude.json", "{}\n")
         """Grok, Cursor, Devin, Continue cn and Copilot also run the hooks in ~/.claude/settings.json, with their
         own payloads and folders: each run exits 0, prints nothing (hosts parse stdout), collects every item once."""
         self.make_stores()
@@ -2933,7 +2968,7 @@ class HookTwiceTests(ToolHome):
         hooks = json.loads((self.home / ".claude/settings.json").read_text())["hooks"]
         collect = hooks["SessionEnd"][0]["hooks"][0]["command"]
         kick = hooks["PostToolUse"][0]["hooks"][0]["command"]
-        (self.home / ".cursor").mkdir()
+        self.write(self.home, ".cursor/cli-config.json", "{}")
         payloads = ('{"hook_event_name": "SessionEnd", "session_id": "c1"}',
                     '{"hook_event_name": "sessionEnd", "cursor_version": "3.2", "conversation_id": "x"}',
                     '{"hookEventName": "SessionEnd", "devin": true}', "", "not json at all")
@@ -3704,6 +3739,8 @@ class RoleTests(ToolHome):
     """Who am I: the tool's own identity first, else the ONE role in agents/ that lists the tool, never wiki/me/."""
 
     def test_rule_in_every_tool_block_print_and_agents_md_then_disconnect_byte_identical(self):
+
+        self.write(self.home, ".codeium/windsurf/mcp_config.json", "{}\n")
         self.every_tool()
         home0 = full_tree(self.home)
         self.ok("connect")
@@ -4443,6 +4480,8 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         self.assertFalse((self.base / "engines.json").exists() and "share" in (self.base / "engines.json").read_text())
 
     def test_mirror_keeps_a_skill_named_like_a_token(self):
+
+        self.write(self.home, ".gemini/oauth_creds.json", "{}\n")
         g = self.home / ".gemini"
         self.write(g, "skills/x-token-spend/SKILL.md", "skill\n")
         self.write(g, "skills/x-token-spend/token.json", '{"a": 1}')
@@ -5021,3 +5060,99 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
 
 def stat_mode(p):
     return os.stat(p).st_mode & 0o777
+
+
+# ---------------------------------------------------------------- base-first: installed = proof, mirrors, doctor
+class BaseFirstTests(ToolHome):
+    """A folder is never proof that a tool is installed (connect makes folders itself); a mirror of a tool that is
+    not installed, or of a source inside the base, goes; a tool that becomes installed is adopted, not mirrored."""
+
+    def tool_dirs_made(self, bins):
+        """The programs are there and their folders exist (the way a real install looks)."""
+        for key, t in B.TOOLS.items():
+            if any(b in bins for b in t.get("bins", ())) and t.get("dir", key):
+                (self.home / t.get("dir", key)).mkdir(parents=True, exist_ok=True)
+
+    def registry(self):
+        return json.loads((self.base / "engines.json").read_text()).get("engines", {})
+
+    def test_a_folder_alone_is_not_proof_of_an_install(self):
+        (self.home / ".config/opencode").mkdir(parents=True)
+        self.ok("connect")
+        self.assertFalse((self.home / ".config/opencode/AGENTS.md").exists(), "a bare folder is not proof")
+
+    def test_a_tool_that_is_not_installed_loses_our_block_and_leaves_no_folder_behind(self):
+        self.bins(*ALL_BINS)
+        self.tool_dirs_made(ALL_BINS)
+        self.ok("connect")
+        self.assertTrue(self.blocks(".config/opencode/AGENTS.md"), "installed: the block is there")
+        for b in ALL_BINS:
+            os.unlink(self.bin / b)
+        self.ok("connect")
+        left = [r for r in ALL_RULES if (self.home / r).exists() and self.blocks(r)
+                and r != ".config/skeleton-base/AGENTS.md"]          # the base pointer, not a tool's
+        self.assertEqual(left, [], "no program on PATH: connect keeps no block of ours")
+        self.assertFalse((self.home / ".config/opencode/AGENTS.md").exists())    # created by us: removed
+        self.assertEqual(os.listdir(self.home / ".config/opencode"), [], "the folder is left empty, never filled")
+        backed = [p for p in (self.base / ".brain/backups").rglob("AGENTS.md") if ".config/opencode" in str(p)]
+        self.assertTrue(backed, "what connect deletes is archived first")
+
+    def test_a_mirror_of_a_tool_that_is_not_installed_is_removed(self):
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}")
+        self.ok("engine", "mirror", "gemini", "--base", str(self.base))
+        self.assertTrue((self.base / "engines/gemini/MIRROR").is_file())
+        os.unlink(self.bin / "gemini")
+        os.unlink(self.home / ".gemini/settings.json")                      # its own proof file is gone too
+        self.ok("watch", "--once", "--no-commit")
+        self.assertFalse((self.base / "engines/gemini").exists())
+        self.assertNotIn("gemini", self.registry())
+
+    def test_a_mirror_of_a_source_inside_the_base_is_removed(self):
+        src = self.base / "projects/teamx/team"
+        src.mkdir(parents=True)
+        (src / "a.md").write_text("team\n")
+        self.write(self.base, "engines/teamx-team/MIRROR", "MIRROR: old copy\n")
+        self.write(self.base, "engines/teamx-team/a.md", "team\n")
+        reg = {"engines": {"teamx-team": {"mode": "mirror", "src": str(src), "since": "2026-11-13"}}}
+        (self.base / "engines.json").write_text(json.dumps(reg))
+        self.ok("watch", "--once", "--no-commit")
+        self.assertFalse((self.base / "engines/teamx-team").exists())
+        self.assertNotIn("teamx-team", self.registry())
+        self.assertTrue((src / "a.md").is_file(), "the source is never touched")
+
+    def test_the_agents_skills_mirror_is_dropped(self):
+        self.write(self.base, "engines/agents-skills/MIRROR", "MIRROR: old copy\n")
+        reg = {"engines": {"agents-skills": {"mode": "mirror", "src": "~/.agents/skills", "since": "2026-11-13"}}}
+        (self.base / "engines.json").write_text(json.dumps(reg))
+        self.ok("watch", "--once", "--no-commit")
+        self.assertFalse((self.base / "engines/agents-skills").exists())
+        self.assertNotIn("agents-skills", self.registry())
+
+    def test_doctor_counts_a_mirror_as_outside_with_its_reason(self):
+        self.bins("gemini")
+        self.write(self.home, ".gemini/settings.json", "{}")
+        self.ok("engine", "mirror", "gemini", "--base", str(self.base))
+        out = self.ok("doctor", "--base", str(self.base)).stdout
+        line = next(x for x in out.splitlines() if x.startswith(("OK", "OUTSIDE")) and "Gemini CLI" in x)
+        self.assertTrue(line.startswith("OUTSIDE"), line)
+        self.assertIn("no setting moves it", line)
+
+    def test_doctor_warns_about_our_block_in_a_tool_that_is_not_installed(self):
+        self.bins("opencode")
+        (self.home / ".config/opencode").mkdir(parents=True)
+        self.ok("connect")
+        block = (self.home / ".config/opencode/AGENTS.md").read_text()
+        os.unlink(self.bin / "opencode")
+        self.write(self.home, ".config/opencode/AGENTS.md", block)                  # left behind, tool gone
+        out = self.ok("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"WARN\s+opencode.*not installed.*brain\.py connect")
+
+    def test_a_tool_that_becomes_installed_is_adopted_into_the_base(self):
+        self.ok("connect")
+        self.ok("watch", "--once", "--no-commit")                                   # first run: nothing installed
+        self.bins("claude")
+        self.write(self.home, ".claude/settings.json", "{}")
+        self.ok("watch", "--once", "--no-commit")
+        self.assertTrue((self.base / "engines/claude/settings.json").is_file(), "adopted, not mirrored")
+        self.assertNotIn("claude", [k for k, v in self.registry().items() if v.get("mode") == "mirror"])

@@ -2,6 +2,32 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.6.6 - 2026-11-13
+- **Installed means proof, not folders**. connect made folders itself, so a folder alone kept a tool "installed" for
+  ever (the loop was self-perpetuating). Now a tool is installed when its program is on PATH (with its folder) or one of
+  its own files exists that connect did not create. Marks changed (audit of every row): `.claude` -> `.claude.json`;
+  `.codex` -> `.codex/auth.json`, `.codex/config.toml`; `.qwen` -> `.qwen/oauth_creds.json`, `.qwen/settings.json`;
+  `.config/opencode` -> `.config/opencode/opencode.json`, `.jsonc`; `.hermes` -> `.hermes/config.yaml`, `SOUL.md`;
+  `.openclaw` -> `.openclaw/workspace/AGENTS.md`; `.codeium/windsurf` -> `.codeium/windsurf/mcp_config.json`;
+  `.kiro` -> `.kiro/settings/mcp.json`, `permissions.yaml`; `.cline` (and `Documents/Cline`) -> `.cline/data/settings/
+  cline_mcp_settings.json`, `global-settings.json`; `.continue` -> `.continue/permissions.yaml`, `config.yaml`; `.junie`
+  -> `.junie/allowlist.json`, `mcp/mcp.json`; `.cursor` -> `.cursor/cli-config.json`, `sandbox.json`, `mcp.json`.
+  Unchanged: file marks, and `.kilocode` (connect never writes there). Bin + folder rule for programs is unchanged.
+- **Not installed = nothing written, and our block goes**. A tool that is not installed but still has our block in its
+  rules file loses only that block (archived in `.brain/backups` first; the file is deleted only if it is then empty;
+  its folders only if empty). Hooks in `~/.claude/settings.json` are written only when Claude Code is installed.
+- **Mirrors**: a mirror whose source is inside the base, a mirror of `~/.agents/skills`, and a mirror of a tool that is
+  not installed are removed (folder with its MIRROR marker, and its engines.json entry; sources are never touched).
+  `engine mirror` refuses a tool that is not installed.
+- **Doctor**: a mirror is OUTSIDE (counted in "outside the base"), with `engine adopt <tool>` when the tool has a
+  setting, else "no setting moves it". Our block left in a not-installed tool's rules file: WARN with `brain.py connect`.
+- **Auto-connect adopts**: a tool that becomes installed and has a setting is moved into `engines/<tool>` by the watch
+  cycle (existing installs are not moved: the first run only records what is installed; `watch.json` `seen_tools`).
+  If adopt cannot run safely, it is reported and left where it is.
+- Not in this release: `~/.agents/skills` as a symlink to the base's skills (the installed copies carry generated text
+  that `skills/` does not hold); `engine adopt` for tools without a setting (`~/.config/Claude`). Tests:
+  `BaseFirstTests`, and the older fixtures that used a bare folder as proof now write the tool's own file.
+
 ## v1.6.5 - 2026-11-13
 - **sync all: Syncthing scans only after our scan**. A new file holding a secret could reach the other computer before
   the next content scan, because Syncthing watched the folder itself (the base has more directories than inotify
