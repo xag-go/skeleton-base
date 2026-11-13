@@ -1124,9 +1124,9 @@ def proc_status(pid):
 
 
 class WatchBase(HomeBase):
-    def start(self, *extra):
+    def start(self, *extra, path=None):
         self.log = self.tmp / "watch.log"
-        e = test_env(HOME=str(self.home), PATH=os.environ["PATH"])
+        e = test_env(HOME=str(self.home), PATH=path or os.environ["PATH"])
         w = subprocess.Popen([sys.executable, str(self.base / "tools" / "brain.py"), "watch", "--base", str(self.base),
                               "--quiet-s", QUIET, "--max-s", "2", "--log", str(self.log), *extra],
                              env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1370,9 +1370,10 @@ class ZeroTouchTests(WatchBase):
         self.write(self.home, ".claude/CLAUDE.md", "# my rules\n")
         self.write(self.home, ".claude.json", "{}\n")                  # Claude Code's own file: its proof
         (self.home / ".hermes/memories").mkdir(parents=True)     # Hermes without SOUL.md: needs-user
-        home0 = tree(self.home)
+        hb = fake_bin(self.tmp / "hermes-bin", "hermes")          # its program on the watcher's PATH (never the
+        home0 = tree(self.home)                                   # machine's own PATH: it may have no Hermes)
         self.ok("connect", "--watch", "--kick")
-        self.start()
+        self.start(path=os.pathsep.join([str(hb), TEST_PATH]))
         self.settle()
         user = {}                                                 # everything the user (their tools) writes
 

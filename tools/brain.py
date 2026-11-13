@@ -4716,6 +4716,7 @@ class Connector:
         if "\n" not in str(self.base):                 # the base's own pointer file: any kit finds the base there
             self.units(rec["pointer"], {POINTER_FILE: f"{self.base}\n"})
         me["connect"] = {key: v for key, v in rec.items() if v}
+        self.record_base_files(me)
         self.save_kits(k)
         before = set(prev.get("blocks") or {})
         self.frugal_take_over([r for r in rec["blocks"] if r not in before] if before else [],
@@ -5266,6 +5267,25 @@ class Connector:
         link_register(self.base, SKILLS_ENGINE, SKILLS_ENGINE, src, self.home, {"by": "connect"})
         self.log += link_drop_mirrors(self.base, src, self.home, SKILLS_ENGINE)
 
+    def record_base_files(self, me, gone=False):
+        """The files connect itself made in the base (the skills copies in engines/agents-skills, an engines.json
+        that holds only their entry) are listed with their hash in the kit's "created" record, like the kit's own
+        files: an installer that guards your data then knows they are ours, not yours."""
+        created = me.setdefault("created", {})
+        for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r == ENGINES_REG]:
+            created.pop(r)
+        dest = self.base / "engines" / SKILLS_ENGINE
+        reg = reg_load(self.base, ENGINES_REG)
+        if gone or not (reg.get("engines", {}).get(SKILLS_ENGINE) or {}).get("link") or dest.is_symlink():
+            return
+        for dp, dns, fns in os.walk(dest):
+            for f in fns:
+                fp = pathlib.Path(dp) / f
+                if fp.is_file() and not fp.is_symlink():
+                    created[fp.relative_to(self.base).as_posix()] = sha(fp.read_bytes())
+        if set(reg) == {"engines"} and set(reg["engines"]) == {SKILLS_ENGINE}:
+            created[ENGINES_REG] = sha((self.base / ENGINES_REG).read_bytes())
+
     def unlink_skills(self, rec):
         """disconnect: the link goes; what is left in engines/agents-skills (not ours) comes back as the folder."""
         sl = rec.get("skills_link")
@@ -5742,6 +5762,7 @@ class Connector:
             tt = f" {TIDY_UNIT}.timer" if any(TIDY_UNIT in r for r in rec["timer"]) else ""
             self.log.append(f"if the timers were enabled: systemctl --user disable --now {UNIT}.timer{tt}")
         del me["connect"]
+        self.record_base_files(me, gone=True)
         self.save_kits(k)
         self.frugal_give_back()
         return self.log

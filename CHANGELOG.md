@@ -47,7 +47,8 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - **`~/.agents/skills` is a link** to `engines/agents-skills` (`mode: adopted`, written by connect; no more
   mirror circle): connect makes the link and writes its copies there; an old folder becomes the link only when it
   holds nothing but connect's own copies (else it is reported once and left as it is); disconnect removes the link
-  and the folder.
+  and the folder. The copies and an engines.json that holds only their entry are listed with their hash in the kit's
+  `created` record (like the kit's own files), so an installer that guards your data knows they are connect's.
 - **Doctor**: a tool adopted by a link whose link is broken, missing, points elsewhere or was replaced by a real
   folder is an ERROR with the fix command. Tests: `AdoptByLinkTests` (a fake `~/.config/Claude`), `SkillsLinkTests`.
 
