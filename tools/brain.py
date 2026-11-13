@@ -7763,6 +7763,15 @@ def st_dropin_path(home=None):
     return pathlib.Path(home or home_dir()) / ".config/systemd/user" / ST_DROPIN
 
 
+def st_dropin_ok(base, home=None):
+    """The start-up drop-in is there (a real folder, or a link into ops/systemd after adopt-units) and runs the
+    sync-scan of THIS base before Syncthing starts; which brain.py path it names does not matter."""
+    t = read(st_dropin_path(home)) or ""
+    b = shlex.quote(str(pathlib.Path(base).resolve()))
+    return any(l.startswith("ExecStartPre=") and " engine sync-scan --lock-first" in l and
+               l.rstrip().endswith(f"--base {b}") for l in t.splitlines())
+
+
 def st_dropin_text(base):
     me = pathlib.Path(__file__).resolve()
     return ("# written by brain.py (Skeleton Base): scan the base for secrets BEFORE Syncthing starts and scans it\n"
@@ -7875,7 +7884,7 @@ def st_doctor(base, home=None):
                              "the scan"))
     if not st_unit_found(home):
         rows.append(("INFO", "Syncthing is not a systemd user service: it scans at its own start before brain.py does"))
-    elif read(st_dropin_path(home)) != st_dropin_text(base):
+    elif not st_dropin_ok(base, home):
         rows.append(("WARN", "Syncthing start-up drop-in missing: it would scan before brain.py at its start "
                              "-> brain.py engine sync-all on"))
     state = reg_load(base, ST_STATE)
@@ -9816,7 +9825,13 @@ def leftover_rows(base, home):
 # one STAYS reason id; anything else is OUTSIDE "unclassified". No deep walks: names, links and (only for
 # product-named caches) a size kept in .brain/doctor-sizes.json for a day.
 STAYS_REASONS = ("os-system", "program-install", "cache", "secret-store", "vault", "backups-outlive-base",
-                 "installer-record", "fixed-locator", "guard-file", "other-user", "tool-state-at-xdg-path")
+                 "installer-record", "fixed-locator", "guard-file", "other-user", "tool-state-at-xdg-path",
+                 "app-config")        # app-config: a non-AI program's own settings (it stays where it looks)
+_XDG = (".config", ".local/share", ".local/state")
+_OS_DESKTOP = ("org.gnome.*", "gsconnect", ".gsd-*", "tiling-assistant", "ubuntu-insights", "update-notifier",
+               "gnome-session*", "user-session-migration", "xorg", "icc", "backgrounds", "orca", "nano")
+_APP_CONFIG = ("uv", "go", "NuGet", "turborepo", "configstore", "nextjs-nodejs", "pnpm", "containers", "blender",
+               "hopper", "Deskflow", "obsidian")
 SCAN_ROOTS = ("", ".config", ".local/share", ".local/state", ".local/bin", UNIT_HOME, ".cache", "Documents",
               "Desktop", "Downloads")                 # "" = HOME itself (every name, dotfiles too)
 SCAN_SKIP = {".config", ".local", ".local/share", ".local/state", ".local/bin", ".cache", "Documents", "Desktop",
@@ -9855,6 +9870,11 @@ STAYS = (             # (home-relative glob, reason id): first match wins
     (".pyenv", "program-install"), (".dotnet", "program-install"), (".vscode-server", "program-install"),
     (".bun", "program-install"), (".deno", "program-install"), ("go", "program-install"),
     ("Applications", "program-install"), ("snap", "program-install"), ("rea-engines", "program-install"),
+    *((f"{x}/{n}", "os-system") for x in _XDG for n in _OS_DESKTOP), (".local/share/pki", "os-system"),
+    (".gsd-*", "os-system"),
+    *((f"{x}/{n}", "app-config") for x in _XDG for n in _APP_CONFIG), (".android", "app-config"),
+    *((f"Downloads/{g}", "program-install") for g in ("*.deb", "*.deb.[0-9]*", "*.AppImage", "*.dmg", "*.flatpak",
+                                                      "*.tar.gz", "*.tgz", "*.zip", "*.rpm")),
     (".npm", "cache"), (".cache/*", "cache"),
     (".ssh", "secret-store"), (".gnupg", "secret-store"), (".pki", "secret-store"), (".sigstore", "secret-store"),
     (".docker", "secret-store"), (".config/gh", "secret-store"), (".idapro", "secret-store"),
@@ -9869,6 +9889,17 @@ STAYS = (             # (home-relative glob, reason id): first match wins
 CACHE_PRODUCTS = ("frugal*", "hermes*", "codex*", "claude*", "skeleton*", "mothership*")   # + outside.json "products"
 CACHE_BIG = 50 * 1024 * 1024
 SIZES = ".brain/doctor-sizes.json"
+
+
+def in_base_lexical(p, base, vault=None):
+    """P counts as in the base when its own path, the first hop of its link, or where it finally resolves is in
+    the base or in the vault (a vault link inside the base resolves outside it on purpose)."""
+    p = os.path.normpath(os.path.abspath(str(p)))
+    roots = [str(pathlib.Path(base).resolve())] + ([str(vault)] if vault else [])
+    cands = [p, os.path.realpath(p)]
+    if os.path.islink(p):
+        cands.append(os.path.normpath(os.path.join(os.path.dirname(p), os.readlink(p))))
+    return any(c == r or c.startswith(r.rstrip("/") + "/") for c in cands for r in roots)
 
 
 def outside_allow(base):
@@ -9934,9 +9965,11 @@ def outside_scan(base, home, handled=()):
     guards = {e.get("from", "").removeprefix("~/") for e in reg_load(base, ENGINES_REG).get("engines", {}).values()
               if isinstance(e, dict) and e.get("mode") == "adopted"}
     try:
-        vault = home_rel(vault_root(base), home).removeprefix("~/")
+        vroot = vault_root(base)
+        vault = home_rel(vroot, home).removeprefix("~/")
     except SystemExit:
-        vault = None
+        vroot = vault = None
+    inb = lambda x: in_base_lexical(x, base, vroot)
     mine_units = {pathlib.PurePosixPath(r).name for st in ("watch", "timer")
                   for r in (connect_rec(base).get(st) or {}) if r.startswith(UNIT_HOME + "/")}
     skip = set(handled) | set(TOOLS) | set(TOOL_HOMES) | {k.split("/")[0] for k in TOOLS if "/" not in k} | NOT_TOOLS
@@ -9973,12 +10006,12 @@ def outside_scan(base, home, handled=()):
             if r in SCAN_SKIP or r in skip or os.path.normpath(e.path) == str(base) or in_dir(base, p) and \
                     not p.is_symlink():
                 continue
-            if p.is_symlink() and in_dir(p, base):
+            if p.is_symlink() and inb(p):
                 counts["link into the base"] = counts.get("link into the base", 0) + 1
                 continue
             if root == ".local/bin":
                 tgt = os.path.realpath(p) if p.is_symlink() else None
-                if tgt and not in_dir(tgt, base) and not any(in_dir(tgt, home / x) for x in (
+                if tgt and not inb(p) and not any(in_dir(tgt, home / x) for x in (
                         ".local/share/uv", ".local/share/claude", ".local/share/pnpm", ".local/bin", "Applications",
                         ".nvm", ".cargo", "snap")) and not tgt.startswith(("/usr/", "/opt/", "/snap/", "/bin/")):
                     rows.append(("OUTSIDE", f"~/{r} -> {tgt}: a link to a place outside the base (move what it "
@@ -9995,7 +10028,7 @@ def outside_scan(base, home, handled=()):
                     rows.append(("OUTSIDE", f"~/{r}: a real unit {'folder' if p.is_dir() else 'file'} "
                                             "-> brain.py engine adopt-units"))
                 for f in ([x for x in sorted(p.iterdir()) if x.is_file()] if p.is_dir() else [p]):
-                    bad = sorted({x for x in unit_paths(f, home) if not in_dir(x, base) and (
+                    bad = sorted({x for x in unit_paths(f, home) if not inb(x) and (
                         in_dir(x, home) and not in_dir(x, home / ".local/bin") or not in_dir(x, home) and not
                         x.startswith(("/usr/", "/bin/", "/sbin/", "/etc/", "/opt/", "/snap/", "/dev/", "/proc/",
                                       "/run/", "/tmp/", "/var/", "/lib")))})

@@ -25,6 +25,15 @@ Changes to the skeleton structure and tools (not to anyone's content).
   `.brain/outside.json` "allow" (now also `{"path": "~/x", "reason": "<id>"}`; a wrong id is a WARN). Anything else
   is OUTSIDE "unclassified" with the fix. `~/rea-engines` is program-install. Containers (`~/.cache`, `~/.config`,
   `~/.local`, Documents, Desktop, Downloads) are no longer allowed as one blob, by default or in outside.json.
+- The scan judges a link by its own path, its first hop and its end: in the base or in the vault is in the base (a
+  vault link such as `~/.claude.json` -> `engines/claude/.claude.json` -> vault, or a unit's EnvironmentFile that is a
+  vault link). New reason id `app-config` (a non-AI program's own settings: uv, go, NuGet, turborepo, configstore,
+  nextjs-nodejs, pnpm, containers, blender, hopper, Deskflow, obsidian, `.android`); os-system covers GNOME/desktop
+  state (org.gnome.*, gsconnect, .gsd-*, tiling-assistant, ubuntu-insights, update-notifier, gnome-session*,
+  user-session-migration, xorg, icc, backgrounds, orca, nano, `.local/share/pki`); installers in `~/Downloads`
+  (*.deb, *.deb.N, *.AppImage, *.dmg, *.flatpak, *.tar.gz, *.tgz, *.zip, *.rpm) are program-install.
+- The Syncthing start-up drop-in check accepts the drop-in written by any brain.py path of this base, as a real
+  folder or as a link into `ops/systemd` after `engine adopt-units`.
 - **Generic adopt**: `engine adopt NAME --path DIR [--vault GLOB]... [--heavy GLOB]...` moves any folder by a link
   (same mover, vault and heavy lines; the globs are kept in engines.json). Named rows (`engine adopt ID`, hinted by
   doctor): codex-desktop (`~/.config/Codex`) and hermes-desktop (`~/.config/Hermes`) with the Claude app's Electron

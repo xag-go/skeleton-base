@@ -5777,3 +5777,62 @@ class UnitsAdoptTests(ToolHome):
 
 def shq_(p):
     return "'" + str(p).replace("'", "'\\''") + "'"
+
+
+class FullScanFollowUpTests(ToolHome):
+    """1.6.8 follow-up: vault links count as in the base; common non-AI things carry a reason; the Syncthing
+    drop-in is found as a real dir or a link into ops/systemd."""
+
+    def test_vault_links_count_as_in_the_base(self):
+        vault = self.home / ".base-secret/claude"
+        self.write(vault, ".claude.json", "{}\n")
+        self.write(vault, "claude-code.env", "K=SECRET-VALUE\n")
+        (self.base / "engines/claude/team/config").mkdir(parents=True)
+        (self.base / "engines/claude/.claude.json").symlink_to(vault / ".claude.json")
+        env = self.base / "engines/claude/team/config/claude-code.env"
+        env.symlink_to(vault / "claude-code.env")
+        (self.home / ".claude.json").symlink_to(self.base / "engines/claude/.claude.json")
+        u = self.base / "ops/systemd/team-x.service"
+        self.write(u.parent, u.name, f"[Service]\nEnvironmentFile={env}\nExecStart=/bin/true\n")
+        (self.home / ".config/systemd/user").mkdir(parents=True)
+        (self.home / ".config/systemd/user/team-x.service").symlink_to(u)
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotIn("~/.claude.json", out)
+        self.assertNotIn("names paths outside the base", out)
+
+    def test_common_non_ai_things_carry_a_reason(self):
+        h = self.home
+        names = [".config/org.gnome.Ptyxis", ".local/share/org.gnome.TextEditor", ".config/gsconnect",
+                 ".local/share/gsconnect", ".config/.gsd-keyboard.settings-ported", ".local/share/tiling-assistant",
+                 ".config/ubuntu-insights", ".cache/ubuntu-insights", ".config/update-notifier",
+                 ".config/gnome-session", ".local/share/gnome-session", ".local/share/user-session-migration",
+                 ".local/share/xorg", ".local/share/icc", ".local/share/backgrounds", ".local/share/orca",
+                 ".local/share/nano", ".config/nano", ".local/share/pki", ".config/uv", ".config/go", ".config/NuGet",
+                 ".config/turborepo", ".config/configstore", ".config/nextjs-nodejs", ".local/state/pnpm",
+                 ".config/pnpm", ".config/containers", ".config/blender", ".config/hopper", ".config/Deskflow",
+                 ".local/state/Deskflow", ".config/obsidian", ".android"]
+        for n in names:
+            (h / n).mkdir(parents=True, exist_ok=True)
+        for f in ("a.deb", "a.deb.1", "b.AppImage", "c.dmg", "d.flatpak", "e.tar.gz", "f.zip"):
+            self.write(h, f"Downloads/{f}", "x\n")
+        (h / ".config/my-own-tool").mkdir()
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        for n in names + ["Downloads/a.deb", "Downloads/a.deb.1", "Downloads/b.AppImage", "Downloads/f.zip"]:
+            self.assertNotIn(f"~/{n} ", out, n)
+        self.assertRegex(out, r"unclassified: ~/\.config/my-own-tool ", "everything else stays unclassified")
+        self.assertRegex(out, r"INFO\s+outside the base on purpose: .*app-config \d+")
+        self.assertIn("app-config", B.STAYS_REASONS)
+
+    def test_syncthing_drop_in_is_found_as_a_dir_or_a_link(self):
+        d = self.home / ".config/systemd/user" / B.ST_DROPIN
+        other = B.st_dropin_text(self.base).replace(str(pathlib.Path(B.__file__).resolve()),
+                                                    str(self.base / "tools/brain.py"))
+        self.write(d.parent, d.name, other)                      # written by the base's own brain.py
+        self.assertTrue(B.st_dropin_ok(self.base, self.home))
+        ops = self.base / "ops/systemd" / d.parent.name
+        ops.parent.mkdir(parents=True)
+        os.rename(d.parent, ops)
+        d.parent.symlink_to(ops)                                 # after adopt-units
+        self.assertTrue(B.st_dropin_ok(self.base, self.home))
+        self.write(ops, d.name, "[Service]\n")
+        self.assertFalse(B.st_dropin_ok(self.base, self.home))
