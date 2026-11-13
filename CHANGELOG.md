@@ -12,7 +12,8 @@ Changes to the skeleton structure and tools (not to anyone's content).
   The API key is read from Syncthing's config.xml at run time and is never printed, logged or stored.
 - A user systemd drop-in `~/.config/systemd/user/syncthing.service.d/skeleton-base-scan.conf` runs
   `engine sync-scan` as `ExecStartPre` (TimeoutStartSec=600), so Syncthing's own start-up scan comes after ours.
-  Removed by `sync-all off` and `uninstall`. Not a systemd user service: skipped, doctor says so.
+  `ExecStartPre=-` so Syncthing always starts; a failed or unfinished scan (`--lock-first`) writes a fail-closed lockdown
+  block (`*`) at the top of `.stignore`, doctor reports an ERROR, the next good scan removes it. Removed by `sync-all off` and `uninstall`. Not a systemd user service: skipped, doctor says so.
 - Syncthing not found or not reachable: unchanged behaviour, doctor warns that new files can sync before the scan.
 - Doctor checks the folder settings, the drop-in and that the last scan request is not older than the last sync-scan.
 - Cost: the other computer sees changes up to one watch cycle (10 min) later. Tests `SyncthingOnDemandTests`.

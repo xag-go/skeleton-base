@@ -4931,8 +4931,8 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         dp = self.home / ".config/systemd/user/syncthing.service.d/skeleton-base-scan.conf"
         self.b("engine", "sync-all", "on")
         t = dp.read_text()
-        self.assertIn("ExecStartPre=", t)
-        self.assertIn("engine sync-scan --base", t)
+        self.assertIn("\nExecStartPre=-", t)
+        self.assertIn("engine sync-scan --lock-first --base", t)
         self.assertIn("TimeoutStartSec=600", t)
         self.assertNotIn(self.KEY, t)
         r = self.b("doctor")
@@ -4983,6 +4983,40 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         d = json.loads(stf.read_text()); d["scan_requested_at"] = 1.0; stf.write_text(json.dumps(d))
         self.assertIn("scan request is older", self.b("doctor").stdout)
         self.assertEqual(json.loads(stf.read_text())["prev"], {"fsWatcherEnabled": True, "rescanIntervalS": 3600})
+
+    def test_failed_scan_locks_the_base_and_the_next_good_scan_unlocks_it(self):
+        self.prep(); self.st_config()
+        self.b("engine", "sync-all", "on")
+        st = self.base / ".stignore"
+        good = st.read_text()
+        self.assertIn("// mine", good)
+        g = self.bin / "gitleaks"; kept = g.read_text(); g.unlink()
+        r = self.hb("engine", "sync-scan", "--force", "--base", str(self.base), env=self.env())
+        self.assertNotEqual(r.returncode, 0)
+        lk = st.read_text()
+        self.assertTrue(lk.startswith("// skeleton-base lockdown:start\n"), lk[:80])
+        self.assertIn("\n*\n// skeleton-base lockdown:end\n", lk)
+        self.assertTrue(lk.endswith(good))                           # user lines and denied block untouched
+        n = len(self.reqs)
+        d = self.hb("doctor", "--base", str(self.base), env=self.env()).stdout
+        self.assertRegex(d, r"ERROR\s+sync lockdown: .*gitleaks")
+        g.write_text(kept); g.chmod(0o755)
+        before = len(self.reqs)
+        self.b("engine", "sync-scan", "--force")
+        self.assertEqual(st.read_text(), good)
+        ev = self.events.read_text().splitlines()
+        self.assertEqual(ev[-1], "scan stignore=denied", ev)          # asked after the unlock
+        self.assertTrue(any(m == "POST" for m, _, _ in self.reqs[before:]))
+        self.assertNotIn("lockdown", self.b("doctor").stdout)
+
+    def test_lock_first_leaves_the_lockdown_when_the_scan_never_finishes(self):
+        self.prep(); self.st_config()
+        self.b("engine", "sync-all", "on")
+        g = self.bin / "gitleaks"
+        g.write_text(f"#!{sys.executable}\nimport os\nos._exit(9)\n")
+        r = self.hb("engine", "sync-scan", "--force", "--lock-first", "--base", str(self.base), env=self.env())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("lockdown:start", (self.base / ".stignore").read_text())
 
 
 def stat_mode(p):

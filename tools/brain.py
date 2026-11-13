@@ -7188,7 +7188,9 @@ def _sync_patterns(base):
             if l.strip() and not l.startswith("//")]
     extra = []
     own = {"/" + _st_escape(x) for x in reg_load(base, SYNC_DENIED_REG).get("denied", {})}   # last scan's lines
-    for l in (read(pathlib.Path(base) / ".stignore") or "").splitlines():
+    cur_st = read(pathlib.Path(base) / ".stignore") or ""
+    cur_st = "".join(lockdown_split(cur_st)[::2])        # the lockdown's own `*` is not a share rule
+    for l in cur_st.splitlines():
         l = l.strip()
         if l and not l.startswith("//") and not l.startswith("#include") and l not in pats and l not in own:
             extra.append(l)
@@ -7243,6 +7245,54 @@ def sync_scan_state(base):
     return st, seen
 
 
+LOCKDOWN_START = "// skeleton-base lockdown:start"
+LOCKDOWN_END = "// skeleton-base lockdown:end"
+
+
+def lockdown_split(text):
+    """(before, block, after) of the lockdown block in a .stignore text (block None when absent)."""
+    a = text.find(LOCKDOWN_START + "\n")
+    b = text.find(LOCKDOWN_END, a) if a >= 0 else -1
+    if a < 0 or b < 0:
+        return text, None, ""
+    e = b + len(LOCKDOWN_END)
+    e += 1 if text[e:e + 1] == "\n" else 0
+    return text[:a], text[a:e], text[e:]
+
+
+def lockdown_reason(base):
+    t = read(pathlib.Path(base) / ".stignore") or ""
+    blk = lockdown_split(t)[1]
+    return None if blk is None else blk.splitlines()[1].removeprefix("// skeleton-base lockdown: ").split(
+        "; nothing in this folder")[0]
+
+
+def lockdown_set(base, reason):
+    """Fail closed: a block at the TOP of .stignore (first match wins) that shares nothing, until a scan succeeds.
+    Only this block is added; every other line stays. Atomic. Present already: left as it is (first reason stays)."""
+    f = pathlib.Path(base) / ".stignore"
+    cur = read(f) or ""
+    if lockdown_split(cur)[1] is not None:
+        return False
+    reason = " ".join(str(reason).split())[:120]
+    blk = (f"{LOCKDOWN_START}\n// skeleton-base lockdown: last content scan failed ({time.strftime('%Y-%m-%d %H:%M')}: "
+           f"{reason}); nothing in this folder is shared until a scan succeeds\n*\n{LOCKDOWN_END}\n")
+    atomic_write(f, blk + cur)
+    return True
+
+
+def lockdown_clear(base):
+    f = pathlib.Path(base) / ".stignore"
+    cur = read(f)
+    if cur is None:
+        return False
+    before, blk, after = lockdown_split(cur)
+    if blk is None:
+        return False
+    atomic_write(f, before + after)
+    return True
+
+
 def sync_pending(base, cur=None, seen=None):
     """(cur, sorted rels): the shareable files that still have to be scanned, i.e. new or changed (mtime and size)
     since the last scan. This one rule is used by sync-scan and by doctor. Files over SYNC_SCAN_MAX are handled
@@ -7254,7 +7304,28 @@ def sync_pending(base, cur=None, seen=None):
     return cur, sorted(r for r, (mt, sz) in cur.items() if sz <= SYNC_SCAN_MAX and seen.get(r) != [mt, sz])
 
 
-def sync_scan(base, force=False, now=None, notify=True):
+def sync_scan(base, force=False, now=None, notify=True, lock_first=False):
+    """The scan with the fail-closed lockdown around it: any failed (or, with LOCK_FIRST, unfinished) scan leaves the
+    lockdown block in .stignore; a good scan removes it and only then asks Syncthing to scan."""
+    base = pathlib.Path(base).resolve()
+    if engine_shares(base).get(SYNC_ALL) is None:
+        lockdown_clear(base)
+        return _sync_scan(base)
+    if lock_first:
+        lockdown_set(base, "scan did not finish")
+    try:
+        log, n = _sync_scan(base, force, now)
+    except BaseException as e:
+        lockdown_set(base, e if isinstance(e, SystemExit) and e.code else (str(e) or type(e).__name__))
+        raise
+    if lockdown_clear(base):
+        log.append("sync scan: lockdown removed")
+    if notify:
+        log += st_scan(base)                       # always AFTER our scan, so nothing is offered before it
+    return log, n
+
+
+def _sync_scan(base, force=False, now=None):
     """Content gate for sync all: gitleaks over the files that sync_pending lists (only new or changed ones since the
     last scan unless FORCE); flagged files (and non-text files above 2 MB) go to .brain/sync-denied.json (paths and
     rule ids only) and into the generated deny lines of .stignore. The generated ignore files this rewrites are
@@ -7326,8 +7397,6 @@ def sync_scan(base, force=False, now=None, notify=True):
     added = sorted(set(denied) - set(prev0))
     log = [f"sync scan: {shareable} shareable files, {scanned} scanned, {len(denied)} denied"
            + (f" ({len(added)} new)" if added else "") + (f"; updated {', '.join(updated)}" if updated else "")]
-    if notify:
-        log += st_scan(base)                       # always AFTER our scan, so nothing is offered before it
     return log, len(denied)
 
 
@@ -7434,8 +7503,9 @@ def st_dropin_text(base):
     me = pathlib.Path(__file__).resolve()
     return ("# written by brain.py (Skeleton Base): scan the base for secrets BEFORE Syncthing starts and scans it\n"
             "[Service]\nTimeoutStartSec=600\n"
-            f"ExecStartPre={shlex.quote(sys.executable)} -S {shlex.quote(str(me))} engine sync-scan --base "
-            f"{shlex.quote(str(base))}\n")
+            f"# the '-' keeps Syncthing starting; a failed scan leaves the lockdown in the base's .stignore (nothing shared)\n"
+            f"ExecStartPre=-{shlex.quote(sys.executable)} -S {shlex.quote(str(me))} engine sync-scan --lock-first "
+            f"--base {shlex.quote(str(base))}\n")
 
 
 def st_secure(base, home=None):
@@ -7572,9 +7642,11 @@ def engine_sync_all(base, on):
             log += sync_scan(base, force=True)[0]
         except BaseException:                      # no scan, no sharing: turn it off again
             reg.pop("sync", None); reg_save(base, ENGINES_REG, reg); refresh_ignore_blocks(base)
-            st_release(base)
+            st_release(base); lockdown_clear(base)
             raise
     else:
+        if lockdown_clear(base):
+            log.append("lockdown removed")
         log += st_release(base)
     return log
 
@@ -9133,6 +9205,10 @@ def doctor(base, strict=False):
     why = sync_scan_due(base)
     if why:
         rows.append(("WARN", f"sync all is on but the content scan is behind ({why}): brain.py engine sync-scan"))
+    why = lockdown_reason(base)
+    if why:
+        rows.append(("ERROR", f"sync lockdown: {why}; the base shares NOTHING until a scan succeeds "
+                              "-> install gitleaks, then brain.py engine sync-scan"))
     rows += st_doctor(base, home)
     for lvl, text in rows:
         print(f"{lvl:8} {text}")
@@ -9355,7 +9431,7 @@ def main(argv):
                     print("usage: engine sync-all on|off"); return 1
                 log = engine_sync_all(base, rest[1] == "on")
             elif sub == "sync-scan":
-                log = sync_scan(base)[0] if "--force" not in flags else sync_scan(base, force=True)[0]
+                log = sync_scan(base, force="--force" in flags, lock_first="--lock-first" in flags)[0]
             elif sub == "sync":
                 ch = mirror_sync(base, quiet=False)
                 log = [f"mirrors changed: {', '.join(ch)}" if ch else "mirrors up to date"]

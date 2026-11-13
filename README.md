@@ -517,7 +517,7 @@ engines.json  projects.json                 what is where (tracked)
   folder (`POST /rest/db/scan?folder=ID`) at the end of every sync-scan. Order: our scan, `.stignore`, Syncthing's
   scan. A user systemd drop-in (`~/.config/systemd/user/syncthing.service.d/skeleton-base-scan.conf`, then
   `systemctl --user daemon-reload`) runs the scan before Syncthing starts, so its start-up scan comes after ours.
-  Cost: the other computer sees changes up to one watch cycle (10 min) later. Fallback: no Syncthing folder found,
+  Cost: the other computer sees changes up to one watch cycle (10 min) later. If a scan fails (gitleaks missing, crash, timeout), brain.py writes a lockdown block at the top of the base's `.stignore` (`*`: nothing is shared) and `doctor` reports an ERROR; the next good scan removes the block (only that block; your lines and the denied lines stay), then asks Syncthing to scan. The drop-in's start-up scan uses `ExecStartPre=-`, so Syncthing always starts (it also syncs other folders) and the lockdown is already in `.stignore` when it reads it. Fallback: no Syncthing folder found,
   not reachable, or not a systemd user service: nothing breaks, sharing works as before, and `doctor` warns that new
   files can sync before the scan. A file created while our scan runs can still be offered before the next one
   (seconds to minutes on a huge base).
