@@ -158,7 +158,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.6"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.7"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
