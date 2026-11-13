@@ -3729,6 +3729,18 @@ class RoleTests(ToolHome):
         self.assertIn(rule, c.read_text())
         self.assertEqual(c.read_text().count("<!-- base-folder:start"), 1)
 
+    def test_tool_product_identity_is_not_a_role(self):
+        """Real run 2026-11-13: Codex answered "I'm Codex" with engineer.md listing codex, because the rule let any
+        system prompt win. The tool's built-in identity must not count; the role's title is the answer."""
+        for t in (B.role_rule(str(self.base) + "/agents"), B.role_rule("agents")):
+            self.assertIn("product name", t)
+            self.assertIn("are not a role and not a name", t)
+            self.assertIn("Only an identity the user set counts", t)
+            self.assertIn("\"who are you?\"", t)
+            self.assertIn("that role's title, not your tool's name", t)
+            self.assertNotIn("Your own identity (your system prompt", t)
+        self.assertIn(B.role_rule("agents"), (REPO / "AGENTS.md").read_text())
+
     def test_engines_list_block_list_and_legacy_engine(self):
         self.assertEqual(B.role_engines(ROLE_TWIN), ["hermes"])
         self.assertEqual(B.role_engines(ROLE_ENGINEER), ["claude-code", "codex"])

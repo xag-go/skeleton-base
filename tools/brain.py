@@ -146,7 +146,7 @@ import sys
 import time
 
 VERSION = "1"
-RELEASE = "1.6.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.6.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -3477,10 +3477,13 @@ def pointer_body(base):
 def role_rule(agents):
     """Who am I: the same rule in every tool's pointer block and in the base's AGENTS.md block."""
     return f"""## Your role and name
-- Your own identity (your system prompt, SOUL.md or identity file, a project ROLE.md) names your role or name: use it.
-- Otherwise, before you say who you are or act in a role, read the frontmatter of `{agents}/*.md`. A role whose
-  `engines:` list (or old `engine:` line) holds your tool's id (lowercase with hyphens: `claude-code`, `codex`,
-  `gemini`, `hermes`, `opencode`, ...) is yours when it is the ONLY such role: take its `name:` (if any) and duties.
+- Your tool's product name and its built-in "You are <tool>" line (Claude Code, Codex, Gemini CLI, opencode, ...)
+  are not a role and not a name. Only an identity the user set counts as your own: a custom system prompt or
+  identity file (SOUL.md) that names a role or name, or a project ROLE.md. If it does: use it.
+- Otherwise, before you say who you are (also "who are you?") or act in a role, read the frontmatter of
+  `{agents}/*.md`. A role whose `engines:` list (or old `engine:` line) holds your tool's id (lowercase with hyphens:
+  `claude-code`, `codex`, `gemini`, `hermes`, `opencode`, ...) is yours when it is the ONLY such role: answer with
+  that role's title, not your tool's name, and take its `name:` (if any) and duties.
 - No match, or several: use no personal name, act as a neutral helper, and ask the user once which role you play
   (they add your tool id to that role's `engines:`).
 - Never take your name from `wiki/me/` or the user's file: names there are the user's words about specific roles."""
