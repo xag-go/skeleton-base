@@ -16,8 +16,9 @@ Changes to the skeleton structure and tools (not to anyone's content).
   are written back into USER.md under their own heading, or into the blank form line of their label; an export is
   never only the blank form while the base knows lines.
 - connect and disconnect refuse a tool home variable (CLAUDE_CONFIG_DIR, CODEX_HOME, HERMES_HOME, GEMINI_CLI_HOME,
-  COPILOT_HOME, OPENCLAW_STATE_DIR, FRUGAL_HOME) that points outside the HOME they run for, unless --tool-dir names
-  that tool or --allow-outside-home is given.
+  COPILOT_HOME, OPENCLAW_STATE_DIR, FRUGAL_HOME) that points outside the HOME they run for and outside the base,
+  unless a dir recorded for that tool (--tool-dir, connect record, shared registry) covers it, or --tool-dir names
+  that tool, or --allow-outside-home is given. FRUGAL_HOME is refused only when its global.json names another base.
 
 ## v1.7.4 - 2026-11-14
 - tidy: watch-owned registry files (engines.json, projects.json, .kits.json, .mothership.json) rewritten during a page

@@ -2164,24 +2164,42 @@ def home_dir():
 
 
 # a tool's home variable that names a folder outside the HOME a connect/disconnect runs for (1.7.5): the run would
-# write there. Refused unless --tool-dir names that tool or --allow-outside-home is given.
+# write there. Allowed: under that HOME, under the base being connected, or a dir recorded for that tool (--tool-dir,
+# the connect record, the shared registry). Frugal-Bridge's FRUGAL_HOME is refused only when its global.json names
+# another base. Otherwise refused, unless --tool-dir names that tool or --allow-outside-home is given.
 TOOL_HOME_VARS = {"CLAUDE_CONFIG_DIR": ".claude", "CODEX_HOME": ".codex", "HERMES_HOME": ".hermes",
                   "GEMINI_CLI_HOME": ".gemini", "COPILOT_HOME": ".copilot", "OPENCLAW_STATE_DIR": ".openclaw",
                   "OPENCLAW_HOME": ".openclaw", "FRUGAL_HOME": None}
 
 
-def outside_home_check(home, cmd, exempt=()):
-    """SystemExit when a tool home variable in the environment points outside HOME (exempt: tool keys given with
-    --tool-dir). The live environment's variables must not steer a run that is meant for a fake or other HOME."""
+def recorded_tool_dirs(base, home):
+    """[(tool key, dir)] that connect recorded for this base (--tool-dir) and in the shared registry (1.7.5)."""
+    rec = connect_rec(base)
+    out = [(k, d) for k, ds in (rec.get("dirs") or {}).items() for d in ds]
+    return out + [(k, d) for k, d, _ in registered_dirs(home, [])]
+
+
+def outside_home_check(home, base, cmd, exempt=()):
+    """SystemExit when a tool home variable in the environment points somewhere that is neither under HOME, nor under
+    the base, nor a dir recorded for that tool. EXEMPT: tool keys named with --tool-dir."""
     home = pathlib.Path(home).resolve()
+    recorded = recorded_tool_dirs(base, home)
     for var, key in TOOL_HOME_VARS.items():
         v = os.environ.get(var)
-        if not v or (key is not None and key in exempt):
+        if not v:
             continue
-        if not in_dir(os.path.expanduser(v), home):
-            raise SystemExit(f"{cmd}: {var}={v} points outside HOME ({home}), so this run would write there. "
-                             "Run it with `env -i HOME=<home> PATH=/usr/bin:/bin ...`, unset the variable, "
-                             "pass --tool-dir for that tool, or add --allow-outside-home.")
+        p = os.path.expanduser(v)
+        if in_dir(p, home) or in_dir(p, base):
+            continue
+        if key is None:                               # Frugal-Bridge's home: refused only when it belongs to another base
+            reg = frugal_reg(home)
+            if reg is None or not reg.get("base") or same_dir(reg.get("base"), base):
+                continue
+        if key is not None and (key in exempt or any(k == key and in_dir(p, d) for k, d in recorded)):
+            continue
+        raise SystemExit(f"{cmd}: {var}={v} points outside HOME ({home}) and outside this base, so this run would "
+                         "write there. Run it with `env -i HOME=<home> PATH=/usr/bin:/bin ...`, unset the variable, "
+                         "pass --tool-dir for that tool, or add --allow-outside-home.")
 
 
 # ---------------------------------------------------------------- where each AI tool really keeps its files
@@ -11800,7 +11818,7 @@ def main(argv):
                 print(f"{cmd}: unknown argument {a}\n" + __doc__); return 1
         base = pathlib.Path(opts.get("--base") or SRC).expanduser().resolve()
         if cmd in ("connect", "disconnect") and not opts.get("--allow-outside-home"):
-            outside_home_check(home_dir(), cmd, exempt=[k for k, _ in tdirs])
+            outside_home_check(home_dir(), base, cmd, exempt=[k for k, _ in tdirs])
         if cmd == "watch":
             return watch_main(base, opts)
         if cmd == "connect" and opts.get("--print"):

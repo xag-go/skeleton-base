@@ -22,7 +22,8 @@ from unittest import mock
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BRAIN = REPO / "tools" / "brain.py"
 # tests must never read the real tool homes: drop them (a test that needs one sets it itself)
-for _v in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "HERMES_HOME", "FRUGAL_HOME"):
+for _v in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "HERMES_HOME", "FRUGAL_HOME", "GEMINI_CLI_HOME", "COPILOT_HOME",
+           "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"):      # the live environment never steers a test (1.7.5)
     os.environ.pop(_v, None)
 
 FRUGAL_SRC = pathlib.Path(os.environ.get("FRUGAL_BRIDGE_SRC") or os.path.expanduser("~/frugal-bridge"))
@@ -2001,7 +2002,7 @@ FAKE_USER = ("# USER.md — who the user is and how they want answers\n\n"
              "- Name: Alex Example\n"
              "Likes plain files.\n")
 SCRUB = ("HERMES_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "BRAIN_ROOT", "FRUGAL_BRIDGE_KIT", "FRUGAL_BASE",
-         "HERMES_AGENT")
+         "HERMES_AGENT", "GEMINI_CLI_HOME", "COPILOT_HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME")
 
 
 @unittest.skipUnless(HAVE_FRUGAL, "Frugal-Bridge checkout not found (set FRUGAL_BRIDGE_SRC)")
@@ -6390,11 +6391,23 @@ class OutsideHomeTests(ToolHome):
         self.assertIn("points outside HOME", r.stderr + r.stdout)
         self.assertFalse(live.exists())
         self.assertFalse((self.home / ".claude.json").exists())
-        r = self.hb("disconnect", env={"FRUGAL_HOME": str(self.tmp / "live" / "frugal")})
+        fh = self.tmp / "live" / "frugal"                    # a Frugal-Bridge home that belongs to another base
+        self.write(fh, "global.json", json.dumps({"base": str(self.tmp / "other-base")}))
+        r = self.hb("disconnect", env={"FRUGAL_HOME": str(fh)})
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("FRUGAL_HOME", r.stderr + r.stdout)
         r = self.hb("connect", "--allow-outside-home", env={"CLAUDE_CONFIG_DIR": str(live)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_home_under_the_base_or_recorded_for_that_tool_passes_without_the_flag(self):
+        under_base = self.base / "engines" / "claude"
+        self.assertEqual(self.hb("connect", env={"CLAUDE_CONFIG_DIR": str(under_base)}).returncode, 0)
+        other = self.tmp / "other-codex"
+        r = self.hb("connect", "--tool-dir", f"codex={other}", env={"CODEX_HOME": str(self.tmp / "x")})
+        self.assertNotIn("points outside HOME", r.stderr + r.stdout)
+        r = self.hb("connect", env={"CODEX_HOME": str(other)})          # recorded by the --tool-dir above
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("points outside HOME", r.stderr + r.stdout)
 
     def test_a_tool_dir_for_that_tool_is_enough_and_inside_home_passes(self):
         inside = self.home / ".claude"
