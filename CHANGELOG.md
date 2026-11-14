@@ -2,6 +2,48 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.0 - 2026-11-14
+No links at old paths: every program is told the new place, and the old path holds the guard file (0 bytes, mode
+000), so a launcher we do not know of fails loudly instead of making a new empty folder. Doctor: a missing guard, a
+link or a real folder at a pinned path is an ERROR with the fix (a program that still tries the old path cannot be
+seen from here).
+- **Claude Code** (`engine pin claude-code`, from 1.6.9): CLAUDE_CONFIG_DIR in the marked blocks of
+  `~/.config/environment.d/60-base-engines.conf` (user units and GUI sessions), `~/.profile` and `~/.bashrc`;
+  `~/.claude` and `~/.claude.json` become guard files. Undo: `engine pin --undo claude-code`.
+- **Electron apps** (`engine pin claude-desktop`, `engine pin codex-desktop`): `--user-data-dir=<base>/engines/<id>`
+  wherever we can find what starts them: a user `.desktop` override in `~/.local/share/applications` of each system
+  `.desktop` file whose Exec starts the app (`$XDG_DATA_DIRS`; a copy with only the Exec lines changed, actions and
+  URL-scheme handlers included), a wrapper `~/.local/bin/<program>` (earlier on PATH) that runs the real program with
+  the flag, and the app's `~/.config/autostart` entries. Then `~/.config/<App>` becomes the guard. watch refreshes an
+  override when a package update changes the system file (or the app rewrites its own user copy, as the Claude app
+  does with `X-Claude-Generated`). Undo puts every file back and the link. The app must honour `--user-data-dir`
+  (Chromium's switch; check once by starting it: the guard makes a failure loud). hermes-desktop is started by
+  `hermes desktop`, which passes no flag we know of: its link stays (no setting known).
+- **Units** (`engine pin-units [--undo]`): units live in `ops/systemd`; the user manager is told the place by
+  `Environment="SYSTEMD_UNIT_PATH=<base>/ops/systemd:"` in `/etc/systemd/system/user@.service.d/skeleton-base-units.conf`
+  (the trailing ':' keeps the default search path: systemd.unit(5), "Unit File Load Path"). It cannot write /etc:
+  it prints the one-time sudo commands and the restart step (log out of every session, or restart the
+  user manager unit `user@<uid>`), and removes the links in `~/.config/systemd/user` only once `systemctl --user show -p
+  UnitPath` lists ops/systemd. Enable links (`*.wants`, `*.requires`) that pointed at a removed link are pointed at
+  the unit file in ops/systemd (`systemctl enable` links a unit found on the search path to that file:
+  systemctl(1), "enable"). An installer that writes a unit there again: doctor ERROR, watch moves it into
+  ops/systemd (no link).
+- **Born in the base**: connect pre-sets each tool's own variable (one that moves that tool alone: CLAUDE_CONFIG_DIR,
+  CODEX_HOME, HERMES_HOME, OPENCLAW_STATE_DIR, COPILOT_HOME, GEMINI_CLI_HOME; never XDG_*) to `<base>/engines/<tool>`
+  in the same env blocks when the tool is not installed and nothing is at its default place, so its first run makes
+  its folder in the base; no empty folder is made; doctor says nothing about a pre-set variable; `engine adopt` or
+  watch records it as adopted once it exists. Qwen, Kilo, Goose and opencode have no variable of their own (XDG only).
+- **New AI folders are adopted by watch**: an AI-looking folder (rules or memory) that appears in `~`, `~/.config`,
+  `~/.local/share` or `~/.local/state` after the first run moves into `engines/<name>` when no program uses it (else
+  on a later run); no setting is known for it, so its link stays and is reported; it is listed in
+  `.brain/learned-tools.json`. disconnect gives these folders back. Folders without AI signals are never moved
+  (doctor lists them as unclassified).
+- **The only links allowed** (no setting known to tell the program the new place): `~/.config/Hermes`
+  (hermes-desktop), `~/.google_workspace_mcp`, `~/.cua-driver`, `~/.config/browser-harness`, `~/.config/hcli`
+  (XDG_CONFIG_HOME only), `~/.ida-mcp`, `~/.local/share/fastmcp` (FASTMCP_HOME exists but no MCP server entry here
+  launches fastmcp to set it in), the ntfy folders until their unit and server.yml are changed by hand, folders watch
+  adopted by itself. `~/.agents/skills` while a tool reads only it.
+
 ## v1.6.9 - 2026-11-13
 - **Secrets in Chromium/Electron sub-profiles**: a profile row (claude-desktop, codex-desktop, hermes-desktop:
   `profiles` in the row) and any folder adopted by a link get the Chromium login names at ANY depth, so `Default/`,

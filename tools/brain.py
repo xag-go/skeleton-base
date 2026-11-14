@@ -166,7 +166,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.6.9"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -4487,6 +4487,7 @@ TOOLS = {t["key"]: t for t in (
          status="app",
          # no setting moves its folder: `engine adopt claude-desktop` moves it into engines/ and leaves a link
          adopt="link", locks=("SingletonLock",),          # Electron: a link "<host>-<pid>" while the app runs
+         launch=("claude-desktop",),     # its program: `engine pin` adds --user-data-dir wherever it is started
          profiles=True,       # Chromium profile names apply in every sub-profile too (CHROMIUM_*)
          vault=("Cookies", "Cookies-journal", "buddy-tokens.json", "ant-did", "ant-device-registry.json",
                 "Trust Tokens*", "claude_desktop_config.json", "config.json",   # MCP env keys; oauth:tokenCache
@@ -4728,6 +4729,21 @@ class Connector:
                             f"{WATCH_UNIT}.service {UNIT}.timer {TIDY_UNIT}.timer")
         if "\n" not in str(self.base):                 # the base's own pointer file: any kit finds the base there
             self.units(rec["pointer"], {POINTER_FILE: f"{self.base}\n"})
+        reg = reg_load(self.base, ENGINES_REG)
+        want = preset_wanted(self.base, self.home, set(found))
+        if (reg.get("preset") or {}) != want:
+            if want:
+                reg["preset"] = want
+            else:
+                reg.pop("preset", None)
+            if reg:
+                reg_save(self.base, ENGINES_REG, reg)
+            elif (self.base / ENGINES_REG).is_file():
+                (self.base / ENGINES_REG).unlink()
+            write_env_files(self.base, reg, self.home, self.log)
+            if want:
+                self.log.append("pre-set for tools not installed yet (their first run makes their folder in the "
+                                "base): " + ", ".join(f"{v}" for _, v in sorted(want.items())))
         me["connect"] = {key: v for key, v in rec.items() if v}
         self.record_base_files(me)
         self.save_kits(k)
@@ -5331,7 +5347,7 @@ class Connector:
         listed with its hash in the kit's "created" record: an installer that guards your data then knows these
         files leave the base on purpose (they are back in your home, not lost)."""
         created = me.setdefault("created", {})
-        for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r == ENGINES_REG] + \
+        for r in [r for r in created if r.startswith(f"engines/{SKILLS_ENGINE}/") or r in (ENGINES_REG, ENV_STORE)] + \
                 [r for r in me.pop("connect_files", []) if r in created]:
             created.pop(r)
         if gone:
@@ -5347,6 +5363,11 @@ class Connector:
             me["connect_files"] = sorted(own)
         dest = self.base / "engines" / SKILLS_ENGINE
         reg = reg_load(self.base, ENGINES_REG)
+        if set(reg) == {"preset"} and (self.base / ENGINES_REG).is_file():
+            created[ENGINES_REG] = sha((self.base / ENGINES_REG).read_bytes())
+        if reg.get("preset") and not any(isinstance(e, dict) and e.get("env") for e in reg.get("engines", {}).values()) \
+                and (self.base / ENV_STORE).is_file():
+            created[ENV_STORE] = sha((self.base / ENV_STORE).read_bytes())    # only connect's presets in it
         if not (reg.get("engines", {}).get(SKILLS_ENGINE) or {}).get("link") or dest.is_symlink():
             return
         for dp, dns, fns in os.walk(dest):
@@ -5354,8 +5375,33 @@ class Connector:
                 fp = pathlib.Path(dp) / f
                 if fp.is_file() and not fp.is_symlink():
                     created[fp.relative_to(self.base).as_posix()] = sha(fp.read_bytes())
-        if set(reg) == {"engines"} and set(reg["engines"]) == {SKILLS_ENGINE}:
+        if set(reg) <= {"engines", "preset"} and set(reg.get("engines", {})) <= {SKILLS_ENGINE}:
             created[ENGINES_REG] = sha((self.base / ENGINES_REG).read_bytes())
+
+    def unadopt_auto(self):
+        """disconnect: folders watch adopted by itself (engines.json "auto") go back home as real folders."""
+        reg = reg_load(self.base, ENGINES_REG)
+        for n, e in sorted(reg.get("engines", {}).items()):
+            if not (isinstance(e, dict) and e.get("auto") and e.get("link")):
+                continue
+            try:
+                for x in [x for x in engine_vault(self.base, n, undo=True) if "nothing to" not in x]:
+                    self.log.append(x)
+                src, dest = pathlib.Path(expand(e["from"], self.home)), self.base / "engines" / n
+                if src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest):
+                    os.unlink(src); os.rename(dest, src)
+                    self.log.append(f"{e['from']}: a real folder again (moved back from {dest})")
+            except (OSError, SystemExit) as x:
+                self.log.append(f"{e['from']}: not moved back ({x})")
+                continue
+            r2 = reg_load(self.base, ENGINES_REG)
+            r2.get("engines", {}).pop(n, None)
+            if not r2.get("engines"):
+                r2.pop("engines", None)
+            if r2:
+                reg_save(self.base, ENGINES_REG, r2)
+            elif (self.base / ENGINES_REG).is_file():
+                (self.base / ENGINES_REG).unlink()
 
     def unlink_skills(self, rec):
         """disconnect: the link goes and ~/.agents/skills is a real folder again with what it held (a folder that
@@ -5904,6 +5950,16 @@ class Connector:
                     p.unlink(); self.log.append(f"removed {tool_tilde(r)}")
             elif p.exists():
                 self.log.append(f"kept {tool_tilde(r)} (changed since connect)")
+        reg = reg_load(self.base, ENGINES_REG)
+        if reg.pop("preset", None) is not None:          # the variables pre-set for absent tools go
+            for x in reg_load(self.base, ENV_STORE).values():
+                dirs |= set(x.get("dirs", []) if isinstance(x, dict) else [])
+            if reg:
+                reg_save(self.base, ENGINES_REG, reg)
+            elif (self.base / ENGINES_REG).is_file():
+                (self.base / ENGINES_REG).unlink()
+            write_env_files(self.base, reg, self.home, self.log)
+        self.unadopt_auto()
         for d in sorted(dirs, key=lambda x: -x.count("/")):
             d = self.home / d
             if d.is_dir() and not d.is_symlink() and not any(d.iterdir()):
@@ -6137,7 +6193,8 @@ def tool_dirs(home, base):
             continue
         for e in ents:
             key = home_rel(e.path, home)[2:]
-            if not e.is_dir(follow_symlinks=False) or (dot and not e.name.startswith(".")) or e.name in NOT_AI \
+            ours = e.is_symlink() and in_dir(e.path, pathlib.Path(base) / "engines")    # adopted by watch
+            if not (e.is_dir(follow_symlinks=False) or ours) or (dot and not e.name.startswith(".")) or e.name in NOT_AI \
                     or key in known or str(base) == e.path or str(base).startswith(e.path + "/"):
                 continue
             out.append((key, pathlib.Path(e.path)))
@@ -6178,11 +6235,81 @@ def autoconnect(base):
                     log += engine_adopt(base, key)
                 except SystemExit as e:
                     log.append(f"not adopted {TOOLS[key]['name']} (left where it is): {e}")
+    log += auto_adopt_unknown(base, cfg)
     cfg["seen_tools"] = sorted(set(seen or []) | set(c.tools))
     cfg["tools"], cfg["extra"] = tools, extra
     if not cfg["extra"]:
         cfg.pop("extra")
     save_watch_cfg(base, cfg)
+    return log
+
+
+LEARNED = ".brain/learned-tools.json"
+
+
+def unknown_ai_dirs(base, home):
+    """[(home-relative key, dir)] of AI-looking folders that no row knows: dot folders of HOME, ~/.config,
+    ~/.local/share, ~/.local/state (real folders, AI signals: rules or memory)."""
+    home, out = pathlib.Path(home), []
+    cands = list(tool_dirs(home, base))
+    for root in (".local/share", ".local/state"):
+        d = home / root
+        for e in sorted(os.scandir(d), key=lambda x: x.name) if d.is_dir() else []:
+            key = f"{root}/{e.name}"
+            if e.is_dir(follow_symlinks=False) and key not in TOOLS and key not in TOOL_HOMES and \
+                    not any(fnmatch.fnmatchcase(key, g) for g, _ in STAYS):
+                cands.append((key, pathlib.Path(e.path)))
+    known = {r["dir"] for r in ADOPT_ROWS.values()} | set(TOOLS) | set(TOOL_HOMES)
+    for key, d in cands:
+        if key in known or d.is_symlink() or in_dir(d, base) or in_dir(base, d):
+            continue
+        if any(ai_signals(d)):
+            out.append((key, d))
+    return out
+
+
+def auto_adopt_unknown(base, cfg):
+    """1.7.0 Q2 (watch): an AI-looking folder that appeared since the last run moves into engines/<name> by a link
+    (no setting is known for it: the link stays, reported) when no program uses it (else tried again on the next
+    run). It is learned in .brain/learned-tools.json (a later release can pre-set it). Never on the first run."""
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    now = unknown_ai_dirs(base, home)
+    seen = cfg.get("seen_unknown")
+    cfg["seen_unknown"] = sorted(set(seen or []) | {k for k, _ in now} if seen is not None else {k for k, _ in now})
+    if seen is None:
+        return log
+    pending = set(cfg.get("adopt_pending") or [])
+    learned = reg_load(base, LEARNED)
+    for key, d in now:
+        if key in seen and key not in pending:
+            continue
+        name = slug(key.split("/")[-1].lstrip(".")) or "tool"
+        try:
+            log += link_move(base, d, name, home, what="watch (new AI folder)")
+        except SystemExit as e:
+            if "use" in str(e) and "now" in str(e):
+                pending.add(key)
+                if key not in (cfg.get("adopt_pending") or []):
+                    log.append(f"~/{key}: a new AI folder, in use now: it moves into the base on a later run")
+            else:
+                pending.discard(key)
+                log.append(f"~/{key}: a new AI folder, not moved: {e}")
+            continue
+        pending.discard(key)
+        link_register(base, name, name, d, home, {"auto": True})
+        try:
+            log += engine_vault(base, name)
+        except SystemExit:
+            pass
+        learned[key] = {"engine": name, "since": today(), "setting": None,
+                        "note": "no setting known: the link stays (the only kind of link allowed)"}
+        log.append(f"~/{key}: a new AI folder, moved into engines/{name}; no setting known: the link stays")
+    if learned:
+        reg_save(base, LEARNED, learned)
+    if pending:
+        cfg["adopt_pending"] = sorted(pending)
+    else:
+        cfg.pop("adopt_pending", None)
     return log
 
 
@@ -6520,6 +6647,12 @@ def watch_once(base, commit=True, connect=True):
             out["mirror"] = mirrored
     except (SystemExit, Exception) as e:
         mirrored, out["error"] = [], f"mirror: {e}"
+    try:                                                  # a package update changed a system .desktop file
+        lr = launchers_refresh(base)
+        if lr:
+            out["launchers"] = "; ".join(lr)
+    except (SystemExit, Exception) as e:
+        out["error"] = f"launchers: {e}"
     try:                                                  # an installer replaced a unit link with a real file
         if reg_load(base, ENGINES_REG).get("units"):
             ua = units_adopt(base, again=True)
@@ -7225,7 +7358,8 @@ _ELECTRON = TOOLS[".config/Claude"]           # an Electron profile: the same lo
 # (`engine adopt ID`); doctor hints them. Owner decision: they all move, used or not.
 ADOPT_ROWS = {r["id"]: r for r in (
     dict(id="codex-desktop", name="Codex desktop app", dir=".config/Codex", locks=("SingletonLock",),
-         marks=(".config/Codex/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"], profiles=True),
+         marks=(".config/Codex/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"], profiles=True,
+         launch=("chatgpt",)),           # /usr/bin/chatgpt (chatgpt.desktop, also x-scheme-handler/codex)
     dict(id="hermes-desktop", name="Hermes desktop app", dir=".config/Hermes", locks=("SingletonLock",),
          marks=(".config/Hermes/Local State",), vault=_ELECTRON["vault"], heavy=_ELECTRON["heavy"], profiles=True),
     dict(id="google-workspace-mcp", name="Google Workspace MCP", dir=".google_workspace_mcp",
@@ -8888,8 +9022,32 @@ def engine_var(key):
 
 
 def env_lines(base, reg):
-    return {name: (e["env"], str(pathlib.Path(base) / "engines" / name)) for name, e in
-            sorted(reg.get("engines", {}).items()) if e.get("mode") == "adopted" and e.get("env")}
+    out = {name: (e["env"], str(pathlib.Path(base) / "engines" / name)) for name, e in
+           sorted(reg.get("engines", {}).items()) if e.get("mode") == "adopted" and e.get("env")}
+    for name, var in sorted((reg.get("preset") or {}).items()):        # 1.7.0: absent tools are born in the base
+        if name not in out and isinstance(var, str):
+            out[name] = (var, str(pathlib.Path(base) / "engines" / name))
+    return out
+
+
+def preset_wanted(base, home, found, env=None):
+    """{engines name: variable} for every tool whose OWN variable relocates it alone (a "dir" or "home" kind in
+    TOOL_HOMES; never XDG_*) and that is not here yet: not installed, nothing at its default place, no engines.json
+    entry, the variable not set to another place. Its first run then makes its folder in the base."""
+    env = os.environ if env is None else env
+    base, home = pathlib.Path(base), pathlib.Path(home)
+    reg = reg_load(base, ENGINES_REG).get("engines", {})
+    out = {}
+    for key, hows in sorted(TOOL_HOMES.items()):
+        var = next((v for v, how in hows if how in ("dir", "home")), None)
+        if not var or key in found:
+            continue
+        name = ENGINE_NAMES.get(key, key.strip(".").replace("/", "-"))
+        cur = env.get(var)
+        if name in reg or os.path.lexists(home / key) or (cur and not in_dir(cur, base / "engines" / name)):
+            continue
+        out[name] = var
+    return out
 
 
 def env_block(path, vals):
@@ -9015,6 +9173,16 @@ def engine_adopt(base, tool, force=False, undo=False, path=None, vault=(), heavy
     src, set_by = tool_root(key, home)
     reg = reg_load(base, ENGINES_REG)
     if set_by and in_dir(src, dest):
+        if name not in reg.get("engines", {}) and dest.is_dir():     # born in the base (a pre-set variable)
+            reg.setdefault("engines", {})[name] = {"tool": next((i for i, k in TOOL_IDS.items() if k == key), key),
+                                                   "mode": "adopted", "env": var, "from": home_rel(home / key, home),
+                                                   "moved": [], "since": today()}
+            (reg.get("preset") or {}).pop(name, None)
+            if "preset" in reg and not reg["preset"]:
+                reg.pop("preset")
+            reg_save(base, ENGINES_REG, reg)
+            write_env_files(base, reg, home, log)
+            return log + [f"{tool}: born in the base ({dest}, {var}): recorded as adopted"]
         return [f"{tool}: already in the base ({dest}, {var})"]
     if dest.exists() and any(dest.iterdir()):
         raise SystemExit(f"engine adopt: {dest} exists and is not empty")
@@ -9058,6 +9226,311 @@ def engine_adopt(base, tool, force=False, undo=False, path=None, vault=(), heavy
     return log
 
 
+# -- 1.7.0: no links at old paths. A program is told the new place; the old path gets the guard file.
+OVERRIDE_MARK = "X-Skeleton-Base-Override"
+WRAP_MARK = "# skeleton-base wrapper"
+
+
+def guard_put(p):
+    """P becomes the guard file (0 bytes, mode 000) in one rename; returns the link target it replaced."""
+    p = pathlib.Path(p)
+    tgt = os.readlink(p) if p.is_symlink() else None
+    tmp = p.with_name(f".{p.name}.pin-tmp")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.close(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    os.chmod(tmp, 0)
+    os.replace(tmp, p)
+    return tgt
+
+
+def is_guard(p):
+    p = pathlib.Path(p)
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0
+
+
+def data_dirs():
+    return [pathlib.Path(x) for x in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+            if x]
+
+
+def _exec_prog(line):
+    v = line.split("=", 1)[1].strip()
+    try:
+        return shlex.split(v)[0] if v else ""
+    except ValueError:
+        return v.split()[0] if v.split() else ""
+
+
+def with_flag(text, names, flag):
+    """TEXT (a .desktop file) with FLAG after the program in every Exec line that starts one of NAMES."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("Exec=") and os.path.basename(_exec_prog(line)) in names and flag not in line:
+            v = line[5:]
+            lead = len(v) - len(v.lstrip())
+            v = v.lstrip()
+            if v.startswith('"'):
+                end = v.find('"', 1) + 1
+            else:
+                end = len(v.split(None, 1)[0]) if v.split() else 0
+            q = f'"{flag}"' if " " in flag else flag
+            line = "Exec=" + " " * lead + v[:end] + " " + q + v[end:]
+        out.append(line)
+    return "".join(out)
+
+
+def app_desktop_files(names):
+    """{file name: system path} of the system .desktop files whose Exec starts one of NAMES (first data dir
+    wins, as the desktop does)."""
+    out = {}
+    for dd in data_dirs():
+        for f in sorted((dd / "applications").glob("*.desktop")) if (dd / "applications").is_dir() else []:
+            if f.name in out:
+                continue
+            t = read(f) or ""
+            if any(l.startswith("Exec=") and os.path.basename(_exec_prog(l)) in names for l in t.splitlines()):
+                out[f.name] = f
+    return out
+
+
+def override_text(sys_path, names, flag):
+    t = with_flag(read(sys_path) or "", names, flag)
+    mark = f"{OVERRIDE_MARK}={sys_path} {sha(read(sys_path) or '')}\n"
+    return t.replace("[Desktop Entry]\n", "[Desktop Entry]\n" + mark, 1) if "[Desktop Entry]\n" in t else mark + t
+
+
+def real_program(name, home):
+    """NAME on PATH, skipping ~/.local/bin (where our wrapper goes)."""
+    lb = os.path.normpath(str(pathlib.Path(home) / ".local/bin"))
+    path = os.pathsep.join(x for x in os.environ.get("PATH", "").split(os.pathsep) if os.path.normpath(x or ".") != lb)
+    return shutil.which(name, path=path)
+
+
+def app_launchers(base, home, row, dest, rec, log, refresh=False):
+    """Write (or refresh) every way we know that starts the app: .desktop overrides, the PATH wrapper, its
+    autostart entries. REC (engines.json "launchers") remembers what was there before, for undo."""
+    names, flag = tuple(row["launch"]), f"--user-data-dir={dest}"
+    apps = pathlib.Path(home) / ".local/share/applications"
+    for n, sp in sorted(app_desktop_files(names).items()):
+        p, want = apps / n, override_text(sp, names, flag)
+        cur = read(p)
+        if cur == want:
+            continue
+        key = f"desktop:{n}"
+        if key not in rec:
+            rec[key] = {"path": home_rel(p, home), "previous": cur, "dirs": [path_key(d, home) for d in
+                                                                              _missing(p.parent)]}
+        apps.mkdir(parents=True, exist_ok=True)
+        write(p, want)
+        log.append(f"{'refreshed' if refresh else 'wrote'} {home_rel(p, home)} (Exec with {flag}; the rest is the "
+                   f"system file {sp})")
+    lb = pathlib.Path(home) / ".local/bin"
+    for b in names:
+        w = lb / b
+        real = real_program(b, home)
+        if not real:
+            log.append(f"no program `{b}` on PATH: no wrapper written")
+            continue
+        want = f"#!/bin/sh\n{WRAP_MARK}: {b} with its folder in the base\nexec {shlex.quote(real)} " \
+               f"{shlex.quote(flag)} \"$@\"\n"
+        cur = read(w) if w.is_file() else None
+        if cur == want:
+            continue
+        if os.path.lexists(w) and not (cur or "").startswith(f"#!/bin/sh\n{WRAP_MARK}"):
+            log.append(f"kept {home_rel(w, home)} (not ours): no wrapper; start {b} with {flag}")
+            continue
+        rec.setdefault(f"wrapper:{b}", {"path": home_rel(w, home), "previous": None,
+                                        "dirs": [path_key(d, home) for d in _missing(lb)]})
+        lb.mkdir(parents=True, exist_ok=True)
+        write(w, want); os.chmod(w, 0o755)
+        log.append(f"wrote {home_rel(w, home)} (runs {real} with {flag})")
+    au = pathlib.Path(home) / ".config/autostart"
+    for f in sorted(au.glob("*.desktop")) if au.is_dir() else []:
+        cur = read(f) or ""
+        new = with_flag(cur, names, flag)
+        if new != cur:
+            rec.setdefault(f"autostart:{f.name}", {"path": home_rel(f, home), "previous": cur, "dirs": []})
+            write(f, new)
+            log.append(f"{home_rel(f, home)}: Exec with {flag}")
+
+
+def _missing(d):
+    out, d = [], pathlib.Path(d)
+    while not d.exists():
+        out.append(d); d = d.parent
+    return out
+
+
+def app_pin(base, name, row, e, reg, undo=False):
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    dest = base / "engines" / name
+    src = pathlib.Path(expand(e["from"], home))
+    rec = e.setdefault("launchers", {})
+    if undo:
+        dirs = set()
+        for k, x in sorted(rec.items()):
+            p = pathlib.Path(expand(x["path"], home))
+            if x.get("previous") is None:
+                if p.is_file():
+                    p.unlink()
+            else:
+                write(p, x["previous"])
+            dirs |= set(x.get("dirs", []))
+            log.append(f"{x['path']}: back as it was")
+        for d in sorted(dirs, key=lambda y: -y.count("/")):
+            d = pathlib.Path(home) / d
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        e.pop("launchers", None)
+        for r, tgt in sorted((e.pop("pinned", None) or {}).items()):
+            p = pathlib.Path(expand(r, home))
+            if is_guard(p):
+                os.chmod(p, 0o600); p.unlink()
+            if tgt and not os.path.lexists(p):
+                os.symlink(tgt, p)
+            log.append(f"{r}: the link is back")
+        reg_save(base, ENGINES_REG, reg)
+        return log
+    if not dest.is_dir() or dest.is_symlink():
+        raise SystemExit(f"engine pin: engines/{name} is not a folder in the base (engine adopt {name} first)")
+    if os.path.lexists(src) and not (src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest)) and \
+            not is_guard(src):
+        raise SystemExit(f"engine pin: {e['from']} is a real {'folder' if src.is_dir() else 'file'}, not the link "
+                         f"into engines/{name}: merge it into the base first")
+    app_launchers(base, home, row, dest, rec, log)
+    pinned = e.setdefault("pinned", {})
+    if not is_guard(src):
+        tgt = guard_put(src)
+        pinned.setdefault(e["from"], tgt or str(dest))
+        log.append(f"{e['from']}: guard file (0 bytes, mode 000) instead of the link: a launcher we do not know "
+                   "of fails loudly instead of making a new empty folder")
+    reg_save(base, ENGINES_REG, reg)
+    log.append(f"start {row.get('name', name)} again (quit it first). Undo: brain.py engine pin --undo {name}")
+    return log
+
+
+def launchers_refresh(base):
+    """watch: a package update changed a system .desktop file, or something rewrote our override or wrapper:
+    write them again. Returns log lines (empty when nothing changed)."""
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    reg = reg_load(base, ENGINES_REG)
+    changed = False
+    for n, e in sorted(reg.get("engines", {}).items()):
+        row = link_row(e.get("tool") or n) if isinstance(e, dict) else None
+        if not (isinstance(e, dict) and e.get("launchers") is not None and e.get("pinned") and row and
+                row.get("launch")):
+            continue
+        before = json.dumps(e["launchers"], sort_keys=True)
+        lg = []
+        app_launchers(base, home, row, base / "engines" / n, e["launchers"], lg, refresh=True)
+        log += lg
+        changed |= bool(lg) or json.dumps(e["launchers"], sort_keys=True) != before
+    if changed:
+        reg_save(base, ENGINES_REG, reg)
+    return log
+
+
+def pinned_rows(base, home):
+    """1.7.0 doctor: every pinned old path holds the guard file; a missing guard, a link or a real folder is an
+    ERROR with the fix."""
+    rows = []
+    for n, e in sorted(reg_load(base, ENGINES_REG).get("engines", {}).items()):
+        for r in sorted((e.get("pinned") or {}) if isinstance(e, dict) else {}):
+            p = pathlib.Path(expand(r, home))
+            fix = f"brain.py engine pin {e.get('tool') or n}"
+            if is_guard(p):
+                continue
+            what = ("the guard file is missing" if not os.path.lexists(p) else "a link is there" if p.is_symlink()
+                    else "a real folder is there" if p.is_dir() else "a file that is not the guard is there")
+            how = f"-> {fix}" if not os.path.lexists(p) or p.is_symlink() or p.stat().st_size == 0 else \
+                f"-> quit the program, move what it wrote into engines/{n}, remove {r}, then {fix}"
+            rows.append(("ERROR", f"{r}: pinned to engines/{n} (the program is told the new place), but {what} "
+                                  f"{how}"))
+    return rows
+
+
+UNITS_DROPIN = "etc/systemd/system/user@.service.d/skeleton-base-units.conf"
+
+
+def units_unitpath():
+    """The user manager's unit search path (systemctl --user show -p UnitPath), or None."""
+    if not shutil.which("systemctl"):
+        return None
+    r = subprocess.run(["systemctl", "--user", "show", "-p", "UnitPath"], capture_output=True, text=True)
+    v = (r.stdout or "").strip()
+    return v.split("=", 1)[1].split() if r.returncode == 0 and v.startswith("UnitPath=") else None
+
+
+def units_pin(base, undo=False):
+    """P3: units live in BASE/ops/systemd; the user manager is told the place by SYSTEMD_UNIT_PATH (a root drop-in
+    for user@.service, written once by the owner: printed here). Only once `systemctl --user show -p UnitPath`
+    lists ops/systemd do the links in ~/.config/systemd/user go; the enable links (*.wants) are pointed at the unit
+    file in ops/systemd (systemctl enable makes them point at the unit file it found on the search path)."""
+    base, home, log = pathlib.Path(base).resolve(), home_dir(), []
+    reg = reg_load(base, ENGINES_REG)
+    units = reg.get("units") if isinstance(reg.get("units"), dict) else {}
+    ud, ops = pathlib.Path(home) / UNIT_HOME, base / UNIT_OPS
+    dropin = "/" + UNITS_DROPIN
+    body = f'[Service]\nEnvironment="SYSTEMD_UNIT_PATH={ops}:"\n'
+    if undo:
+        for n in sorted(units):
+            if (ops / n).exists() and not os.path.lexists(ud / n):
+                os.symlink(str(ops / n), ud / n); log.append(f"~/{UNIT_HOME}/{n}: the link is back")
+        reg.pop("units_pinned", None)
+        reg_save(base, ENGINES_REG, reg)
+        systemctl_reload(log)
+        log.append(f"then, as root (one time): sudo rm {shq(dropin)} && sudo systemctl daemon-reload; the user "
+                   "manager drops the path at its next start (log out of every session and back in)")
+        return log
+    if not units:
+        return ["engine pin-units: no units moved yet (engine adopt-units first)"]
+    up = units_unitpath()
+    if up is None or str(ops) not in up:
+        return [f"The user manager does not search {ops} yet. One time, as root (it cannot be done from here):",
+                f"  sudo mkdir -p {shq(os.path.dirname(dropin))}",
+                f"  printf '%s' {shq(body)} | sudo tee {shq(dropin)} >/dev/null",
+                "  sudo systemctl daemon-reload",
+                "Then restart your user manager: log out of every session and log in again (or `sudo systemctl "
+                "restart user@$(id -u).service`, which stops all your user services). SYSTEMD_UNIT_PATH ending in "
+                "':' keeps the default search path (systemd.unit(5), \"Unit File Load Path\").",
+                "Then run `brain.py engine pin-units` again: it checks `systemctl --user show -p UnitPath` and only "
+                "then removes the links."]
+    for n in sorted(units):
+        p = ud / n
+        if p.is_symlink() and os.path.realpath(p) == os.path.realpath(ops / n):
+            os.unlink(p); log.append(f"~/{UNIT_HOME}/{n}: link removed (found in {ops} now)")
+    for w in sorted(ud.glob("*.wants")) + sorted(ud.glob("*.requires")):
+        for x in sorted(w.iterdir()):
+            if x.is_symlink() and x.name in units:
+                t = os.path.normpath(os.path.join(str(w), os.readlink(x)))
+                if t == os.path.normpath(str(ud / x.name)) or not os.path.exists(x):
+                    os.unlink(x); os.symlink(str(ops / x.name), x)
+                    log.append(f"{home_rel(x, home)} -> {ops / x.name}")
+    reg["units_pinned"] = True
+    reg_save(base, ENGINES_REG, reg)
+    systemctl_reload(log)
+    return log
+
+
+def units_pinned_rows(base, home):
+    reg = reg_load(base, ENGINES_REG)
+    if not reg.get("units_pinned"):
+        return []
+    ud, rows = pathlib.Path(home) / UNIT_HOME, []
+    for n in sorted(reg.get("units") or {}):
+        p = ud / n
+        if os.path.lexists(p):
+            rows.append(("ERROR", f"~/{UNIT_HOME}/{n}: pinned to {UNIT_OPS} (found through SYSTEMD_UNIT_PATH), but "
+                                  f"{'a link' if p.is_symlink() else 'a real file'} is there -> brain.py watch adopts "
+                                  "it again (or: brain.py engine adopt-units)"))
+    return rows
+
+
 def engine_pin(base, tool, undo=False):
     """A tool adopted by its own setting whose default places are still links into the base (made by hand or by
     an older setup): the variable goes where every launcher sees it (the marked blocks in environment.d for user
@@ -9066,8 +9539,16 @@ def engine_pin(base, tool, undo=False):
     base, home, log = pathlib.Path(base).resolve(), home_dir(), []
     key = tool_key_of(tool)
     name = ENGINE_NAMES.get(key, tool) if key else tool
+    if link_row(tool):
+        name = link_row(tool)["id"]
     reg = reg_load(base, ENGINES_REG)
     e = reg.get("engines", {}).get(name)
+    if isinstance(e, dict) and e.get("mode") == "adopted" and e.get("link") and not e.get("env"):
+        row = link_row(tool) or link_row(e.get("tool") or "")
+        if not (row and row.get("launch")):
+            raise SystemExit(f"engine pin: {tool}: no setting is known that tells it the new place: its link stays "
+                             "(the only kind of link allowed)")
+        return app_pin(base, name, row, e, reg, undo)
     if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("env")):
         raise SystemExit(f"engine pin: {tool} is not adopted by its own setting here (engine adopt first)")
     dest = base / "engines" / name
@@ -9381,6 +9862,9 @@ def units_adopt(base, undo=False, again=False):
                 log += link_move(base, p, p.name, home, what="engine adopt-units", dest=dest, kind="unit")
             except SystemExit as e:
                 log.append(str(e)); continue
+            if reg.get("units_pinned") and p.is_symlink():
+                os.unlink(p)                          # pinned: found through SYSTEMD_UNIT_PATH, no link
+                log.append(f"~/{UNIT_HOME}/{p.name}: no link (the user manager finds it in {od})")
             rec[p.name] = {"since": (rec.get(p.name) or {}).get("since") or today()}
     if rec:
         reg["units"] = {k: rec[k] for k in sorted(rec)}
@@ -10148,8 +10632,9 @@ def outside_scan(base, home, handled=()):
                                  "(the allow line hides nothing)"))
     adopt = {r["dir"]: r for r in ADOPT_ROWS.values()}
     adopt.update({k: t for k, t in TOOLS.items() if t.get("adopt") == "link"})
-    guards = {e.get("from", "").removeprefix("~/") for e in reg_load(base, ENGINES_REG).get("engines", {}).values()
-              if isinstance(e, dict) and e.get("mode") == "adopted"}
+    guards = {x.removeprefix("~/") for e in reg_load(base, ENGINES_REG).get("engines", {}).values()
+              if isinstance(e, dict) and e.get("mode") == "adopted"
+              for x in [e.get("from", "")] + list(e.get("pinned") or {})}
     try:
         vroot = vault_root(base)
         vault = home_rel(vroot, home).removeprefix("~/")
@@ -10272,9 +10757,15 @@ def link_rows(base, home):
     engines/NAME. Broken, pointing elsewhere or replaced by a real folder: an ERROR with the fix."""
     rows = []
     for n, e in sorted(reg_load(base, ENGINES_REG).get("engines", {}).items()):
-        if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("link") and e.get("from")):
-            continue
+        if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("link") and e.get("from")) or \
+                e.get("pinned"):
+            continue                                  # pinned: pinned_rows checks its guard
         src, dest = pathlib.Path(expand(e["from"], home)), pathlib.Path(base) / "engines" / n
+        row = link_row(e.get("tool") or n)
+        if row and row.get("launch") and src.is_symlink() and os.path.realpath(src) == os.path.realpath(dest):
+            rows.append(("WARN", f"{e['from']}: a link into engines/{n}, a link where a setting exists "
+                                 f"(--user-data-dir) -> brain.py engine pin {n}"))
+            continue
         fix_ln = f"ln -sfn {shq(str(dest))} {shq(str(src))}"
         if n == SKILLS_ENGINE:
             fix_ln = "brain.py connect"
@@ -10342,9 +10833,12 @@ def doctor(base, strict=False):
         if var and not extra and default.is_dir() and not default.is_symlink() and not in_dir(default, d):
             rows.append(("WARN", f"{name}: {var} points to {home_rel(d, home)} but {home_rel(default, home)} exists "
                                  "too (split brain: a launcher without the variable made or kept it)"))
+    presets = {os.path.normpath(str(base / "engines" / n)) for n in reg_load(base, ENGINES_REG).get("preset") or {}}
     for key, d, where in configured_dirs(home):
         if os.path.realpath(d) in guarded:
             continue                                   # the guard row above says to load the variable
+        if os.path.normpath(str(d)) in presets or any(os.path.normpath(str(d)).startswith(x + "/") for x in presets):
+            continue                                   # pre-set for a tool not installed yet: nothing to report
         if not any(os.path.normpath(str(x)) == d for _, x, _ in tool_instances(home, base)):
             rows.append(("WARN", f"{TOOLS.get(key, {}).get('name', key)}: dir {home_rel(d, home)} configured in "
                                  f"{where} is not wired by connect (add it: connect --tool-dir "
@@ -10362,9 +10856,11 @@ def doctor(base, strict=False):
                     if os.path.normpath(str(p)) in mirrors else f" -> brain.py engine mirror ~/{key}")
             rows.append(("OUTSIDE", f"{TOOLS[key]['name']}: ~/{key} (no setting moves it){hint}"))
     rows += link_rows(base, home)
+    rows += pinned_rows(base, home)
+    rows += units_pinned_rows(base, home)
     for key, d in tool_dirs(home, base):
         rules, mem = ai_signals(d)
-        if (rules or mem) and os.path.normpath(str(d)) not in mirrors:
+        if (rules or mem) and os.path.normpath(str(d)) not in mirrors and not in_dir(d, base):
             rows.append(("OUTSIDE", f"unknown AI tool dir ~/{key} -> brain.py engine mirror ~/{key}"))
     try:
         tops = sorted(home.iterdir())
@@ -10599,7 +11095,7 @@ def main(argv):
             print("\n".join(log)); return 0
         if cmd == "engine":
             if sub in ("adopt", "release", "mirror", "unmirror") and len(rest) != 2 or \
-                    sub == "adopt-units" and len(rest) != 1:
+                    sub in ("adopt-units", "pin-units") and len(rest) != 1:
                 print(f"usage: engine {sub} TOOL"); return 1
             if sub == "vault":
                 if len(rest) != 2:
@@ -10618,6 +11114,8 @@ def main(argv):
                 if len(rest) != 2:
                     print("usage: engine pin TOOL [--undo]"); return 1
                 log = engine_pin(base, rest[1], undo)
+            elif sub == "pin-units":
+                log = units_pin(base, undo)
             elif sub == "adopt-units":
                 log = units_adopt(base, undo)
             elif sub == "release":
