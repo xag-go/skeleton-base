@@ -2,6 +2,17 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.5 - 2026-11-14
+- Start in the base: connect writes a marked block into ~/.profile and ~/.bashrc. In an interactive shell that
+  starts in $HOME it `cd`s into the base; other shells (scripts, `ssh host cmd`, a shell started elsewhere) are not
+  touched. Off with `connect --no-start-in-base` (on again: `connect --start-in-base`); disconnect removes the block.
+- Units: `engine pin-units` also takes the units connect wrote (watch, collect, tidy): their links in
+  ~/.config/systemd/user go, a real file moves into ops/systemd, and connect/watch write them there with no link
+  once pinned. Doctor WARNs about a link or a real file of those units left in ~/.config/systemd/user.
+- Units start in the base: connect's service units set `WorkingDirectory=` to the base. Doctor WARNs about every
+  service in ops/systemd and ~/.config/systemd/user whose WorkingDirectory= is outside the base or missing (a user
+  unit without one starts in the home folder); the fix is printed with it. Timers are not checked.
+
 ## v1.7.4 - 2026-11-14
 - tidy: watch-owned registry files (engines.json, projects.json, .kits.json, .mothership.json) rewritten during a page
   run are no conflict any more (was "changed engines.json": 2 of 3 runs failed).

@@ -6273,6 +6273,83 @@ class UnitPinTests(ToolHome):
         self.assertTrue((self.u / "team-a.service").is_symlink())
         self.assertIn("sudo rm", r.stdout)
 
+    def test_connect_units_go_into_ops_once_pinned_and_doctor_warns_on_a_link(self):
+        """1.7.5: connect's own units join the pin: no link in ~/.config/systemd/user, the file lives in ops/systemd."""
+        self.ok("connect", "--watch")
+        self.assertTrue((self.u / "skeleton-base-collect.service").is_file())
+        self.up.write_text(f"{self.ops} {self.home}/.config/systemd/user /usr/lib/systemd/user")
+        self.ok("engine", "pin-units", "--base", str(self.base))
+        self.assertTrue((self.ops / "skeleton-base-collect.service").is_file(), "moved into ops/systemd")
+        self.assertFalse(os.path.lexists(self.u / "skeleton-base-collect.service"))
+        self.ok("connect", "--watch")                              # connect writes straight into ops/systemd
+        self.assertFalse(os.path.lexists(self.u / "skeleton-base-collect.service"), "no link comes back")
+        self.assertIn(f"WorkingDirectory={self.base}", (self.ops / "skeleton-base-collect.service").read_text())
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"WARN\s+.*skeleton-base-(collect|watch|tidy)")
+        (self.u / "skeleton-base-collect.service").symlink_to(self.ops / "skeleton-base-collect.service")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"WARN\s+~/\.config/systemd/user/skeleton-base-collect\.service: a link .*pin-units")
+        self.ok("disconnect")
+        self.assertFalse((self.ops / "skeleton-base-collect.service").exists(), "disconnect removes the unit")
+        self.ok("engine", "pin-units", "--undo", "--base", str(self.base))
+
+
+class StartInBaseTests(ToolHome):
+    """1.7.5: a shell that starts in $HOME goes into the base (interactive shells only); the owner can turn it off."""
+
+    BLOCK = "# skeleton-base start-in-base:start"
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.home, ".profile", "export KEEP=1\n")
+        self.write(self.home, ".bashrc", "alias ll='ls -l'\n")
+
+    def rc(self, name):
+        p = self.home / name
+        return p.read_text() if p.is_file() else ""
+
+    def test_block_in_profile_and_bashrc_and_disconnect_takes_it_out(self):
+        self.ok("connect")
+        for f in (".profile", ".bashrc"):
+            self.assertIn(self.BLOCK, self.rc(f), f)
+            self.assertIn(f"cd {self.base}", self.rc(f), f)
+        self.ok("disconnect")
+        self.assertEqual(self.rc(".profile"), "export KEEP=1\n")
+        self.assertEqual(self.rc(".bashrc"), "alias ll='ls -l'\n")
+
+    def test_no_start_in_base_turns_it_off_and_back_on(self):
+        self.ok("connect", "--no-start-in-base")
+        self.assertNotIn(self.BLOCK, self.rc(".bashrc"))
+        self.ok("connect")                                         # the setting is kept
+        self.assertNotIn(self.BLOCK, self.rc(".bashrc"))
+        self.ok("connect", "--start-in-base")
+        self.assertIn(self.BLOCK, self.rc(".bashrc"))
+
+    def shell(self, cwd, *args):
+        home = os.path.realpath(self.home)
+        env = {"HOME": home, "PATH": "/usr/bin:/bin", "TERM": "dumb"}
+        return subprocess.run(["bash", *args, "pwd"], cwd=cwd, env=env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=60).stdout.strip()
+
+    def test_interactive_shell_from_home_goes_to_base_only_then(self):
+        self.ok("connect")
+        home = os.path.realpath(self.home)
+        self.assertEqual(self.shell(home, "-i", "-c"), os.path.realpath(self.base))
+        self.assertEqual(self.shell(self.tmp, "-i", "-c"), os.path.realpath(self.tmp), "started elsewhere: stays")
+        self.assertEqual(self.shell(home, "-c"), home, "not interactive: stays")
+        self.ok("connect", "--no-start-in-base")
+        self.assertEqual(self.shell(home, "-i", "-c"), home, "turned off: stays")
+
+    def test_doctor_warns_on_a_working_directory_outside_the_base(self):
+        self.write(self.home, ".config/systemd/user/team-x.service",
+                   "[Service]\nWorkingDirectory=%h\nExecStart=/bin/true\n")
+        self.ok("connect", "--timer")
+        unit = self.home / ".config/systemd/user/skeleton-base-collect.service"
+        self.assertIn(f"WorkingDirectory={self.base}", unit.read_text())
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertRegex(out, r"WARN\s+~/\.config/systemd/user/team-x\.service: starts outside the base \(WorkingDirectory=%h\)")
+        self.assertNotRegex(out, r"WARN\s+.*skeleton-base-collect")
+
 
 class PresetTests(ToolHome):
     """1.7.0 Q1: a tool that is not installed yet is born in the base: its own variable is pre-set."""
