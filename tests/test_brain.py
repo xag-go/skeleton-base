@@ -3966,7 +3966,7 @@ class EverythingInBaseTests(ToolHome):
         self.write(cx, "config.toml", 'model = "x"\n')
         before = tree(self.tmp)
         env = {"CLAUDE_CONFIG_DIR": str(cl), "CODEX_HOME": str(cx)}
-        r = self.hb("connect", "--mcp", env=env)
+        r = self.hb("connect", "--mcp", "--allow-outside-home", env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse((self.home / ".claude").exists())
         self.assertFalse((self.home / ".claude.json").exists())
@@ -3978,7 +3978,7 @@ class EverythingInBaseTests(ToolHome):
         self.assertIn("SessionEnd", s["hooks"])
         self.assertIn(str(self.base), (cx / "config.toml").read_text())
         self.assertTrue((cx / "AGENTS.md").is_file())
-        r = self.hb("disconnect", env=env)
+        r = self.hb("disconnect", "--allow-outside-home", env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         after = {k: v for k, v in tree(self.tmp).items() if not k.startswith("base/.brain/backups")}
         self.assertEqual({k: v for k, v in after.items() if not k.startswith("base/")},
@@ -6033,7 +6033,7 @@ class SkillsPerToolTests(ToolHome):
         self.bins("codex")
         ch = self.base / "engines/codex"
         self.write(ch, "config.toml", 'model = "x"\n')
-        r = self.hb("connect", env={"CODEX_HOME": str(ch)})
+        r = self.hb("connect", "--allow-outside-home", env={"CODEX_HOME": str(ch)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue((ch / "skills/base-home/SKILL.md").is_file())
         self.assertFalse(os.path.lexists(self.home / ".agents/skills"))
@@ -6349,6 +6349,59 @@ class StartInBaseTests(ToolHome):
         out = self.hb("doctor", "--base", str(self.base)).stdout
         self.assertRegex(out, r"WARN\s+~/\.config/systemd/user/team-x\.service: starts outside the base \(WorkingDirectory=%h\)")
         self.assertNotRegex(out, r"WARN\s+.*skeleton-base-collect")
+
+
+class FrugalKeptLinesTests(HomeBase):
+    """1.7.5: an export never comes out as Frugal-Bridge's blank form while the base remembers the owner's lines."""
+
+    def brain_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("brain_under_test", BRAIN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_recorded_lines_are_written_back_when_the_base_pages_are_blank(self):
+        m = self.brain_module()
+        c = m.Connector(self.base)
+        key = m.norm("Language and script: Spanish")
+        known = {"lines": [key, m.norm("the owner likes plain files.")],
+                 "raw": {key: "- Language and script: Spanish"}}
+        text = c.frugal_export_text(None, known)
+        self.assertIn("- Language and script: Spanish\n", text)
+        self.assertNotIn("- Language and script:\n", text, "the blank form line is filled, not repeated")
+        self.assertIn("## Kept from Frugal-Bridge USER.md", text)
+        self.assertIn("- the owner likes plain files.", text)
+        self.assertEqual({x[0] for x in m.frugal_user_lines(text)} & set(known["lines"]), set(known["lines"]))
+        blank = c.frugal_export_text(None, {})
+        self.assertNotIn("Kept from", blank)
+        self.assertIn("- Language and script:\n", blank)
+
+
+class OutsideHomeTests(ToolHome):
+    """1.7.5: a tool home variable that points outside the HOME the run is for is refused (a fake HOME must
+    never write the live base through the live environment)."""
+
+    def test_connect_and_disconnect_refuse_then_allow_with_the_flag(self):
+        live = self.tmp / "live" / "claude"
+        r = self.hb("connect", env={"CLAUDE_CONFIG_DIR": str(live)})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("CLAUDE_CONFIG_DIR", r.stderr + r.stdout)
+        self.assertIn("points outside HOME", r.stderr + r.stdout)
+        self.assertFalse(live.exists())
+        self.assertFalse((self.home / ".claude.json").exists())
+        r = self.hb("disconnect", env={"FRUGAL_HOME": str(self.tmp / "live" / "frugal")})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("FRUGAL_HOME", r.stderr + r.stdout)
+        r = self.hb("connect", "--allow-outside-home", env={"CLAUDE_CONFIG_DIR": str(live)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_tool_dir_for_that_tool_is_enough_and_inside_home_passes(self):
+        inside = self.home / ".claude"
+        self.assertEqual(self.hb("connect", env={"CLAUDE_CONFIG_DIR": str(inside)}).returncode, 0)
+        out = self.hb("connect", "--tool-dir", f"claude-code={self.tmp / 'x'}",
+                      env={"CLAUDE_CONFIG_DIR": str(self.tmp / "y")})
+        self.assertNotIn("points outside HOME", out.stderr + out.stdout)
 
 
 class PresetTests(ToolHome):

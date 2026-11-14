@@ -2163,6 +2163,27 @@ def home_dir():
     return pathlib.Path(os.environ.get("HOME") or pathlib.Path.home())
 
 
+# a tool's home variable that names a folder outside the HOME a connect/disconnect runs for (1.7.5): the run would
+# write there. Refused unless --tool-dir names that tool or --allow-outside-home is given.
+TOOL_HOME_VARS = {"CLAUDE_CONFIG_DIR": ".claude", "CODEX_HOME": ".codex", "HERMES_HOME": ".hermes",
+                  "GEMINI_CLI_HOME": ".gemini", "COPILOT_HOME": ".copilot", "OPENCLAW_STATE_DIR": ".openclaw",
+                  "OPENCLAW_HOME": ".openclaw", "FRUGAL_HOME": None}
+
+
+def outside_home_check(home, cmd, exempt=()):
+    """SystemExit when a tool home variable in the environment points outside HOME (exempt: tool keys given with
+    --tool-dir). The live environment's variables must not steer a run that is meant for a fake or other HOME."""
+    home = pathlib.Path(home).resolve()
+    for var, key in TOOL_HOME_VARS.items():
+        v = os.environ.get(var)
+        if not v or (key is not None and key in exempt):
+            continue
+        if not in_dir(os.path.expanduser(v), home):
+            raise SystemExit(f"{cmd}: {var}={v} points outside HOME ({home}), so this run would write there. "
+                             "Run it with `env -i HOME=<home> PATH=/usr/bin:/bin ...`, unset the variable, "
+                             "pass --tool-dir for that tool, or add --allow-outside-home.")
+
+
 # ---------------------------------------------------------------- where each AI tool really keeps its files
 # Paths in this file are written as each tool's DEFAULT home-relative path (".claude/CLAUDE.md"). A tool's dir can
 # live anywhere (e.g. BASE/engines/<tool>/) when the tool's OWN setting points there: tool_path() maps the default
@@ -6097,6 +6118,7 @@ class Connector:
         if rec.get("sha") == sha(text):
             return                                    # nothing new since the last import
         done = set(rec.get("lines", []))
+        raw = dict(rec.get("raw") or {})                  # key -> the line as Frugal-Bridge wrote it (1.7.5)
         slot = self.user_slot(k)
         pages, review, counts = {}, [], {"filled": 0, "added": 0}
         for key, label, value in frugal_user_lines(text):
@@ -6117,6 +6139,7 @@ class Connector:
             else:
                 review.append((what, r, line, shown))
             done.add(key)
+            raw[key] = f"- {label}: {value}" if label else f"- {value}"
         changed = {r: touch_frontmatter(t, FRUGAL_SRC_NAME) for r, t in pages.items() if t != read(self.base / r)}
         card = None
         if changed or review:
@@ -6133,7 +6156,8 @@ class Connector:
             if review:
                 card = self.review_card(user, slot, review)
                 rec["review"] = card
-        rec.update({"file": str(user), "sha": sha(text), "lines": sorted(done), "last": today()})
+        rec.update({"file": str(user), "sha": sha(text), "lines": sorted(done), "last": today(),
+                    "raw": {x: raw[x] for x in sorted(done) if x in raw}})
         rec.setdefault("first", today())
         me["frugal_user"] = rec
         self.save_kits(k)
@@ -6163,7 +6187,9 @@ class Connector:
         write(p, old.rstrip("\n") + "\n" + "\n".join(lines) + "\n")
         return r
 
-    def frugal_export_text(self, old):
+    def frugal_export_text(self, old, known=None):
+        """USER.md text for Frugal-Bridge. KNOWN is the connect record's frugal_user (1.7.5): the lines it holds that
+        the base pages do not say are kept under their own heading, so an export never comes out as a blank form."""
         slot = self.user_slot()
         files = sorted((self.base / slot).glob("*.md")) if slot.endswith("/") else [self.base / slot]
         texts = {f: read(f) or "" for f in files if f.is_file()}
@@ -6202,6 +6228,21 @@ class Connector:
                 keep.append(s if s.startswith(("-", "*")) else f"- {s}")
             if keep:
                 out += ["", f"## {fm.get('title') or f.stem} (from the base: {rel(f, self.base)})"] + keep
+        known = known or {}
+        have = {k for k, _, _ in frugal_user_lines("\n".join(out))}
+        kept = []
+        for k in known.get("lines", []):
+            if k in have:
+                continue
+            line = (known.get("raw") or {}).get(k) or f"- {k}"
+            m = LABEL_LINE.match(line.strip())
+            i = next((i for i, x in enumerate(out) if m and x == f"- {m.group(1).strip()}:"), None)
+            if i is not None:                         # the blank form line of that label gets the owner's value
+                out[i] = line
+            else:
+                kept.append(line)
+        if kept:
+            out += ["", "## Kept from Frugal-Bridge USER.md (not on the base pages)"] + kept
         return "\n".join(out) + "\n"
 
     def frugal_give_back(self):
@@ -6210,7 +6251,8 @@ class Connector:
             return
         user = frugal_home(self.home) / "USER.md"
         old = read(user)
-        text = self.frugal_export_text(old)
+        k0 = self.kits()
+        text = self.frugal_export_text(old, (k0.get("kits", {}).get("base-folder", {}).get("frugal_user")))
         if old != text:
             if old is not None:
                 bd = frugal_home(self.home) / "backup" / f"skeleton-base-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
@@ -6224,6 +6266,8 @@ class Connector:
         if me is not None:                            # what we wrote is known: a later connect imports none of it
             rec = dict(me.get("frugal_user") or {})
             rec["lines"] = sorted(set(rec.get("lines", [])) | {x[0] for x in frugal_user_lines(text)})
+            rec["raw"] = {**(rec.get("raw") or {}), **{x[0]: f"- {x[1]}: {x[2]}" if x[1] else f"- {x[2]}"
+                                                       for x in frugal_user_lines(text)}}
             rec.update({"file": str(user), "sha": sha(text), "exported": today()})
             me["frugal_user"] = rec
             self.save_kits(k)
@@ -11734,8 +11778,9 @@ def main(argv):
                             "--rescan-s", "--poll-s", "--log", "--for-s")}[cmd] + ("--base",)
         flags = {"collect": ("--baseline", "--quiet", "--no-file"), "connect": ("--timer", "--watch", "--kick", "--print",
                                                                    "--mcp", "--matrix",
-                                                                   "--no-start-in-base", "--start-in-base"),
-                 "disconnect": (), "watch": ("--once", "--list", "--discover", "--poll", "--no-commit",
+                                                                   "--no-start-in-base", "--start-in-base",
+                                                                   "--allow-outside-home"),
+                 "disconnect": ("--allow-outside-home",), "watch": ("--once", "--list", "--discover", "--poll", "--no-commit",
                                              "--no-connect")}[cmd]
         tdirs = []
         while i < len(args):
@@ -11754,6 +11799,8 @@ def main(argv):
             else:
                 print(f"{cmd}: unknown argument {a}\n" + __doc__); return 1
         base = pathlib.Path(opts.get("--base") or SRC).expanduser().resolve()
+        if cmd in ("connect", "disconnect") and not opts.get("--allow-outside-home"):
+            outside_home_check(home_dir(), cmd, exempt=[k for k, _ in tdirs])
         if cmd == "watch":
             return watch_main(base, opts)
         if cmd == "connect" and opts.get("--print"):

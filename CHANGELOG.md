@@ -12,6 +12,12 @@ Changes to the skeleton structure and tools (not to anyone's content).
 - Units start in the base: connect's service units set `WorkingDirectory=` to the base. Doctor WARNs about every
   service in ops/systemd and ~/.config/systemd/user whose WorkingDirectory= is outside the base or missing (a user
   unit without one starts in the home folder); the fix is printed with it. Timers are not checked.
+- Frugal-Bridge export on disconnect keeps the owner's lines: the lines the connect record holds (and their text)
+  are written back into USER.md under their own heading, or into the blank form line of their label; an export is
+  never only the blank form while the base knows lines.
+- connect and disconnect refuse a tool home variable (CLAUDE_CONFIG_DIR, CODEX_HOME, HERMES_HOME, GEMINI_CLI_HOME,
+  COPILOT_HOME, OPENCLAW_STATE_DIR, FRUGAL_HOME) that points outside the HOME they run for, unless --tool-dir names
+  that tool or --allow-outside-home is given.
 
 ## v1.7.4 - 2026-11-14
 - tidy: watch-owned registry files (engines.json, projects.json, .kits.json, .mothership.json) rewritten during a page
