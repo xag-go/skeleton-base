@@ -1532,6 +1532,10 @@ def git(d, *a):
 USER_RULES = "# My own rules for this folder\n\nAlways cite the page you used.\n\n"
 
 
+PRODUCT_PAGE_NAMES = ("dashboard.md", "sessions.md", "memories.md", "glossary.md", "stale-pages.base",
+                      "projects-by-status.base", "decisions-newest.base")
+
+
 @unittest.skipUnless(shutil.which("git"), "needs git")
 class UninstallKeepsDataTests(HomeBase):
     """Owner rule: removing Skeleton Base never loses the user's data. A rich base, then uninstall."""
@@ -1595,6 +1599,11 @@ class UninstallKeepsDataTests(HomeBase):
                 continue
             if after.get(rel) == v:
                 continue
+            if rel in ("wiki/dashboard.md", "wiki/sessions.md", "wiki/memories.md", "wiki/glossary.md") \
+                    or rel.startswith("wiki/weekly/") or rel.endswith(".base"):
+                self.assertNotIn(rel, after, rel)                        # 1.7.4: product-made pages go with it
+                removed.append(rel)
+                continue
             if v[0] == "dir" and rel not in after:
                 continue
             if rel == "AGENTS.md":                                   # only our block left it: your text stays
@@ -1648,7 +1657,8 @@ class UninstallKeepsDataTests(HomeBase):
         self.assertEqual(a.count("<!-- base-folder:start"), 1)
         self.assertEqual(a.count("Always cite the page you used."), 1)
         for rel, v in before.items():                                         # nothing of yours went missing
-            if v[0] == "file" and not self.kit_owned(rel, before) and rel != "AGENTS.md":
+            if v[0] == "file" and not self.kit_owned(rel, before) and rel != "AGENTS.md" \
+                    and not (rel.startswith("wiki/") and rel.split("/")[-1] in PRODUCT_PAGE_NAMES):   # 1.7.4
                 self.assertEqual(now.get(rel), v, rel)
         files = self.collected()
         self.ok("collect")                                                    # dedupe state kept: nothing new
@@ -6585,3 +6595,24 @@ class Release174Tests(unittest.TestCase):
         self.assertTrue((d / "wiki" / "how-this-base-works.md").is_file())
         self.assertIn("how-this-base-works", (d / "hot.md").read_text())
         self.assertFalse((d / "wiki" / "dashboard.md").exists(), "watch makes the dashboard, not init")
+
+    def test_uninstall_removes_product_pages_and_keeps_owner_text(self):
+        """1.7.4: generated pages and the shipped guide go with the uninstall; a glossary the owner wrote in is kept."""
+        d = self.tmp / "unin"
+        self.assertEqual(run(BRAIN, "init", d, "--frugal=no").returncode, 0)
+        B.glossary_block(d)
+        B.dashboard_main(d)
+        B.sessions_index(d, self.home)
+        B.memories_page(d, {})
+        B.weekly_main(d, now=dt.datetime(2026, 11, 15, 8, 0), notify=False)
+        self.assertEqual(run(BRAIN, "uninstall", d).returncode, 0)
+        for gone in ("wiki/glossary.md", "wiki/how-this-base-works.md", "wiki/dashboard.md", "wiki/sessions.md",
+                     "wiki/memories.md", "wiki/weekly", "wiki/stale-pages.base"):
+            self.assertFalse((d / gone).exists(), gone)
+        d2 = self.tmp / "unin2"
+        run(BRAIN, "init", d2, "--frugal=no")
+        B.glossary_block(d2)
+        g = d2 / "wiki" / "glossary.md"
+        g.write_text(g.read_text() + "- **mine**: my own word.\n")
+        run(BRAIN, "uninstall", d2)
+        self.assertIn("**mine**", g.read_text())

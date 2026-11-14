@@ -792,6 +792,43 @@ class Installer:
         return None
 
     # -- uninstall
+    def remove_product_pages(self):
+        """1.7.4: pages the product made (shipped text, or generated text with its own markers) go with the uninstall;
+        a page the owner added text to is kept (the generated block is taken out first)."""
+        def gone(rel):
+            self.p(rel).unlink(); self.log.append(f"removed {rel}")
+
+        def product_text(rel):
+            t = read(self.p(rel))
+            return t is not None and "sources: [brain.py" in t.split("---", 2)[1] if t and t.startswith("---") else False
+
+        g = self.p("wiki/glossary.md")
+        if g.is_file():
+            t, shipped = read(g), read(SRC / "wiki/glossary.md")
+            if t is not None and GLOSSARY_START in t and GLOSSARY_END in t:
+                a, b = t.index(GLOSSARY_START), t.index(GLOSSARY_END) + len(GLOSSARY_END)
+                t = (t[:a] + t[b:]).strip()
+            if shipped is not None and t is not None and t.strip() == shipped.strip():
+                gone("wiki/glossary.md")
+        h = self.p("wiki/how-this-base-works.md")
+        if h.is_file() and read(h) is not None and read(SRC / "wiki/how-this-base-works.md") is not None \
+                and read(h).strip() == read(SRC / "wiki/how-this-base-works.md").strip():
+            gone("wiki/how-this-base-works.md")
+        for rel in ("wiki/sessions.md", "wiki/memories.md", "wiki/dashboard.md"):
+            if self.p(rel).is_file() and product_text(rel):
+                gone(rel)
+        wk = self.p("wiki/weekly")
+        if wk.is_dir():
+            for f in sorted(wk.glob("*.md")):
+                if product_text(f.relative_to(self.d).as_posix()):
+                    f.unlink(); self.log.append(f"removed {f.relative_to(self.d).as_posix()}")
+            if not any(wk.iterdir()):
+                wk.rmdir()
+        for name in ("projects-by-status", "decisions-newest", "stale-pages"):
+            rel = f"wiki/{name}.base"
+            if self.p(rel).is_file() and read(self.p(rel)).startswith("filters:\n  and:\n"):
+                gone(rel)
+
     def uninstall(self):
         k = load_json(self.p(".kits.json"), ".kits.json")
         kits = k.get("kits", {})
@@ -850,6 +887,8 @@ class Installer:
                     kept.append(f"{rel} (your text outside the kit block stays; you edited inside it too: a copy "
                                 f"of the whole file is in .base-folder/backup/)")
                 self.change(rel, new)
+
+        self.remove_product_pages()
 
         rel = CLAUDE_SETTINGS
         if self.p(rel).exists():
