@@ -1,5 +1,7 @@
 ---
 title: Decision in a few words
+status: active
+supersedes:
 sources: [raw/...]
 updated: YYYY-MM-DD
 scope: private

@@ -14,6 +14,10 @@ Setup
 Daily use (run inside a base, or pass --root DIR)
   status                       NEW / CHANGED / DELETED files in raw/ since the last ingest
   done RAW PAGE...             record that RAW was ingested into PAGE(s)
+  sessions                     write wiki/sessions.md: one line per agent session (watch does it daily)
+  weekly [--no-notify]         write wiki/weekly/YYYY-Www.md now; .brain/notify.json {"command": [...]} gets it
+  dashboard                    write wiki/dashboard.md and its .base views (watch does it daily)
+  ingest --baseline RAWDIR     mark the raw files of an old folder (e.g. raw/old-wiki) as known: lint stops warning
   lint                         check the wiki, board, maps and skills (exit 2 on problems)
   index                        rebuild the page list in wiki/index.md
   map [--force]                draw the base as a mind map: maps/brain.canvas (Obsidian) and
@@ -77,8 +81,11 @@ Your tools' own memories (default base: the base holding this brain.py; paths co
 
 Everything in the base (engines/<tool>/, projects/<slug>/; never in the base's git or Syncthing)
   engine sync-scan [--force]   (sync all) gitleaks over what would be shared; flagged files get exact deny lines
-  engine sync-all on|off       Syncthing shares the whole base except secrets, tool config files and heavy files
-                               (node_modules, .git, DBs, archives); data/, apps/, backups/ stay off; git unchanged
+  engine sync-scope notes|all  what Syncthing shares: notes (default: wiki, hot.md, plans, board, progress, agents,
+                               templates, maps, sources, raw, research minus crawl text; no code, no engines/) or all
+  engine sync-all on|off       all = Syncthing shares the whole base except secrets, tool config files and heavy files
+                               (node_modules, .git, DBs, archives); data/, apps/, backups/ stay off; git unchanged;
+                               off = notes again
   engine share NAME SUBDIR [--remove]  share one more safe sub-folder of engines/NAME (engines.json "share"); the
                                secret rules still win inside it; sessions, auth, tokens, .git are refused
   engine vault NAME [--undo] [--dry-run]
@@ -146,10 +153,12 @@ Instant and zero-touch
                                remove a location; show locations and tools (connected / needs-user);
                                suggest memory-like stores not watched yet; run the pipeline once
 """
+import contextlib
 import datetime as dt
 import difflib
 import fnmatch
 import hashlib
+import io
 import json
 import math
 import os
@@ -166,7 +175,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.7.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.4"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -189,10 +198,10 @@ FRUGAL_DEFAULT = {"user": "USER.md", "now": "PROGRESS.md", "decisions": "DECISIO
                   "map": "MAP.md", "sources": "sources/"}
 
 # what init installs (plain files are copied only when missing)
-DIRS = ["wiki/projects", "wiki/clients", "wiki/people", "wiki/decisions", "wiki/concepts", "wiki/daily",
-        "wiki/sops", "raw/inbox", "raw/docs", "raw/references", "raw/clients", "raw/videos", "raw/exports"]
+DIRS = ["raw/inbox"]     # 1.7.4: content folders (wiki/clients, wiki/people, raw/docs, ...) appear with their first page
 REQUIRED = {"hot.md", "wiki/index.md", "wiki/log.md", "tools/brain.py"}   # recreated if missing
 FILES = ["README.md", "SECURITY.md", "hot.md", "wiki/index.md", "wiki/log.md", "wiki/glossary.md",
+         "wiki/how-this-base-works.md",
          "wiki/me/who-i-am.md", "wiki/me/goals.md", "wiki/me/how-to-talk-to-me.md",
          "board/README.md", "board/board.base", "board/2026-01-01-fill-in-your-profile.md",
          "agents/assistant.md", "agents/twin.md", "progress/agents.log",
@@ -240,6 +249,168 @@ def write(p, text):
     p = pathlib.Path(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
+
+
+PAGE_STATUS = ("active", "superseded", "done")       # `status:` of project and decision pages (1.7.4)
+WIKI_PAGE_WARN, README_WARN = 30000, 20000             # bytes: lint warns above these (1.7.4)
+
+
+GLOSSARY_TERMS = [
+    ("base", "this folder: the pages, the tools and the settings of one Skeleton Base."),
+    ("engine", "one AI tool's own settings folder, kept in engines/<tool>/ (secrets excluded)."),
+    ("adopt", "move a tool's settings folder into the base and point the tool at it (`engine adopt`)."),
+    ("pin", "a path the tool must not recreate: a guard folder or file stands in its place (`engine pin`)."),
+    ("guard", "the empty stand-in left at a pinned path, so a tool that uses the old path fails loudly."),
+    ("connect", "tell each AI tool about the base in its own rules file (`connect`)."),
+    ("collect", "copy the tools' memories into raw/inbox/collected/ (`collect`); read-only on the tools."),
+    ("file", "put collected lines on the right page, with no model call (`file`)."),
+    ("watch", "the background loop: connect, collect, file, index, commit, daily checks (`watch`)."),
+    ("tidy", "the rare model pass that merges filed lines into the page prose (`tidy`)."),
+    ("kit", "a set of rules and tools installed into the base from outside (Frugal-Bridge is one)."),
+    ("slot", "a named place in .kits.json (now, user, decisions) that tells tools where a file lives."),
+    ("lint", "the page checks: links, frontmatter, sizes, raw files not yet ingested (`lint`)."),
+    ("doctor", "the health check of the whole setup, with the fix for each problem (`doctor`)."),
+    ("vault", "one folder outside the base that holds the secret files; the base keeps only links (`vault`)."),
+    ("sync scope", "what Syncthing shares: notes (default) or all (`engine sync-scope`)."),
+    ("scope", "who may see a page: private or workspaces (frontmatter `scope:`)."),
+    ("status", "the state of a project or decision page: active, superseded or done."),
+    ("supersedes", "on a decision page: the decision it replaces."),
+    ("weekly", "the Sunday review in wiki/weekly/, written from the log and the doctor (`weekly`)."),
+    ("hot.md", "the short file of what matters now; read first."),
+    ("raw/", "material as it came in; never edited, read through the ingest step."),
+]
+GLOSSARY_START, GLOSSARY_END = "<!-- glossary-terms:start -->", "<!-- glossary-terms:end -->"
+
+
+def glossary_block(base):
+    """Keep the base's own terms in wiki/glossary.md between markers; the owner's lines are never touched (1.7.4)."""
+    base = pathlib.Path(base)
+    g = base / "wiki" / "glossary.md"
+    if not g.is_file():
+        return False
+    block = "\n".join([GLOSSARY_START, "## Terms of this base (generated by brain.py)", ""]
+                      + [f"- **{t}**: {d}" for t, d in GLOSSARY_TERMS] + [GLOSSARY_END])
+    cur = g.read_text(encoding="utf-8")
+    if GLOSSARY_START in cur and GLOSSARY_END in cur:
+        a, b = cur.index(GLOSSARY_START), cur.index(GLOSSARY_END) + len(GLOSSARY_END)
+        new = cur[:a] + block + cur[b:]
+    else:
+        new = cur.rstrip("\n") + "\n\n" + block + "\n"
+    if new != cur:
+        atomic_write(g, new)
+        return True
+    return False
+
+
+def dashboard_base_files(base):
+    """The three Obsidian .base files the dashboard embeds (generated; 1.7.4)."""
+    def view(name, folder, sort, filt=None, group=None):
+        lines = ["filters:", "  and:", f'    - file.inFolder("{folder}")']
+        lines += [f"    - {filt}"] if filt else []
+        lines += ["views:", "  - type: table", f"    name: {name}", "    order:", "      - file.name",
+                  "      - status", "      - updated"]
+        if group:
+            lines += [f"    groupBy:", f"      property: {group}", "      direction: ASC"]
+        lines += ["    sort:", f"      - property: {sort}", "        direction: DESC"]
+        return "\n".join(lines) + "\n"
+    files = {
+        "wiki/projects-by-status.base": view("Projects by status", "wiki/projects", "updated", group="status"),
+        "wiki/decisions-newest.base": view("Decisions, newest first", "wiki/decisions", "updated"),
+        "wiki/stale-pages.base": view("Not updated in 30 days", "wiki", "updated",
+                                      filt='\'file.mtime < now() - "30d"\''),
+    }
+    for r, t in files.items():
+        atomic_write(pathlib.Path(base) / r, t)
+    return list(files)
+
+
+def goals_lines(base):
+    """The owner's goals, copied from wiki/me/goals.md (bullets only, up to 10). Never invented."""
+    g = pathlib.Path(base) / "wiki" / "me" / "goals.md"
+    items = [l.rstrip() for l in (read(g) or "").splitlines() if l.lstrip().startswith(("- ", "* "))]
+    return items[:10]
+
+
+def dashboard_main(base):
+    base = pathlib.Path(base)
+    if not (base / "wiki").is_dir():
+        return 1
+    dashboard_base_files(base)
+    goals = goals_lines(base) or ["(no goals written in wiki/me/goals.md yet)"]
+    text = ("---\ntitle: Dashboard\nsources: [brain.py dashboard: wiki/projects, wiki/decisions, wiki/me/goals.md]\n"
+            f"updated: {today()}\nscope: private\n---\n\n# Dashboard\n\n"
+            "Generated by `brain.py dashboard` (the views below are live Obsidian bases).\n\n"
+            "## Goals\n\n" + "\n".join(goals) + "\n\n"
+            "## Projects by status\n\n![[projects-by-status.base]]\n\n"
+            "## Decisions, newest first\n\n![[decisions-newest.base]]\n\n"
+            "## Not updated in 30 days\n\n![[stale-pages.base]]\n")
+    atomic_write(base / "wiki" / "dashboard.md", text)
+    return 0
+
+
+def weekly_week(now):
+    """(monday date, ISO week label like 2026-W46) for the week of NOW."""
+    mon = now.date() - dt.timedelta(days=now.weekday())
+    return mon, f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+
+
+def weekly_main(base, now=None, notify=True):
+    """wiki/weekly/YYYY-Www.md: done, changed, waiting for the owner, next. Plain text. Then the notify command of
+    .brain/notify.json (if any) gets title and text on stdin (1.7.4)."""
+    base = pathlib.Path(base).resolve()
+    now = now or dt.datetime.now()
+    mon, label = weekly_week(now)
+    days = {(mon + dt.timedelta(days=i)).isoformat() for i in range(7)}
+    done_ = [l for l in (read(base / "progress" / "agents.log") or "").splitlines() if l[:10] in days]
+    changed = []
+    for p in list((base / "wiki" / "decisions").glob("*.md")) + list((base / "wiki" / "projects").glob("*.md")) \
+            + list((base / "board").glob("*.md")):
+        if p.name == "README.md":
+            continue
+        if dt.date.fromtimestamp(p.stat().st_mtime).isoformat() in days:
+            changed.append(rel(p, base))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor(base)
+    waiting = [l.strip() for l in buf.getvalue().splitlines() if l.strip().startswith(("ERROR", "WARN"))]
+    nxt = [l for l in (read(base / "hot.md") or "").splitlines() if re.search(r"next|open question", l, re.I)]
+    sess = [l for l in (read(base / SESSIONS_PAGE) or "").splitlines() if l[2:12] in days]
+    out = ["---", f"title: Weekly review {label}", "sources: [brain.py weekly]", f"updated: {now.date().isoformat()}",
+           "scope: private", "---", "", f"# Weekly review {label}", "",
+           f"Week of {mon.isoformat()}. Plain summary, written by code from the log, the pages and the doctor.", "",
+           "## Done", ""] + [f"- {l}" for l in done_[-30:]] + ([] if done_ else ["- nothing logged this week"]) + \
+          ["", "## Changed", ""] + [f"- {c}" for c in sorted(changed)[:30]] + \
+          ([] if changed else ["- no decision, project or card page changed"]) + \
+          ["", "## Waiting for the owner", ""] + [f"- {w}" for w in waiting[:20]] + \
+          ([] if waiting else ["- nothing: doctor has no errors or warnings"]) + \
+          ["", "## Next", ""] + [f"- {n.strip()}" for n in nxt[:6]] + ([] if nxt else ["- see hot.md"]) + \
+          ["", f"Sessions this week: {len(sess)}.", ""]
+    text = "\n".join(out)
+    write(base / "wiki" / "weekly" / f"{label}.md", text)
+    msg = ""
+    cfgp = base / ".brain" / "notify.json"
+    if notify and cfgp.is_file():
+        try:
+            cmd = json.loads(read(cfgp) or "{}").get("command")
+        except ValueError:
+            cmd = None
+        if isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd):
+            payload = json.dumps({"title": f"Weekly review {label}", "text": "\n".join(out[-16:])})
+            try:
+                r = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=60)
+                msg = f"notify: exit {r.returncode}"
+            except (OSError, subprocess.SubprocessError) as e:
+                msg = f"notify: {e}"
+    return f"wiki/weekly/{label}.md" + (f" ({msg})" if msg else "")
+
+
+def weekly_due(base, now):
+    """Sunday from 07:00 local time, once per ISO week (watch runs it; the state is .brain/weekly.json)."""
+    if now.weekday() != 6 or now.hour < 7:
+        return False
+    _, label = weekly_week(now)
+    st = json.loads(read(pathlib.Path(base) / ".brain" / "backups" / "weekly.json") or "{}")
+    return st.get("last") != label
 
 
 def today():
@@ -482,6 +653,7 @@ class Installer:
             json_added.pop(rel)
         self.change(rel, dump_json(cla))
 
+
         # .gitignore block
         existed = self.p(".gitignore").exists()
         body = block_body(".gitignore", GI_START_RE, GI_END)
@@ -521,6 +693,7 @@ class Installer:
         for key in ("connect", "frugal_user"):
             if prev.get(key):
                 entry[key] = prev[key]
+        refresh_ignore_blocks(self.d)                  # the layout blocks follow engines.json (notes or all), 1.7.4
         kits["base-folder"] = entry
         k["slots"] = dict(BASE_SLOTS)
         new = dump_json(k)
@@ -871,6 +1044,8 @@ class Installer:
 
 
 # ---------------------------------------------------------------- full backup before uninstall
+RETENTION_REG = ".brain/retention.json"    # {"backups_days": 30} (1.7.4; the owner's setting, local)
+PRUNE_STATE, PRUNE_LOG = ".brain/backups/prune.json", ".brain/backups/prune.log"   # local (not in git)
 BACKUPS_DIR = "skeleton-base-backups"     # under HOME: ~/skeleton-base-backups/BASENAME-YYYYmmdd-HHMMSS.tar.gz
 
 
@@ -1083,6 +1258,26 @@ def status(root):
     return 0
 
 
+def ingest_baseline(root, folder):
+    """`ingest --baseline RAWDIR`: every raw file under RAWDIR is marked as known (no page filed for it), so lint
+    stops warning about files that were in raw/ before the manifest existed (1.7.4). Changes later are still
+    reported."""
+    root = pathlib.Path(root).resolve()
+    d = (root / folder).resolve() if not pathlib.Path(folder).is_absolute() else pathlib.Path(folder).resolve()
+    if not str(d).startswith(str(root / "raw")) or not d.is_dir():
+        print(f"ingest --baseline: {folder} is not a folder under raw/"); return 1
+    m, n = load_manifest(root), 0
+    for f in sorted(d.rglob("*")):
+        if f.is_file():
+            r = rel(f, root)
+            if r not in m:
+                m[r] = {"sha": sha(f.read_bytes()), "pages": [], "date": today(), "baseline": True}
+                n += 1
+    write(manifest_path(root), json.dumps(m, indent=2, sort_keys=True) + "\n")
+    print(f"ingest --baseline: {n} raw file(s) under {rel(d, root)} marked as known")
+    return 0
+
+
 def done(root, raw, pages):
     p = root / raw
     if not raw.startswith("raw/") or not p.is_file():
@@ -1126,6 +1321,8 @@ def lint(root):
     def check_links(p, t):
         for l in LINK.findall(t):
             l = l.strip()
+            if l.endswith((".base", ".canvas")):      # Obsidian views and canvases embedded (1.7.4)
+                continue
             stem = l.split("/")[-1].removesuffix(".md")
             if l in link_targets or stem in link_targets:
                 if stem in inbound and names.get(stem) != p:
@@ -1139,6 +1336,9 @@ def lint(root):
                 errs.append(f"{rel(p, root)}: frontmatter lacks '{k}'")
         if fm.get("scope") and fm["scope"] not in SCOPES:
             errs.append(f"{rel(p, root)}: bad scope '{fm['scope']}' (use {' | '.join(SCOPES)})")
+        if fm.get("status") and fm["status"] not in PAGE_STATUS and \
+                rel(p, root).startswith(("wiki/projects/", "wiki/decisions/")):          # 1.7.4 dashboard property
+            errs.append(f"{rel(p, root)}: bad status '{fm['status']}' (use {' | '.join(PAGE_STATUS)})")
         if fm.get("updated") and not DATE.match(fm["updated"]):
             errs.append(f"{rel(p, root)}: 'updated' is not YYYY-MM-DD")
 
@@ -1227,6 +1427,11 @@ def lint(root):
         if c == 0 and not (p.name in SPECIAL and p.parent == root / "wiki"):
             errs.append(f"{rel(p, root)}: orphan (no inbound links; link it or run index)")
 
+    for p in wiki_pages(root):
+        if p.stat().st_size > WIKI_PAGE_WARN:
+            warns.append(f"{rel(p, root)}: {p.stat().st_size // 1000} KB, over {WIKI_PAGE_WARN // 1000} KB: split it")
+    if (root / "README.md").is_file() and (root / "README.md").stat().st_size > README_WARN:
+        warns.append(f"README.md: over {README_WARN // 1000} KB: keep the root README a short overview")
     # raw changed since ingest / new raw
     m = load_manifest(root)
     for k, v in m.items():
@@ -1378,7 +1583,7 @@ def check(root):
         v = k.get("kits", {}).get("base-folder", {}).get("version")
         out.append(f".kits.json base-folder version: {v}"); ok &= v is not None
         for slot, path in (k.get("slots") or {}).items():
-            if not (root / path).exists():
+            if not (root / path).exists() and not str(path).endswith("/"):   # a folder slot appears with its page
                 out.append(f"slot {slot} -> {path}: missing"); ok = False
     except json.JSONDecodeError:
         out.append(".kits.json: invalid JSON"); ok = False
@@ -2199,6 +2404,58 @@ def _collect_dir(home, notes, roots, only):
         yield from files("openclaw", pattern, rel_home)
 
 
+def memory_desc(content):
+    """One line for a memory: its frontmatter description (or name), else its first text line; scrubbed (1.7.4)."""
+    lines, desc, name = content.splitlines(), "", ""
+    if lines[:1] == ["---"]:
+        for l in lines[1:]:
+            if l.strip() == "---":
+                break
+            m = re.match(r"(description|name):\s*(.+)", l)
+            if m:
+                if m.group(1) == "description":
+                    desc = m.group(2).strip().strip("\"'")
+                else:
+                    name = name or m.group(2).strip().strip("\"'")
+    desc = desc or name
+    if not desc:
+        desc = next((l.strip().lstrip("-#* ").strip() for l in lines if l.strip() not in ("", "---")), "")
+    return " ".join(redact(desc).split())[:160] or "(no description)"
+
+
+def memories_page(base, mem):
+    """wiki/memories.md (generated, 1.7.4): what each tool's memory holds now: origin and one line each."""
+    out = ["---", "title: What my agents remember", "sources: [brain.py collect]",
+           f"updated: {dt.date.today().isoformat()}", "scope: private", "---", "",
+           "# What my agents remember", "",
+           "Generated by `brain.py collect` from each tool's memory store (names and one-line descriptions only; the "
+           "contents stay in `raw/inbox/collected/`). Read-only: edit the memory in the tool, not here.", ""]
+    for src in COLLECT_SOURCES:
+        rows = mem.get(src, [])
+        out.append(f"## {src}: {len(rows)} memor{'y' if len(rows) == 1 else 'ies'}")
+        if not rows:
+            out.append("- none collected yet")
+        for origin, desc in rows[:40]:
+            out.append(f"- `{origin.replace('`', '')}`: {desc}")
+        if len(rows) > 40:
+            out.append(f"- ... and {len(rows) - 40} more")
+        out.append("")
+    write(base / "wiki" / "memories.md", "\n".join(out))
+
+
+def daily_pages(base):
+    """The generated pages made once a day (1.7.4): wiki/sessions.md, the glossary terms, wiki/dashboard.md."""
+    base = pathlib.Path(base)
+    sp = base / SESSIONS_PAGE
+    try:
+        if not sp.exists() or time.time() - sp.stat().st_mtime > 86400:
+            sessions_index(base)
+        glossary_block(base)
+        dashboard_main(base)
+    except OSError:
+        pass
+
+
 def collect(base, only=None, baseline=False, since=None, quiet=False, file=True):
     base = pathlib.Path(base).resolve()
     if not base.is_dir():
@@ -2225,12 +2482,13 @@ def collect(base, only=None, baseline=False, since=None, quiet=False, file=True)
         print(f"collect: {man_p} is not valid JSON; fix or delete it (nothing changed)", file=sys.stderr); return 1
     hashes = man.setdefault("hashes", {})
     at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    notes, per, new, dupes, old = [], {}, 0, 0, 0
+    notes, per, new, dupes, old, mem = [], {}, 0, 0, 0, {}
     for src, origin, ts, content in collect_items(home, notes, cfg, base):
         if src not in only:
             continue
         if not content.strip():           # an empty store file (e.g. a fresh MEMORY.md index) is not a memory
             continue
+        mem.setdefault(src, []).append((origin, memory_desc(content)))
         ts = ts if ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
         if since is not None and ts < since:
             old += 1; continue
@@ -2268,6 +2526,9 @@ def collect(base, only=None, baseline=False, since=None, quiet=False, file=True)
         verb = "recorded (baseline, no files)" if baseline else "new"
         print(f"collect: {new} {verb}, {dupes} already known, {old} older than --since; "
               f"per source: {json.dumps(per, sort_keys=True)}")
+    if not baseline and only >= set(COLLECT_SOURCES) and (base / "wiki").is_dir():
+        memories_page(base, mem)                         # the generated "what my agents remember" page (1.7.4)
+        daily_pages(base)                                # sessions, glossary, dashboard: before the watcher commits
     if file and not baseline and (base / "wiki").is_dir():
         file_main(base, quiet=True)                      # file the new items on their pages at once (0 tokens)
     return 0
@@ -2397,7 +2658,8 @@ class PageIndex:
         self.root, self.pages = root, {}
         for p in wiki_pages(root):
             r = rel(p, root)
-            if (p.parent == root / "wiki" and p.name in SPECIAL) or r in (UNSORTED, VAULT_PAGE):
+            if (p.parent == root / "wiki" and p.name in SPECIAL) or r in (UNSORTED, VAULT_PAGE) or \
+                    r in GENERATED_PAGES or r.startswith("wiki/weekly/"):
                 continue                                  # generated pages: never a filing target
             t = p.read_text(encoding="utf-8", errors="replace")
             fm = frontmatter(t) or {}
@@ -3155,6 +3417,10 @@ def bullet_words(line):
     return {w for w in fnorm(t).split() if (len(w) >= 4 and w not in WORD_STOP) or any(c.isdigit() for c in w)}
 
 
+# root files that watch (not the harness) rewrites; tidy must not count them as a conflict (1.7.4)
+WATCH_REGISTRY_FILES = ("engines.json", "projects.json", ".kits.json", ".mothership.json")
+
+
 def tidy_verify(base, job, snap0, texts0, lint0, log0):
     """Problems found after one tidy call ([] = keep it)."""
     probs = []
@@ -3164,6 +3430,8 @@ def tidy_verify(base, job, snap0, texts0, lint0, log0):
         if r == "progress/agents.log":
             if not (read(base / r) or "").startswith(log0 or ""):
                 probs.append("progress/agents.log was rewritten (only appending is allowed)")
+        elif r in WATCH_REGISTRY_FILES:
+            continue                # watch rewrites its registries (engines.json ...) during a run: not a harness edit
         elif r.startswith("maps/") or (r not in snap0 and r.startswith("raw/inbox/collected/")
                                         and read_collected(base / r)):
             continue                # the watcher's own writes (generated maps, a NEW collected memory), not the harness
@@ -6635,10 +6903,149 @@ class Watcher:
                 self.resolve(); self.hit("rescan")       # safety net: anything inotify missed
 
 
+def backups_days(base):
+    try:
+        return max(1, int(json.loads(read(pathlib.Path(base) / RETENTION_REG) or "{}").get("backups_days", 30)))
+    except (ValueError, TypeError, AttributeError):
+        return 30
+
+
+def backup_candidates(base, home, now, days):
+    """[(path, folder)]: items older than DAYS in backups/ (base) and ~/skeleton-base-backups; the newest item of
+    each folder is never one of them (1.7.4)."""
+    out = []
+    for d in (pathlib.Path(base) / "backups", pathlib.Path(home) / BACKUPS_DIR):
+        if not d.is_dir():
+            continue
+        items = sorted(d.iterdir(), key=lambda x: x.lstat().st_mtime, reverse=True)
+        for e in items[1:]:
+            if now - e.lstat().st_mtime > days * 86400:
+                out.append((e, d))
+    return out
+
+
+def prune_backups(base, home=None, now=None, force=False):
+    """Once a day (watch): remove backups older than backups_days, logged to .brain/prune.log. Returns the paths."""
+    base = pathlib.Path(base).resolve()
+    home = home or home_dir()
+    now = time.time() if now is None else now
+    today = dt.date.fromtimestamp(now).isoformat()
+    st = json.loads(read(base / PRUNE_STATE) or "{}") if (base / PRUNE_STATE).exists() else {}
+    if not force and st.get("last") == today:
+        return []
+    days, gone = backups_days(base), []
+    for e, d in backup_candidates(base, home, now, days):
+        if e.is_dir() and not e.is_symlink():
+            shutil.rmtree(e, ignore_errors=True)
+        else:
+            e.unlink(missing_ok=True)
+        gone.append(str(e))
+    if gone:
+        (base / PRUNE_LOG).parent.mkdir(parents=True, exist_ok=True)
+        with open(base / PRUNE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": dt.datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+                                "days": days, "removed": gone}) + "\n")
+    atomic_write(base / PRUNE_STATE, json.dumps({"last": today}) + "\n")
+    return gone
+
+
+SESSIONS_PAGE = "wiki/sessions.md"
+SESSION_GLOBS = (("claude-code", ".claude/projects/*/*.jsonl"), ("codex", ".codex/sessions/**/*.jsonl"))
+
+
+def _session_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict) and isinstance(c.get("text"), str))
+    return ""
+
+
+def session_line(f, tool, home):
+    """(title, cwd) of one transcript from its first lines only: a custom title, else the first user message. The
+    transcript itself is never copied into the page (1.7.4)."""
+    title, cwd, first = None, None, None
+    try:
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 80:
+                    break
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                pl = o.get("payload") if isinstance(o.get("payload"), dict) else {}
+                cwd = cwd or o.get("cwd") or pl.get("cwd")
+                if o.get("type") == "custom-title" and (o.get("customTitle") or o.get("title")):
+                    title = o.get("customTitle") or o.get("title")
+                msg = o.get("message") if isinstance(o.get("message"), dict) else pl
+                if first is None and (o.get("type") == "user" or msg.get("role") == "user"):
+                    txt = _session_text(msg.get("content"))
+                    if txt.strip():
+                        first = txt
+    except OSError:
+        pass
+    text = title or first or "(no first message)"
+    text = " ".join(redact(text).split())[:80]
+    return text, (home_rel(pathlib.Path(cwd), home) if cwd else "")
+
+
+def sessions_index(base, home=None):
+    """wiki/sessions.md: one line per agent session (date, tool, title, folder, size), newest first (1.7.4)."""
+    base = pathlib.Path(base).resolve()
+    home = pathlib.Path(home or home_dir())
+    found = []
+    for tool, pat in SESSION_GLOBS:
+        for f in tool_glob(home, pat):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            found.append((st.st_mtime, tool, f, st.st_size))
+    found.sort(reverse=True)
+    out = ["---", "title: Agent sessions", "sources: [brain.py sessions: the tools' transcripts, first lines only]",
+           f"updated: {dt.date.today().isoformat()}", "scope: private", "---", "", "# Agent sessions", "",
+           "One line per session, newest first: date, tool, title (custom title or first message), folder, size. "
+           "No transcript text is kept here.", ""]
+    for mt, tool, f, size in found:
+        title, cwd = session_line(f, tool, home)
+        day = dt.datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
+        out.append(f"- {day} | {tool} | {title.replace('|', '/')} | {cwd or '-'} | {size // 1024} KB")
+    if not found:
+        out.append("- no transcripts found")
+    write(base / SESSIONS_PAGE, "\n".join(out) + "\n")
+    return len(found)
+
+
+def prune_preview_row(base, home=None):
+    """The doctor row: how many backups the next daily prune removes, and when it runs."""
+    base = pathlib.Path(base).resolve()
+    home = home or home_dir()
+    days = backups_days(base)
+    n = len(backup_candidates(base, home, time.time(), days))
+    nxt = dt.date.today() + dt.timedelta(days=1) if (base / PRUNE_STATE).exists() and \
+        json.loads(read(base / PRUNE_STATE) or "{}").get("last") == dt.date.today().isoformat() \
+        else dt.date.today()
+    return ("INFO", f"backups: next prune {nxt.isoformat()} removes {n} item(s) older than {days} days "
+                    f"(the newest of each folder is kept; log {PRUNE_LOG}; days in {RETENTION_REG})")
+
+
+GENERATED_PAGES = ("wiki/memories.md", "wiki/sessions.md", "wiki/glossary.md", "wiki/dashboard.md",
+                   "wiki/projects-by-status.base", "wiki/decisions-newest.base", "wiki/stale-pages.base")
+
+
+def generated_state(base):
+    return {g: (sha((pathlib.Path(base) / g).read_bytes()) if (pathlib.Path(base) / g).is_file() else "")
+            for g in GENERATED_PAGES}
+
+
 def watch_once(base, commit=True, connect=True):
     """One pipeline run: auto-connect new tools, collect, then index + map + git commit if anything is new."""
     base = pathlib.Path(base).resolve()
     out = {"new": 0}
+    gen_before = generated_state(base)
     if connect and is_connected(base):
         try:
             lg = autoconnect(base)
@@ -6706,17 +7113,20 @@ def watch_once(base, commit=True, connect=True):
             with contextlib.redirect_stdout(io.StringIO()):
                 build_index(base, quiet=True)
                 build_map(base, quiet=True)
-        if (new or out.get("connect") or touched or filed_any or mirrored) and commit and (base / ".git").exists():
+        gen_changed = [g for g, v in generated_state(base).items() if v != gen_before.get(g)]   # 1.7.4 pages
+        if (new or out.get("connect") or touched or filed_any or mirrored or gen_changed) and commit \
+                and (base / ".git").exists():
             per = ", ".join(f"{k} {v}" for k, v in sorted(last.get("per_source", {}).items()))
             msg = f"watch: collect {new} new" + (f" ({per})" if per else "") if new else \
                 ("watch: file" if touched else "watch: file (already known)" if filed_any else
-                 "watch: auto-connect" if out.get("connect") else "watch: mirror " + ", ".join(mirrored))
+                 "watch: auto-connect" if out.get("connect") else "watch: mirror " + ", ".join(mirrored)
+                 if mirrored else "watch: generated pages")
             if touched:
                 msg += f", filed on {len(touched)} page(s)"
             # the bookkeeping of already-known items (filed.json, manifest) is committed too, or a fresh clone
             # would see those raw files as NEW again
             out["commit"] = git_commit(base, msg, (touched + [FILED, ".brain/manifest.json"] if filed_any else [])
-                                       + [f"engines/{m}" for m in mirrored])
+                                       + [f"engines/{m}" for m in mirrored] + gen_changed)
     finally:
         if wl is not None:
             wl.close()
@@ -6726,6 +7136,19 @@ def watch_once(base, commit=True, connect=True):
                 out["tidy"] = "started"
         except Exception as e:
             out["error"] = f"tidy check: {e}"
+    try:
+        if weekly_due(base, dt.datetime.now()):           # Sunday morning, once per ISO week (1.7.4)
+            _, label = weekly_week(dt.datetime.now())
+            out["weekly"] = weekly_main(base)
+            atomic_write(base / ".brain" / "backups" / "weekly.json", json.dumps({"last": label}) + "\n")
+    except OSError as e:
+        out["error"] = f"weekly: {e}"
+    try:
+        gone = prune_backups(base)                        # once a day: old backups go (1.7.4)
+        if gone:
+            out["pruned"] = len(gone)
+    except OSError as e:
+        out["error"] = f"prune: {e}"
     return out
 
 
@@ -7535,7 +7958,7 @@ def gitignore_layout(shares=None):
                 if g.endswith("/"):
                     out.append(f"!/engines/{k}/{g}**")
     for k, subs in sorted((shares or {}).items()):          # engines.json "share": extra safe sub-folders
-        if k in (SYNC_ALL, SYNC_DENIED, VAULTED, HEAVY):
+        if k in (SYNC_ALL, SYNC_NOTES, SYNC_DENIED, VAULTED, HEAVY):
             continue
         for sub in subs:
             out += [f"!/engines/{k}/{par}" for par in _parents(sub + "/x")] + [f"!/engines/{k}/{sub}/",
@@ -7575,6 +7998,19 @@ def stignore_layout(shares=None):
     out += [f"/engines/{n}/{g.rstrip('/')}" for n, pats in sorted({**ENGINE_HEAVY, **(shares or {}).get(HEAVY, {})}
                                                                   .items()) for g in pats]          # even sync all
     out += [f"/engines/{n}/**/{h}" for n in sorted(ENGINE_PROFILES) for h in CHROMIUM_HEAVY]
+    if (shares or {}).get(SYNC_NOTES):                       # engines.json "sync": "notes" (1.7.4)
+        out.append("// sync scope notes: only the notes folders leave this machine; code, heavy data, scratch and "
+                   "engines/ stay here")
+        out += [f"/**/{g}" for g in SYNC_ALL_DENY_FILES + SYNC_ALL_HEAVY_FILES]
+        out += [f"/**/{d}" for d in SYNC_ALL_HEAVY_DIRS] + ["/.brain"]
+        out += [f"/{g}" for g in NOTES_CRAWL]
+        out += [f"!/{d}" for d in NOTES_SHARED]
+        for k, subs in sorted((shares or {}).items()):          # engines.json "share": an explicit share still goes
+            if k not in (SYNC_ALL, SYNC_NOTES, SYNC_DENIED, VAULTED, HEAVY):
+                out += [f"!/engines/{k}/{sub}" for sub in subs]
+        out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]   # never leave, whatever the rest says
+        out.append("/*")
+        return "\n".join(dict.fromkeys(out))
     out.append("!/engines/README.md")
     for k, pats in ENGINE_SAFE.items():
         out += [f"!/engines/{k}/{g.rstrip('/')}" for g in pats]
@@ -7585,7 +8021,7 @@ def stignore_layout(shares=None):
         out += [f"/{d}" for d in SYNC_ALL_CLOSED]
         return "\n".join(dict.fromkeys(out))
     for k, subs in sorted((shares or {}).items()):          # after the secret denies, before the deny-all /engines
-        if k not in (SYNC_ALL, SYNC_DENIED, VAULTED, HEAVY):
+        if k not in (SYNC_ALL, SYNC_NOTES, SYNC_DENIED, VAULTED, HEAVY):
             out += [f"!/engines/{k}/{sub}" for sub in subs]
     out += ["/engines"] + [f"/{d}" for d in LAYOUT_CLOSED + ("ops",)]
     return "\n".join(dict.fromkeys(out))
@@ -7609,6 +8045,12 @@ def share_check(sub):
 
 
 SYNC_ALL = "*sync-all*"     # key in engine_shares() output: engines.json "sync": "all" (never a folder name)
+SYNC_NOTES = "*sync-notes*"  # key: engines.json "sync": "notes" (the default for new bases, 1.7.4): only NOTES_SHARED
+# what the "notes" scope shares (Syncthing and the base's git are separate): the notes folders and root files only;
+# code (projects/), heavy data (data/), scratch, runs, ops, engines/ and .brain/ never leave this machine
+NOTES_SHARED = ("wiki", "hot.md", "plans", "board", "progress", "agents", "templates", "maps", "sources", "raw",
+                "research", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md")
+NOTES_CRAWL = ("research/**/*.txt", "research/**/snapshots")   # crawl text stays on this machine (1.7.4)
 SYNC_DENIED = "*sync-denied*"   # key: exact paths the content scan flagged (.brain/sync-denied.json), sync all only
 SYNC_DENIED_REG = ".brain/sync-denied.json"
 HEAVY = "*heavy*"           # key: {tool folder: heavy globs} that `engine adopt --path ... --heavy` recorded
@@ -7623,6 +8065,8 @@ SYNC_DENY_MARK = "// sync scan denied (generated: brain.py engine sync-scan): fl
 def engine_shares(base):
     """{tool folder: [sub-folders]} from engines.json ("share" lists); bad entries are ignored."""
     out, reg = {}, reg_load(base, ENGINES_REG)
+    if reg.get("sync", "notes") == "notes":          # no "sync" key = the notes scope (the default, 1.7.4)
+        out[SYNC_NOTES] = ["notes"]
     if reg.get("sync") == "all":
         out[SYNC_ALL] = ["all"]
         try:
@@ -8182,7 +8626,7 @@ def engine_sync_all(base, on):
                              "it scans the files for secrets before they are shared, so sync all stays off")
         reg["sync"] = "all"
     else:
-        reg.pop("sync", None)
+        reg["sync"] = "notes"                      # off = the notes scope (1.7.4), not the whole base
     reg_save(base, ENGINES_REG, reg)
     done = refresh_ignore_blocks(base)
     log = [f"sync all {'on' if on else 'off'}" + (f": {', '.join(done)} updated" if done else "")]
@@ -8191,10 +8635,30 @@ def engine_sync_all(base, on):
         try:
             log += sync_scan(base, force=True)[0]
         except BaseException:                      # no scan, no sharing: turn it off again
-            reg.pop("sync", None); reg_save(base, ENGINES_REG, reg); refresh_ignore_blocks(base)
+            reg["sync"] = "notes"; reg_save(base, ENGINES_REG, reg); refresh_ignore_blocks(base)
             st_release(base); lockdown_clear(base)
             raise
     else:
+        if lockdown_clear(base):
+            log.append("lockdown removed")
+        log += st_release(base)
+    return log
+
+
+def engine_sync_scope(base, scope):
+    """engines.json "sync": "notes" (the default for new bases) or "all" (= sync-all on). Notes shares only the notes
+    folders (NOTES_SHARED, crawl text left out); no gitleaks needed because no code or heavy data is shared."""
+    if scope == "all":
+        return engine_sync_all(base, True)
+    if scope != "notes":
+        raise SystemExit("usage: engine sync-scope notes|all")
+    reg = reg_load(base, ENGINES_REG)
+    was = reg.get("sync")
+    reg["sync"] = "notes"
+    reg_save(base, ENGINES_REG, reg)
+    done = refresh_ignore_blocks(base)
+    log = ["sync scope notes" + (f": {', '.join(done)} updated" if done else "")]
+    if was == "all":
         if lockdown_clear(base):
             log.append("lockdown removed")
         log += st_release(base)
@@ -10263,6 +10727,16 @@ def worktrees_of(repo):
     return out[1:]
 
 
+def is_own_repo(d):
+    """True when folder D is its own git repo: its top level is D itself. An empty .git folder, or a folder inside
+    another repo, is not one (git falls through to the parent repo: the 1.7.3 `projects/Codex` bug, 1.7.4)."""
+    d = pathlib.Path(d)
+    if not (d / ".git").exists():
+        return False
+    top = git_out("-C", str(d), "rev-parse", "--show-toplevel")
+    return bool(top) and os.path.realpath(top) == os.path.realpath(d)
+
+
 def project_info(repo):
     return {"remote": git_out("-C", str(repo), "remote", "get-url", "origin"),
             "branch": git_out("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"),
@@ -10274,7 +10748,7 @@ def projects_scan(base):
     reg = reg_load(base, PROJECTS_REG)
     ps = reg.setdefault("projects", {})
     for d in sorted((base / "projects").iterdir()) if (base / "projects").is_dir() else []:
-        if d.is_dir() and not d.name.startswith(".") and (d / ".git").exists():
+        if d.is_dir() and not d.name.startswith(".") and is_own_repo(d):
             ps[d.name] = project_info(d)
     reg_save(base, PROJECTS_REG, reg)
     return [f"{s}: {p.get('remote') or 'local only (no remote)'} [{p.get('branch')}]"
@@ -10361,8 +10835,9 @@ def projects_move(base, path, slug=None, force=False, keep_worktrees=False, bund
     base, home, log = pathlib.Path(base).resolve(), home_dir(), []
     os.environ["GIT_NO_LAZY_FETCH"] = "1"            # never download missing blobs of a partial clone
     src = pathlib.Path(os.path.abspath(os.path.expanduser(path)))
-    if not (src / ".git").is_dir():
-        raise SystemExit(f"projects move: {src} is not the main folder of a git repository")
+    if not (src / ".git").is_dir() or not is_own_repo(src):
+        raise SystemExit(f"projects move: {src} is not the main folder of a git repository (its own .git is missing "
+                         f"or it sits inside another repo)")
     if in_dir(src, base):
         raise SystemExit(f"projects move: {src} is inside the base already")
     slug = slug or src.name
@@ -10500,6 +10975,17 @@ def configured_dirs(home):
         dns[:] = [d for d in dns if d not in ("node_modules", "Cache", "cache", ".git")]
         if ".claude.json" in fns and (".credentials.json" in fns or "settings.json" in fns):
             out.append((".claude", os.path.normpath(dp), "found under ~/.config"))
+    return out
+
+
+def doctor_projects(base):
+    """[(level, text)]: a projects.json entry whose folder under projects/ is not its own repo (1.7.4)."""
+    base, out = pathlib.Path(base), []
+    for slug in sorted(reg_load(base, PROJECTS_REG).get("projects", {})):
+        d = base / "projects" / slug
+        if d.is_dir() and not is_own_repo(d):
+            out.append(("ERROR", f"projects.json lists projects/{slug}, which is not its own git repo (empty .git or "
+                                 f"inside another repo): delete its entry from projects.json and the empty folder's .git"))
     return out
 
 
@@ -10961,6 +11447,8 @@ def doctor(base, strict=False):
                          {home_rel(x, home).removeprefix("~/") for x in mirrors})
     rows += leftover_rows(base, home)
     rows += doctor_git(base)
+    rows += doctor_projects(base)
+    rows.append(prune_preview_row(base, home))
     rows += vault_rows(base)
     if vault_page(base):
         rows.append(("INFO", f"wrote {VAULT_PAGE} (where each vaulted secret is; never contents)"))
@@ -11135,7 +11623,7 @@ def main(argv):
     if cmd == "layout":
         if "--print" not in args:
             print("usage: layout --print   (the generated layout part of .gitignore, then of .stignore)"); return 1
-        print(gitignore_layout() + "\n\n" + stignore_layout())
+        print(gitignore_layout() + "\n\n" + stignore_layout({SYNC_NOTES: ["notes"]}))   # the default scope
         return 0
     if cmd == "guard":
         return guard_main(root_of())
@@ -11210,6 +11698,10 @@ def main(argv):
                 if len(rest) != 2 or rest[1] not in ("on", "off"):
                     print("usage: engine sync-all on|off"); return 1
                 log = engine_sync_all(base, rest[1] == "on")
+            elif sub == "sync-scope":
+                if len(rest) != 2 or rest[1] not in ("notes", "all"):
+                    print("usage: engine sync-scope notes|all"); return 1
+                log = engine_sync_scope(base, rest[1])
             elif sub == "sync-scan":
                 log = sync_scan(base, force="--force" in flags, lock_first="--lock-first" in flags)[0]
             elif sub == "sync":
@@ -11242,7 +11734,18 @@ def main(argv):
         return done(root, args[0], args[1:]) if args else (print("usage: done RAW PAGE...") or 1)
     if cmd == "lint":
         return lint(root)
+    if cmd == "weekly":
+        print(weekly_main(root, notify="--no-notify" not in args)); return 0
+    if cmd == "dashboard":
+        return dashboard_main(root)
+    if cmd == "sessions":
+        print(f"sessions: {sessions_index(root)} session(s) -> {SESSIONS_PAGE}"); return 0
+    if cmd == "ingest":
+        if len(args) == 2 and args[0] == "--baseline":
+            return ingest_baseline(root, args[1])
+        print("usage: ingest --baseline RAWDIR"); return 1
     if cmd == "index":
+        glossary_block(root)
         return build_index(root)
     if cmd == "map":
         return build_map(root, force="--force" in args)[0]

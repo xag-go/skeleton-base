@@ -4,6 +4,7 @@ Coexistence tests use a COPY of a Frugal-Bridge checkout (kit/ + adapters/) and 
 copy. Set FRUGAL_BRIDGE_SRC to its path (default: ~/frugal-bridge); they are skipped when it is not found.
 All people, projects and facts in these tests are fake.
 """
+import datetime as dt
 import hashlib
 import json
 import os
@@ -505,10 +506,9 @@ class InitTests(Base):
                     "skills/base-ingest/SKILL.md", "skills/base-lint/SKILL.md", "tools/brain.py", ".kits.json",
                     ".gitignore", ".stignore", "SECURITY.md"]:
             self.assertTrue((d / rel).is_file(), rel)
-        for sub in ["projects", "clients", "people", "decisions", "concepts", "daily", "sops"]:
-            self.assertTrue((d / "wiki" / sub).is_dir(), sub)
-        for sub in ["inbox", "docs", "references", "clients", "videos", "exports"]:
-            self.assertTrue((d / "raw" / sub).is_dir(), sub)
+        self.assertTrue((d / "raw" / "inbox").is_dir())           # 1.7.4: content folders appear with their first page
+        for sub in ["clients", "people", "projects", "decisions"]:
+            self.assertFalse((d / "wiki" / sub).exists(), sub)
         self.assertEqual((d / "CLAUDE.md").read_text(), "@AGENTS.md\n")
         self.assertEqual((d / "GEMINI.md").read_text(), "@AGENTS.md\n")
         self.assertEqual(json.loads((d / ".gemini/settings.json").read_text()),
@@ -3148,13 +3148,13 @@ class McpTests(Base):
 
 class ReadmeMatrixTests(unittest.TestCase):
     def test_readme_tidy_table_is_the_generated_one(self):
-        t = (REPO / "README.md").read_text()
+        t = (REPO / "docs" / "REFERENCE.md").read_text()
         a, b = t.index("<!-- tidy-harnesses:start -->\n"), t.index("<!-- tidy-harnesses:end -->")
         self.assertEqual(t[a + len("<!-- tidy-harnesses:start -->\n"):b], B.harnesses_text(),
                          "README tidy table is stale: paste `python3 tools/brain.py tidy --harnesses` there")
 
     def test_readme_matrix_is_the_generated_one(self):
-        t = (REPO / "README.md").read_text()
+        t = (REPO / "docs" / "REFERENCE.md").read_text()
         a, b = t.index("<!-- tools-matrix:start -->\n"), t.index("<!-- tools-matrix:end -->")
         self.assertEqual(t[a + len("<!-- tools-matrix:start -->\n"):b], B.matrix_md(),
                          "README matrix is stale: paste `python3 tools/brain.py connect --matrix` between the markers")
@@ -3481,6 +3481,9 @@ if mode == "watch-sim":          # a watcher writes maps/ and a NEW collected me
         held = "held"
     pathlib.Path(os.environ["FAKE_LOCK_OUT"]).write_text(held)
     mode = "merge"
+if mode == "registry-sim":       # watch rewrites its own registry files (engines.json) while the page is edited
+    pathlib.Path(os.environ["FAKE_BASE"], "engines.json").write_text('{"engines": {"x": {"tick": 2}}}\n')
+    mode = "merge"
 if mode == "raw-edit":           # the harness edits an EXISTING collected memory: must still put the page back
     pathlib.Path(os.environ["FAKE_RAW"]).write_text("edited by the harness\n")
     mode = "merge"
@@ -3645,6 +3648,15 @@ class TidyTests(FileBase):
         self.assertTrue(new.is_file(), "the watcher's new memory is kept")
         rec = json.loads((self.base / ".brain/tidy.log").read_text().splitlines()[-1])
         self.assertTrue(rec["ok"], rec)
+
+    def test_watch_owned_registry_write_during_a_page_run_is_not_a_conflict(self):
+        """1.7.4: watch rewrites engines.json (and the other registries) during a tidy run; that is not a harness edit."""
+        self.alpha_lines(5)
+        (self.base / "engines.json").write_text('{"engines": {"x": {"tick": 1}}}\n')
+        r = self.tidy(code=0, mode="registry-sim")
+        self.assertNotIn("changed engines.json", r.stdout + r.stderr)
+        self.assertIn("1 page(s) merged, 0 put back", r.stdout)
+        self.assertIn("copper buttons", self.page("projects/project-alpha.md"))
 
     def test_harness_edit_of_an_existing_raw_file_still_puts_the_page_back(self):
         self.alpha_lines(5)
@@ -4214,6 +4226,21 @@ class EverythingInBaseTests(ToolHome):
         self.assertTrue((self.base / "projects/.worktrees/lib/lib-dev/r.md").is_file())
         self.assertIn("local: local only", r.stdout)
 
+    def test_projects_scan_skips_a_folder_that_is_not_its_own_repo(self):
+        """1.7.4: an empty .git folder inside projects/ is not a repo; git falls through to the base's repo."""
+        self.git(self.base, "init", "-q")
+        self.git(self.base, "remote", "add", "origin", "https://example.invalid/base.git")
+        fake = self.base / "projects/Codex"
+        (fake / ".git").mkdir(parents=True)
+        r = self.ok_env("projects", "scan", "--base", str(self.base))
+        reg = json.loads((self.base / "projects.json").read_text()) if (self.base / "projects.json").exists() else {}
+        self.assertNotIn("Codex", reg.get("projects", {}), r.stdout)
+        # an entry registered before 1.7.4 (the live case) is flagged by doctor
+        (self.base / "projects.json").write_text(json.dumps({"projects": {"Codex": {
+            "remote": "https://example.invalid/base.git", "branch": "main", "worktrees": []}}}))
+        d = self.hb("doctor", "--base", str(self.base))
+        self.assertIn("projects/Codex, which is not its own git repo", d.stdout + d.stderr)
+
     def test_doctor_reports_outside_split_brain_and_unwired_dirs(self):
         (self.home / "repo1").mkdir()
         self.git(self.home / "repo1", "init", "-q")
@@ -4319,9 +4346,10 @@ class EverythingInBaseTests(ToolHome):
     def test_shipped_ignore_blocks_are_the_generated_ones(self):
         gi, st = (REPO / ".gitignore").read_text(), (REPO / ".stignore").read_text()
         self.assertIn(B.gitignore_layout() + "\n# base-folder:end", gi)
-        self.assertIn("// base-folder:start v1\n" + B.stignore_layout() + "\n// base-folder:end", st)
+        notes = B.stignore_layout({B.SYNC_NOTES: ["notes"]})            # the shipped template is the notes scope
+        self.assertIn("// base-folder:start v1\n" + notes + "\n// base-folder:end", st)
         r = self.ok_env("layout", "--print")
-        self.assertEqual(r.stdout, B.gitignore_layout() + "\n\n" + B.stignore_layout() + "\n")
+        self.assertEqual(r.stdout, B.gitignore_layout() + "\n\n" + notes + "\n")
 
     def test_syncthing_shares_safe_engine_files_and_never_a_secret(self):
         pats = [l for l in B.stignore_layout().splitlines() if l and not l.startswith("//")]
@@ -4463,6 +4491,23 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         self.ok_env("engine", "sync-all", "off", "--base", str(self.base))
         self.assertEqual(before, ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
 
+    def test_notes_is_the_default_scope_and_shares_only_notes(self):
+        """1.7.4: a new base shares the notes folders only (no code, no heavy data, no engines/, no crawl text)."""
+        self.git(self.base, "init", "-q")
+        self.init(self.base)
+        self.assertIn(B.SYNC_NOTES, B.engine_shares(self.base))          # no engines.json "sync" key = notes
+        pats = [l for l in (self.base / ".stignore").read_text().splitlines() if l and not l.startswith("//")]
+        synced = lambda path: syncthing_allows(pats, path)
+        for ok in ("hot.md", "wiki/index.md", "plans/x.md", "raw/inbox/a.md", "research/t/notes.md", "sources/s.md"):
+            self.assertTrue(synced(ok), ok)
+        for no in ("projects/app/main.py", "scratch/n.md", "runs/r/out.log", "ops/ci.py", "data/x.csv",
+                   "engines/claude/CLAUDE.md", ".brain/engines.json", "research/t/snapshots/p.html",
+                   "research/t/retrieved/source-1.txt", "raw/big/archive.zip", "raw/a/node_modules/x.js",
+                   "wiki/.env", "projects/app/.git/config"):
+            self.assertFalse(synced(no), no)
+        r = self.hb("engine", "sync-scope", "bogus", "--base", str(self.base))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
     def test_engine_share_adds_a_safe_subfolder_and_secrets_stay_ignored(self):
         self.git(self.base, "init", "-q")
         self.init(self.base)
@@ -4499,7 +4544,7 @@ open(a[a.index("--report-path") + 1], "w").write(json.dumps(out))
         i = pats.index("!/engines/w/team")
         self.assertLess(pats.index("/engines/**/.env"), i)
         self.assertLess(i, pats.index("/engines"))
-        self.assertIn(B.stignore_layout({"w": ["team"]}), st)
+        self.assertIn(B.stignore_layout({"w": ["team"], B.SYNC_NOTES: ["notes"]}), st)
         self.ok_env("engine", "share", "w", "team", "--base", str(self.base))          # again: same bytes
         self.assertEqual((gi, st), ((self.base / ".gitignore").read_text(), (self.base / ".stignore").read_text()))
         self.init(self.base)                                                              # an update keeps it
@@ -4653,6 +4698,7 @@ class VaultTests(ToolHome):
         pats = [l for l in st.splitlines() if l and not l.startswith("//")]
         shares = B.engine_shares(self.base)
         self.assertEqual(shares[B.VAULTED], sorted(self.UNITS))
+        shares = {k: v for k, v in shares.items() if k != B.SYNC_NOTES}     # sync all replaces the notes scope
         allpats = [l for l in B.stignore_layout({**shares, B.SYNC_ALL: ["all"]}).splitlines()
                    if l and not l.startswith("//")]
         for f in self.SECRETS:
@@ -6408,3 +6454,134 @@ class SystemdDropinOpsTests(ToolHome):
             self.assertTrue(B.st_dropin_ok(self.base, self.home))
         with mock.patch.dict(os.environ, {"SYSTEMD_UNIT_PATH": ""}):
             self.assertFalse(B.st_dropin_ok(self.base, self.home))
+
+
+class Release174Tests(unittest.TestCase):
+    """1.7.4: backups prune, sessions, memories page, ingest baseline, glossary, dashboard, weekly, size lint, the
+    empty content folders. Fake HOME and fake bases only."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.base, self.home = self.tmp / "base", self.tmp / "home"
+        for d in (self.base / "wiki" / "me", self.base / "wiki" / "projects", self.base / "wiki" / "decisions",
+                  self.base / "raw", self.base / "progress", self.home):
+            d.mkdir(parents=True)
+        (self.base / "hot.md").write_text("# hot\n")
+        (self.base / "wiki" / "index.md").write_text("# Index\n")
+        (self.base / "wiki" / "log.md").write_text("# Log\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_backups_older_than_30_days_go_but_the_newest_stays(self):
+        now = time.time()
+        old, new = self.base / "backups" / "old", self.base / "backups" / "new"
+        old.mkdir(parents=True); new.mkdir(parents=True)
+        (self.home / B.BACKUPS_DIR).mkdir()
+        hold, keep = self.home / B.BACKUPS_DIR / "a-old.tar.gz", self.home / B.BACKUPS_DIR / "b-new.tar.gz"
+        hold.write_text("x"); keep.write_text("y")
+        os.utime(old, (now - 40 * 86400,) * 2); os.utime(hold, (now - 40 * 86400,) * 2)
+        os.utime(keep, (now - 1 * 86400,) * 2)
+        os.utime(new, (now - 1 * 86400,) * 2)
+        gone = B.prune_backups(self.base, self.home, now=now)
+        self.assertEqual(sorted(pathlib.Path(g).name for g in gone), ["a-old.tar.gz", "old"])
+        self.assertTrue(new.is_dir() and keep.is_file())
+        self.assertIn("removed", (self.base / B.PRUNE_LOG).read_text())
+        self.assertEqual(B.prune_backups(self.base, self.home, now=now), [], "once a day")
+        self.assertIn("next prune", B.prune_preview_row(self.base, self.home)[1])
+
+    def test_sessions_page_lists_titles_newest_first_without_transcript_text(self):
+        pdir = self.home / ".claude" / "projects" / "-code-app"
+        pdir.mkdir(parents=True)
+        (pdir / "s1.jsonl").write_text(json.dumps({"type": "user", "cwd": str(self.home / "code"),
+                                                   "message": {"role": "user", "content": "first question here"}})
+                                       + "\n" + json.dumps({"type": "custom-title", "customTitle": "Named one"}) + "\n")
+        n = B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertEqual(n, 1)
+        self.assertIn("| claude-code | Named one |", page)
+        self.assertIn("~/code", page)
+        self.assertNotIn("first question", page)
+
+    def test_memory_description_and_the_memories_page(self):
+        self.assertEqual(B.memory_desc("---\nname: tea\ndescription: Likes green tea\n---\nbody"), "Likes green tea")
+        self.assertEqual(B.memory_desc("- plain first line\n"), "plain first line")
+        B.memories_page(self.base, {"claude-code": [("p/MEMORY.md", "Likes tea")]})
+        page = (self.base / "wiki" / "memories.md").read_text()
+        self.assertIn("## claude-code: 1 memory", page)
+        self.assertIn("## codex: 0 memories", page)
+        self.assertIn("none collected yet", page)
+
+    def test_ingest_baseline_marks_old_raw_files_known(self):
+        old = self.base / "raw" / "old-wiki"
+        old.mkdir(parents=True)
+        (old / "a.md").write_text("old\n")
+        self.assertEqual(B.ingest_baseline(self.base, "raw/old-wiki"), 0)
+        m = B.load_manifest(self.base)
+        self.assertIn("raw/old-wiki/a.md", m)
+        self.assertEqual(B.ingest_baseline(self.base, "wiki"), 1)
+
+    def test_glossary_block_keeps_the_owner_lines(self):
+        g = self.base / "wiki" / "glossary.md"
+        g.write_text("# Glossary\n\n- **mine**: my own word.\n")
+        self.assertTrue(B.glossary_block(self.base))
+        text = g.read_text()
+        self.assertIn("- **mine**: my own word.", text)
+        self.assertIn("**vault**", text)
+        self.assertFalse(B.glossary_block(self.base), "a second run changes nothing")
+
+    def test_dashboard_copies_goals_and_writes_the_base_views(self):
+        (self.base / "wiki" / "me" / "goals.md").write_text("# Goals\n\n- Ship the base\n- Keep it small\n")
+        self.assertEqual(B.dashboard_main(self.base), 0)
+        d = (self.base / "wiki" / "dashboard.md").read_text()
+        self.assertIn("- Ship the base", d)
+        self.assertIn("![[projects-by-status.base]]", d)
+        for f in ("projects-by-status", "decisions-newest", "stale-pages"):
+            self.assertTrue((self.base / "wiki" / f"{f}.base").is_file())
+        (self.base / "wiki" / "me" / "goals.md").unlink()
+        B.dashboard_main(self.base)
+        self.assertIn("no goals written", (self.base / "wiki" / "dashboard.md").read_text())
+
+    def test_weekly_review_is_written_once_and_sent_to_the_notify_command(self):
+        now = dt.datetime(2026, 11, 15, 8, 0)
+        mon, label = B.weekly_week(now)
+        (self.base / "progress" / "agents.log").write_text(f"{mon.isoformat()} 09:00 | tidy | one page merged\n")
+        out_file = self.tmp / "notified.json"
+        (self.base / ".brain").mkdir()
+        (self.base / ".brain" / "notify.json").write_text(json.dumps({"command": [
+            sys.executable, "-c", f"import sys, pathlib; pathlib.Path({str(out_file)!r}).write_text(sys.stdin.read())"]}))
+        self.assertTrue(B.weekly_due(self.base, now))
+        res = B.weekly_main(self.base, now=now)
+        self.assertIn(f"wiki/weekly/{label}.md", res)
+        page = (self.base / "wiki" / "weekly" / f"{label}.md").read_text()
+        self.assertIn("one page merged", page)
+        self.assertIn("## Waiting for the owner", page)
+        sent = json.loads(out_file.read_text())
+        self.assertEqual(sent["title"], f"Weekly review {label}")
+        self.assertIn("Done", sent["text"] + page)
+        (self.base / ".brain" / "backups").mkdir(parents=True, exist_ok=True)
+        (self.base / ".brain" / "backups" / "weekly.json").write_text(json.dumps({"last": label}))   # what watch records
+        self.assertFalse(B.weekly_due(self.base, now + dt.timedelta(hours=1)), "once per week")
+        self.assertFalse(B.weekly_due(self.base, dt.datetime(2026, 11, 14, 8, 0)), "not on a Saturday")
+
+    def test_lint_warns_on_big_pages_and_checks_status(self):
+        (self.base / "wiki" / "projects" / "big.md").write_text(
+            "---\ntitle: Big\nsources: [x]\nupdated: 2026-11-14\nscope: private\nstatus: maybe\n---\n\n# Big\n\n"
+            + ("word " * 7000) + "\n")
+        errs = B.lint_errors(self.base)
+        self.assertTrue(any("bad status 'maybe'" in e for e in errs), errs)
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            B.lint(self.base)
+        self.assertIn("over 30 KB", err.getvalue())
+
+    def test_init_does_not_create_empty_content_folders(self):
+        d = self.tmp / "fresh"
+        r = run(BRAIN, "init", d, "--frugal=no")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for empty in ("wiki/clients", "wiki/people", "raw/docs"):
+            self.assertFalse((d / empty).exists(), empty)
+        self.assertTrue((d / "wiki" / "how-this-base-works.md").is_file())
+        self.assertIn("how-this-base-works", (d / "hot.md").read_text())
+        self.assertFalse((d / "wiki" / "dashboard.md").exists(), "watch makes the dashboard, not init")

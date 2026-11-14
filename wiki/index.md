@@ -1,5 +1,7 @@
 # Index
 
+Start here: [[how-this-base-works]] (plain words). Then the status board: `wiki/dashboard.md` (made by the daily watch).
+
 One line per page. Read this after `hot.md`, then open only the pages you need.
 The list between the markers is rebuilt by `python3 tools/brain.py index`; write your own notes outside it.
 

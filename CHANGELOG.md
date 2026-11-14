@@ -2,6 +2,36 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.4 - 2026-11-14
+- tidy: watch-owned registry files (engines.json, projects.json, .kits.json, .mothership.json) rewritten during a page
+  run are no conflict any more (was "changed engines.json": 2 of 3 runs failed).
+- projects: a folder counts as a repo only when its own top level is the folder (an empty `.git` folder inside
+  `projects/` fell through to the base's repo and was registered as `Codex`). `projects scan` and `projects move`
+  refuse such folders; doctor flags projects.json entries that are not their own repo.
+- Sync scope `notes` (default for new bases, `engine sync-scope notes|all`): Syncthing shares wiki/, hot.md, plans/,
+  board/, progress/, agents/, templates/, maps/, sources/, raw/, research/ (crawl text left out). Code, data, scratch,
+  runs, ops, engines/ and .brain/ stay here. `sync-all off` now means notes. Explicit engine shares still go.
+- Backups: `backups/` and ~/skeleton-base-backups entries older than 30 days (`.brain/retention.json` "backups_days")
+  are removed once a day by watch, logged to `.brain/prune.log`; the newest entry of each folder is kept; doctor
+  shows the next prune.
+- Owner guide `wiki/how-this-base-works.md` (added by init when missing, linked first from hot.md and the index).
+- `sessions` (and watch, daily): `wiki/sessions.md`, one line per Claude Code / Codex session, newest first; titles
+  from the first lines only, scrubbed.
+- collect: `wiki/memories.md` (generated: what each tool remembers, names and one-line descriptions). Codex memories:
+  the collector reads `memories_*.sqlite` correctly; the live store was empty (no rows yet), so nothing was missed.
+- `ingest --baseline RAWDIR`: marks old raw files as known (lint stops warning).
+- `weekly` (watch, Sunday from 07:00, once per ISO week): `wiki/weekly/YYYY-Www.md` with done, changed, waiting for
+  the owner, next. `.brain/notify.json` {"command": [...]} gets title and text as JSON on stdin (no product-specific
+  notifier).
+- `dashboard`: `wiki/dashboard.md` with three Obsidian `.base` views (projects by status, decisions newest first,
+  pages not updated in 30 days) and the goals copied from wiki/me/goals.md (never invented). Pages take `status:`
+  (active | superseded | done; lint checks it), decisions take `supersedes:`.
+- Glossary: the base's own terms are generated between markers in wiki/glossary.md; owner lines are kept.
+- init no longer creates empty content folders (wiki/clients, wiki/people, raw/docs, ...); folder slots are not
+  reported missing.
+- lint: WARN on a wiki page over 30 KB and on a root README over 20 KB.
+- The product README is now a short overview; the full reference moved to `docs/REFERENCE.md`.
+
 ## v1.7.3 - 2026-11-14
 - `engine pin` (and `--undo`): a pinned path that is a FILE (`~/.claude.json`, a `.desktop` file) gets a folder guard
   (mode 000, one marker file inside) instead of the 0-byte file: rename(2) cannot put a file over a folder, and rmdir
