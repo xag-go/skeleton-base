@@ -10,11 +10,13 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BRAIN = REPO / "tools" / "brain.py"
@@ -52,7 +54,7 @@ FRUGAL_PATH = os.pathsep.join([_FRUGAL_BIN.name, os.path.dirname(sys.executable)
 
 REAL_TOOL_VARS = ("BRAIN_ROOT", "FRUGAL_HOME", "FRUGAL_BASE", "FRUGAL_BRIDGE_KIT", "HERMES_HOME", "CODEX_HOME",
                   "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR",
-                  "COPILOT_HOME", "GEMINI_CLI_HOME")
+                  "COPILOT_HOME", "GEMINI_CLI_HOME", "SYSTEMD_UNIT_PATH")   # the live user's units are not the fake one
 
 
 def test_env(**over):
@@ -6044,7 +6046,9 @@ class PinTests(ToolHome):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         for p in (self.home / ".claude", self.home / ".claude.json"):
             self.assertFalse(p.is_symlink(), p)
-            self.assertEqual((p.stat().st_size, p.stat().st_mode & 0o777), (0, 0), p)
+            self.assertEqual(p.stat().st_mode & 0o777, 0, p)
+        self.assertEqual((self.home / ".claude").stat().st_size, 0)       # a folder path: the 0-byte file guard
+        self.assertTrue((self.home / ".claude.json").is_dir())              # a file path: the folder guard (1.7.3)
         self.assertIn(f"CLAUDE_CONFIG_DIR={self.cl}",
                       (self.home / ".config/environment.d/60-base-engines.conf").read_text())
         self.assertIn("CLAUDE_CONFIG_DIR", (self.home / ".profile").read_text())
@@ -6304,7 +6308,7 @@ class PinFixTests(PinTests):
         (self.cl / ".claude.json").symlink_to(vault / ".claude.json")
         r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual((self.home / ".claude.json").stat().st_size, 0)
+        self.assertTrue((self.home / ".claude.json").is_dir())
 
     def test_a_pinned_adopt_row_guard_is_not_outside(self):
         d = self.base / "engines/codex-desktop"
@@ -6318,3 +6322,89 @@ class PinFixTests(PinTests):
         (self.base / "engines.json").write_text(json.dumps(reg))
         out = self.hb("doctor", "--base", str(self.base)).stdout
         self.assertNotIn("~/.config/Codex", out)
+
+
+class FileGuardTests(ToolHome):
+    """1.7.3: a pinned FILE path (~/.claude.json) gets a folder guard: a Claude Code that renames its temp file over
+    it fails. A folder path (~/.claude) keeps the 0-byte file guard."""
+
+    def setUp(self):
+        super().setUp()
+        cl = self.base / "engines/claude"
+        self.write(cl, "CLAUDE.md", "x\n")
+        self.write(cl, ".claude.json", "{}\n")
+        (self.home / ".claude").symlink_to(cl)
+        (self.home / ".claude.json").symlink_to(cl / ".claude.json")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {"claude": {
+            "tool": "claude-code", "mode": "adopted", "env": "CLAUDE_CONFIG_DIR", "from": "~/.claude",
+            "moved": [".claude.json"], "since": "2026-11-13"}}}))
+        self.cl = cl
+
+    def test_rename_over_a_pinned_file_path_fails_and_undo_restores(self):
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        g = self.home / ".claude.json"
+        self.assertTrue(g.is_dir() and not g.is_symlink(), g)
+        self.assertEqual(stat.S_IMODE(g.stat().st_mode), 0)
+        self.assertEqual((self.home / ".claude").stat().st_size, 0)           # a folder path: the 0-byte file
+        tmp = self.home / ".claude.json.tmp1"
+        tmp.write_text("{}\n")
+        with self.assertRaises(OSError):
+            os.rename(tmp, g)                                                  # the bypass that must fail
+        with self.assertRaises(OSError):
+            os.replace(tmp, g)
+        self.assertTrue(g.is_dir())
+        with self.assertRaises(OSError):
+            os.rmdir(g)                                                        # the marker keeps it non-empty
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotRegex(out, r"ERROR\s+~/\.claude\.json")
+        r = self.hb("engine", "pin", "--undo", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(self.home / ".claude.json"), str(self.cl / ".claude.json"))
+
+    def test_an_old_zero_byte_guard_of_a_file_path_is_upgraded_by_pin(self):
+        g = self.home / ".claude.json"
+        g.unlink()
+        g.write_bytes(b"")
+        os.chmod(g, 0)
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(g.is_dir() and not g.is_symlink(), g)
+
+    def test_a_real_file_at_a_pinned_file_path_is_an_error(self):
+        self.assertEqual(self.hb("engine", "pin", "claude-code", "--base", str(self.base)).returncode, 0)
+        g = self.home / ".claude.json"
+        os.chmod(g, 0o700)
+        (g / "skeleton-base-guard").unlink()
+        g.rmdir()
+        g.write_text("{}\n")
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertRegex(out, r"ERROR\s+~/\.claude\.json: pinned.*not the guard")
+
+
+class SystemdDropinOpsTests(ToolHome):
+    """1.7.3: the Syncthing start-up drop-in is looked for in ops/systemd and in SYSTEMD_UNIT_PATH, and written into
+    ops/systemd once the units are pinned there."""
+
+    def drop_text(self):
+        return B.st_dropin_text(self.base).replace(str(pathlib.Path(B.__file__).resolve()),
+                                                   str(self.base / "tools/brain.py"))
+
+    def test_drop_in_in_ops_is_found_and_written_there_once_units_are_pinned(self):
+        ops = self.base / B.UNIT_OPS
+        self.assertEqual(B.st_dropin_path(self.base, self.home), self.home / B.UNIT_HOME / B.ST_DROPIN)
+        self.write(ops, "syncthing.service", "[Service]\n")
+        B.reg_save(self.base, B.ENGINES_REG, {"units_pinned": True})
+        self.assertEqual(B.st_dropin_path(self.base, self.home), ops / B.ST_DROPIN)
+        self.assertTrue(B.st_unit_found(self.home, self.base))
+        self.write(ops, B.ST_DROPIN, self.drop_text())
+        with mock.patch.dict(os.environ, {"SYSTEMD_UNIT_PATH": ""}):
+            self.assertTrue(B.st_dropin_ok(self.base, self.home))
+            os.unlink(ops / B.ST_DROPIN)
+            self.assertFalse(B.st_dropin_ok(self.base, self.home))
+        other = self.tmp / "units"
+        self.write(other, B.ST_DROPIN, self.drop_text())
+        with mock.patch.dict(os.environ, {"SYSTEMD_UNIT_PATH": f"{other}:"}):
+            self.assertTrue(B.st_dropin_ok(self.base, self.home))
+        with mock.patch.dict(os.environ, {"SYSTEMD_UNIT_PATH": ""}):
+            self.assertFalse(B.st_dropin_ok(self.base, self.home))

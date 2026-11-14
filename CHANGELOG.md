@@ -2,6 +2,15 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.3 - 2026-11-14
+- `engine pin` (and `--undo`): a pinned path that is a FILE (`~/.claude.json`, a `.desktop` file) gets a folder guard
+  (mode 000, one marker file inside) instead of the 0-byte file: rename(2) cannot put a file over a folder, and rmdir
+  fails on the marker. Folder paths (`~/.claude`, `~/.config/Claude`) keep the 0-byte file. Re-running `engine pin`
+  upgrades an old 0-byte guard of a file path; undo removes either kind.
+- doctor: either guard kind is the guard of a pinned path; a real file at a pinned file path is still an ERROR.
+- Syncthing start-up drop-in: doctor finds it in `<base>/ops/systemd/syncthing.service.d/` and in every
+  SYSTEMD_UNIT_PATH folder; `engine sync-all on` writes it into `ops/systemd` once the units are pinned there.
+
 ## v1.7.2 - 2026-11-14
 - Pointer block (every tool's global rules, `connect`): a "New projects and files" section. New projects, code and
   documents go in `<base>/projects/<short-name>/`, not in ~ or another folder; temporary files go in the tool's

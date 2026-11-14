@@ -166,7 +166,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.7.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.3"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -8007,27 +8007,46 @@ def st_patch(st, values):
         raise OSError(f"HTTP {code}")
 
 
-def st_unit_found(home=None):
-    """True when Syncthing is a systemd user service (a unit file in a user or system unit folder)."""
+def st_unit_dirs(base=None, home=None):
+    """Folders systemd loads Syncthing's units and drop-ins from: each SYSTEMD_UNIT_PATH folder (when set), the base's
+    ops/systemd (after pin-units) and the user folder; each once."""
     home = pathlib.Path(home or home_dir())
-    for d in (home / ".config/systemd/user", pathlib.Path("/usr/lib/systemd/user"), pathlib.Path("/etc/systemd/user"),
-              pathlib.Path("/lib/systemd/user")):
-        if (d / "syncthing.service").exists():
-            return True
-    return False
+    dirs = [pathlib.Path(x) for x in (os.environ.get("SYSTEMD_UNIT_PATH") or "").split(":") if os.path.isabs(x)]
+    if base:
+        dirs.append(pathlib.Path(base).resolve() / UNIT_OPS)
+    dirs.append(home / UNIT_HOME)
+    out = []
+    for d in dirs:
+        if d not in out:
+            out.append(d)
+    return out
 
 
-def st_dropin_path(home=None):
-    return pathlib.Path(home or home_dir()) / ".config/systemd/user" / ST_DROPIN
+def st_unit_found(home=None, base=None):
+    """True when Syncthing is a systemd user service (a unit file in a user, system or base unit folder)."""
+    dirs = st_unit_dirs(base, home) + [pathlib.Path("/usr/lib/systemd/user"), pathlib.Path("/etc/systemd/user"),
+                                      pathlib.Path("/lib/systemd/user")]
+    return any((d / "syncthing.service").exists() for d in dirs)
+
+
+def st_dropin_path(base, home=None):
+    """Where the start-up drop-in is written: ops/systemd once the units are pinned there, else the user folder."""
+    ops = pathlib.Path(base).resolve() / UNIT_OPS
+    if reg_load(base, ENGINES_REG).get("units_pinned") and (ops / "syncthing.service").exists():
+        return ops / ST_DROPIN
+    return pathlib.Path(home or home_dir()) / UNIT_HOME / ST_DROPIN
 
 
 def st_dropin_ok(base, home=None):
-    """The start-up drop-in is there (a real folder, or a link into ops/systemd after adopt-units) and runs the
-    sync-scan of THIS base before Syncthing starts; which brain.py path it names does not matter."""
-    t = read(st_dropin_path(home)) or ""
+    """The start-up drop-in is in one of st_unit_dirs (a real folder, or a link after adopt-units or pin-units) and runs
+    the sync-scan of THIS base before Syncthing starts; which brain.py path it names does not matter."""
     b = shlex.quote(str(pathlib.Path(base).resolve()))
-    return any(l.startswith("ExecStartPre=") and " engine sync-scan --lock-first" in l and
-               l.rstrip().endswith(f"--base {b}") for l in t.splitlines())
+    for d in st_unit_dirs(base, home):
+        t = read(d / ST_DROPIN) or ""
+        if any(l.startswith("ExecStartPre=") and " engine sync-scan --lock-first" in l and
+               l.rstrip().endswith(f"--base {b}") for l in t.splitlines()):
+            return True
+    return False
 
 
 def st_dropin_text(base):
@@ -8059,10 +8078,10 @@ def st_secure(base, home=None):
             log.append("syncthing: folder watcher and periodic rescan off (it scans when brain.py asks)")
     except (OSError, ValueError) as e:
         return log + [f"syncthing: not reachable ({e}): new files can sync before the scan"]
-    if not st_unit_found(home):
+    if not st_unit_found(home, base):
         log.append("syncthing: not a systemd user service: it scans at its own start before brain.py does")
         return log
-    dp, want = st_dropin_path(home), st_dropin_text(base)
+    dp, want = st_dropin_path(base, home), st_dropin_text(base)
     have = read(dp)
     if have is None or have == want:
         if have is None:
@@ -8140,7 +8159,7 @@ def st_doctor(base, home=None):
     except (OSError, ValueError) as e:
         rows.append(("WARN", f"sync all is on but Syncthing is not reachable ({e}): new files can sync before "
                              "the scan"))
-    if not st_unit_found(home):
+    if not st_unit_found(home, base):
         rows.append(("INFO", "Syncthing is not a systemd user service: it scans at its own start before brain.py does"))
     elif not st_dropin_ok(base, home):
         rows.append(("WARN", "Syncthing start-up drop-in missing: it would scan before brain.py at its start "
@@ -9236,26 +9255,85 @@ OVERRIDE_MARK = "X-Skeleton-Base-Override"
 WRAP_MARK = "# skeleton-base wrapper"
 
 
-def guard_put(p):
-    """P becomes the guard file (0 bytes, mode 000) in one rename; returns the link target it replaced."""
+GUARD_MARK = "skeleton-base-guard"     # the marker file inside a folder guard: rmdir fails while it is there
+
+
+def guard_put(p, for_file=False):
+    """P becomes its guard (mode 000); returns the link target it replaced. A folder path gets the 0-byte file (mkdir
+    fails on it). A FILE path gets a folder with one marker file inside: rename(2) cannot put a file over a folder
+    (and a file over a folder that is not empty fails too). A file or link at P goes first: one gap of a syscall."""
     p = pathlib.Path(p)
     tgt = os.readlink(p) if p.is_symlink() else None
     tmp = p.with_name(f".{p.name}.pin-tmp")
     if os.path.lexists(tmp):
-        os.unlink(tmp)
+        guard_remove(tmp)
+    if for_file:
+        os.mkdir(tmp, 0o700)
+        os.close(os.open(tmp / GUARD_MARK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        os.chmod(tmp, 0)
+        if p.is_symlink() or p.is_file():
+            os.unlink(p)
+        os.rename(tmp, p)
+        return tgt
     os.close(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     os.chmod(tmp, 0)
     os.replace(tmp, p)
     return tgt
 
 
-def is_guard(p):
-    p = pathlib.Path(p)
+def guard_word(for_file):
+    return ("guard folder (mode 000, one marker file inside)" if for_file else "guard file (0 bytes, mode 000)")
+
+
+def is_file_guard(p):
+    """The 0-byte file guard (mode 000): the guard of a folder path, and the old guard of a file path."""
     try:
         st = os.lstat(p)
     except OSError:
         return False
     return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0
+
+
+def is_dir_guard(p):
+    """The folder guard of a file path (mode 000; its marker file is inside, so rmdir and rename both fail)."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) == 0
+
+
+def is_guard(p):
+    return is_file_guard(p) or is_dir_guard(p)
+
+
+def guard_ok(p, for_file):
+    """P holds the guard its kind needs (a file path needs the folder guard: an old 0-byte file is upgraded)."""
+    return is_dir_guard(p) if for_file else is_guard(p)
+
+
+def pin_kind_is_file(p):
+    """A pinned path is a FILE when it is a file, a file guard or a link to one, or it is missing and its name has
+    an extension (~/.claude.json); a FOLDER when it is a folder or a link to one (~/.claude, ~/.config/Claude)."""
+    p = pathlib.Path(p)
+    if is_dir_guard(p):
+        return True
+    if p.is_dir():
+        return False
+    return os.path.lexists(p) or bool(p.suffix)
+
+
+def guard_remove(p):
+    """Takes a guard away (either kind): a folder guard is opened, its marker removed, then rmdir."""
+    p = pathlib.Path(p)
+    if p.is_dir() and not p.is_symlink():
+        os.chmod(p, 0o700)
+        for x in p.iterdir():
+            os.unlink(x)
+        p.rmdir()
+    else:
+        os.chmod(p, 0o600)
+        p.unlink()
 
 
 def data_dirs():
@@ -9395,7 +9473,7 @@ def app_pin(base, name, row, e, reg, undo=False):
         for r, tgt in sorted((e.pop("pinned", None) or {}).items()):
             p = pathlib.Path(expand(r, home))
             if is_guard(p):
-                os.chmod(p, 0o600); p.unlink()
+                guard_remove(p)
             if tgt and not os.path.lexists(p):
                 os.symlink(tgt, p)
             log.append(f"{r}: the link is back")
@@ -9409,10 +9487,11 @@ def app_pin(base, name, row, e, reg, undo=False):
                          f"into engines/{name}: merge it into the base first")
     app_launchers(base, home, row, dest, rec, log)
     pinned = e.setdefault("pinned", {})
-    if not is_guard(src):
-        tgt = guard_put(src)
+    for_file = pin_kind_is_file(src)
+    if not guard_ok(src, for_file):
+        tgt = guard_put(src, for_file)
         pinned.setdefault(e["from"], tgt or str(dest))
-        log.append(f"{e['from']}: guard file (0 bytes, mode 000) instead of the link: a launcher we do not know "
+        log.append(f"{e['from']}: {guard_word(for_file)} instead of the link: a launcher we do not know "
                    "of fails loudly instead of making a new empty folder")
     reg_save(base, ENGINES_REG, reg)
     log.append(f"start {row.get('name', name)} again (quit it first). Undo: brain.py engine pin --undo {name}")
@@ -9557,38 +9636,31 @@ def engine_pin(base, tool, undo=False):
     if not (isinstance(e, dict) and e.get("mode") == "adopted" and e.get("env")):
         raise SystemExit(f"engine pin: {tool} is not adopted by its own setting here (engine adopt first)")
     dest = base / "engines" / name
-    places = [pathlib.Path(home) / key] + [pathlib.Path(home) / f for f, k in TOOL_FILES.items() if k == key]
+    places = [(pathlib.Path(home) / key, False)] + \
+        [(pathlib.Path(home) / f, True) for f, k in TOOL_FILES.items() if k == key]     # a file path: folder guard
     if undo:
         for r, tgt in sorted((e.get("pinned") or {}).items()):
             p = pathlib.Path(expand(r, home))
-            if p.is_file() and not p.is_symlink() and p.stat().st_size == 0:
-                os.chmod(p, 0o600); p.unlink()
+            if is_guard(p):
+                guard_remove(p)
                 if tgt:
                     os.symlink(tgt, p)
                 log.append(f"{r}: " + (f"the link to {tgt} is back" if tgt else "guard removed"))
         e.pop("pinned", None)
         reg_save(base, ENGINES_REG, reg)
         return log or [f"engine pin --undo: nothing pinned for {tool}"]
-    for p in places:
-        if os.path.lexists(p) and not (p.is_symlink() and in_base_lexical(p, dest)) and \
-                not (p.is_file() and not p.is_symlink() and p.stat().st_size == 0):
+    for p, for_file in places:
+        if os.path.lexists(p) and not (p.is_symlink() and in_base_lexical(p, dest)) and not is_guard(p):
             raise SystemExit(f"engine pin: {home_rel(p, home)} is a real {'folder' if p.is_dir() else 'file'}, not a "
                              f"link into engines/{name}: merge it into the base first (doctor: split brain)")
     write_env_files(base, reg, home, log)
     pinned = dict(e.get("pinned") or {})
-    for p in places:
-        if p.is_file() and not p.is_symlink():
+    for p, for_file in places:
+        if guard_ok(p, for_file):
             continue                                  # already the guard
-        tgt = os.readlink(p) if p.is_symlink() else None
-        tmp = p.with_name(f".{p.name}.pin-tmp")
-        if os.path.lexists(tmp):
-            os.unlink(tmp)
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        os.chmod(tmp, 0)
-        os.replace(tmp, p)                            # the link (or nothing) becomes the guard in one rename
-        pinned[home_rel(p, home)] = tgt
-        log.append(f"{home_rel(p, home)}: guard file (0 bytes, mode 000) instead of " +
+        tgt = guard_put(p, for_file)                  # the link (or nothing, or an old guard) becomes the guard
+        pinned[home_rel(p, home)] = tgt or pinned.get(home_rel(p, home))
+        log.append(f"{home_rel(p, home)}: {guard_word(for_file)} instead of " +
                    (f"the link to {tgt}" if tgt else "nothing"))
     e["pinned"] = pinned
     reg_save(base, ENGINES_REG, reg)
