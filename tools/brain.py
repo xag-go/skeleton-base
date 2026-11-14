@@ -792,7 +792,7 @@ class Installer:
         return None
 
     # -- uninstall
-    def remove_product_pages(self):
+    def remove_product_pages(self, created):
         """1.7.4: pages the product made (shipped text, or generated text with its own markers) go with the uninstall;
         a page the owner added text to is kept (the generated block is taken out first)."""
         def gone(rel):
@@ -802,18 +802,21 @@ class Installer:
             t = read(self.p(rel))
             return t is not None and "sources: [brain.py" in t.split("---", 2)[1] if t and t.startswith("---") else False
 
-        g = self.p("wiki/glossary.md")
-        if g.is_file():
-            t, shipped = read(g), read(SRC / "wiki/glossary.md")
+        def without_block(t):
             if t is not None and GLOSSARY_START in t and GLOSSARY_END in t:
                 a, b = t.index(GLOSSARY_START), t.index(GLOSSARY_END) + len(GLOSSARY_END)
-                t = (t[:a] + t[b:]).strip()
-            if shipped is not None and t is not None and t.strip() == shipped.strip():
+                t = t[:a] + t[b:]
+            return t.strip() if t is not None else None
+
+        g = self.p("wiki/glossary.md")
+        if g.is_file():
+            t = without_block(read(g))
+            # the shipped file's sha is what init recorded; SRC may be this base itself, so compare with that record
+            if t is not None and created.get("wiki/glossary.md") == sha((t + "\n").encode()):
                 gone("wiki/glossary.md")
         h = self.p("wiki/how-this-base-works.md")
-        if h.is_file() and read(h) is not None and read(SRC / "wiki/how-this-base-works.md") is not None \
-                and read(h).strip() == read(SRC / "wiki/how-this-base-works.md").strip():
-            gone("wiki/how-this-base-works.md")
+        if h.is_file() and created.get("wiki/how-this-base-works.md") == sha((read(h).strip() + "\n").encode()):
+            gone("wiki/how-this-base-works.md")          # unchanged since init (the recorded copy)
         for rel in ("wiki/sessions.md", "wiki/memories.md", "wiki/dashboard.md"):
             if self.p(rel).is_file() and product_text(rel):
                 gone(rel)
@@ -888,7 +891,7 @@ class Installer:
                                 f"of the whole file is in .base-folder/backup/)")
                 self.change(rel, new)
 
-        self.remove_product_pages()
+        self.remove_product_pages(created)
 
         rel = CLAUDE_SETTINGS
         if self.p(rel).exists():
