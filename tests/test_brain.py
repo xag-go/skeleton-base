@@ -6267,3 +6267,30 @@ class AutoAdoptUnknownTests(WatchBase):
         self.write(self.home, ".plain/data.bin", "x\n")
         self.ok("watch", "--once", "--no-commit")
         self.assertFalse((self.home / ".plain").is_symlink())
+
+
+class PinFixTests(PinTests):
+    """1.7.1: a link whose first hop is engines/<tool> counts even when that file is a vault link; a pinned guard
+    of an ADOPT_ROWS folder is in the base for doctor."""
+
+    def test_pin_accepts_a_link_into_a_vault_link(self):
+        vault = self.home / ".base-secret/claude"
+        self.write(vault, ".claude.json", "{}\n")
+        os.unlink(self.cl / ".claude.json")
+        (self.cl / ".claude.json").symlink_to(vault / ".claude.json")
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.home / ".claude.json").stat().st_size, 0)
+
+    def test_a_pinned_adopt_row_guard_is_not_outside(self):
+        d = self.base / "engines/codex-desktop"
+        d.mkdir(parents=True)
+        g = self.home / ".config/Codex"
+        g.parent.mkdir(parents=True, exist_ok=True)
+        B.guard_put(g)
+        reg = json.loads((self.base / "engines.json").read_text())
+        reg["engines"]["codex-desktop"] = {"tool": "codex-desktop", "mode": "adopted", "link": True,
+                                           "from": "~/.config/Codex", "pinned": {"~/.config/Codex": str(d)}}
+        (self.base / "engines.json").write_text(json.dumps(reg))
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotIn("~/.config/Codex", out)

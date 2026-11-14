@@ -166,7 +166,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.7.0"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -9565,7 +9565,7 @@ def engine_pin(base, tool, undo=False):
         reg_save(base, ENGINES_REG, reg)
         return log or [f"engine pin --undo: nothing pinned for {tool}"]
     for p in places:
-        if os.path.lexists(p) and not (p.is_symlink() and in_dir(p, dest)) and \
+        if os.path.lexists(p) and not (p.is_symlink() and in_base_lexical(p, dest)) and \
                 not (p.is_file() and not p.is_symlink() and p.stat().st_size == 0):
             raise SystemExit(f"engine pin: {home_rel(p, home)} is a real {'folder' if p.is_dir() else 'file'}, not a "
                              f"link into engines/{name}: merge it into the base first (doctor: split brain)")
@@ -10707,7 +10707,7 @@ def outside_scan(base, home, handled=()):
                         rows.append(("OUTSIDE", f"~/{r}: names paths outside the base: {', '.join(bad[:4])} (move "
                                                 "them into the base, then point the unit there)"))
                 continue
-            if r in adopt and not p.is_symlink():
+            if r in adopt and not p.is_symlink() and not is_guard(p):
                 t = adopt[r]
                 rows.append(("OUTSIDE", f"{t.get('name', t['id'])}: ~/{r} -> brain.py engine adopt {t['id']} "
                                         "(moves it into the base and leaves a link)"))

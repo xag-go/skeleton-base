@@ -2,6 +2,12 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.1 - 2026-11-14
+- `engine pin`: a link whose first hop is `engines/<tool>/...` counts as the tool's link even when that file is itself
+  a vault link (`~/.claude.json` -> `engines/claude/.claude.json` -> vault); it was refused as "a real file".
+- doctor: the guard file at a pinned folder of an adopt row (e.g. `~/.config/Codex` after `engine pin codex-desktop`)
+  is not reported OUTSIDE with the adopt hint any more.
+
 ## v1.7.0 - 2026-11-14
 No links at old paths: every program is told the new place, and the old path holds the guard file (0 bytes, mode
 000), so a launcher we do not know of fails loudly instead of making a new empty folder. Doctor: a missing guard, a
