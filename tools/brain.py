@@ -166,7 +166,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.7.1"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.2"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -3493,6 +3493,11 @@ def pointer_body(base):
   that form) and add one line to `{b}/progress/agents.log` with your file tools.
 - "Remember ..." from the user is durable knowledge: write it in the base first, then a short copy in your own
   memory; both should have it. Never only in your own memory.
+
+## New projects and files
+- Any new project, code, app or document goes in `{b}/projects/<short-name>/` (its own folder; `git init` there
+  when it is code), never in ~ or another folder outside the base.
+- Temporary files go in your tool's scratch folder; deliverables the user keeps go in the project folder.
 
 ## Access
 - This folder is outside your project; read and write it with your normal file tools, from any folder.

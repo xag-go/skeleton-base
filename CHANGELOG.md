@@ -2,6 +2,12 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.2 - 2026-11-14
+- Pointer block (every tool's global rules, `connect`): a "New projects and files" section. New projects, code and
+  documents go in `<base>/projects/<short-name>/`, not in ~ or another folder; temporary files go in the tool's
+  scratch folder. Existing blocks are refreshed by the next `connect` (no version bump: the block is found by its
+  start marker whatever its version).
+
 ## v1.7.1 - 2026-11-14
 - `engine pin`: a link whose first hop is `engines/<tool>/...` counts as the tool's link even when that file is itself
   a vault link (`~/.claude.json` -> `engines/claude/.claude.json` -> vault); it was refused as "a real file".

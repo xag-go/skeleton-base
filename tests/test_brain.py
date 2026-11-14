@@ -1026,6 +1026,30 @@ class ConnectTests(HomeBase):
         self.assertEqual(kits0, (self.base / ".kits.json").read_bytes())
         self.assertIn("not connected", self.ok("disconnect").stdout)
 
+    def test_pointer_block_says_where_new_projects_go(self):
+        self.user_files()
+        self.ok("connect")
+        b = str(self.base)
+        for f in (self.home / ".claude/CLAUDE.md", self.home / ".codex/AGENTS.md"):
+            t = f.read_text()
+            self.assertIn("\n## New projects and files\n", t)
+            self.assertIn(f"- Any new project, code, app or document goes in `{b}/projects/<short-name>/`", t)
+            self.assertIn("- Temporary files go in your tool's scratch folder", t)
+            self.assertEqual(t.count("<!-- base-folder:start"), 1)
+
+    def test_old_pointer_block_is_refreshed_by_connect(self):
+        self.user_files()
+        self.ok("connect")
+        p = self.home / ".claude/CLAUDE.md"
+        t = p.read_text()
+        a, e = t.index("## New projects and files"), t.index("## Access")
+        p.write_text(t[:a] + t[e:])                       # the block as 1.7.1 wrote it
+        self.ok("connect")
+        t2 = p.read_text()
+        self.assertIn("\n## New projects and files\n", t2)
+        self.assertEqual(t2.count("<!-- base-folder:start"), 1)
+        self.assertTrue(t2.startswith("# my global rules\nUse tabs.\n\n<!-- base-folder:start v2 -->\n"))
+
     def test_pointer_file_of_another_base_is_given_back_on_disconnect(self):
         self.user_files()
         self.write(self.home, ".config/skeleton-base/base", "/somewhere/else/base\n")
