@@ -4,12 +4,15 @@ Changes to the skeleton structure and tools (not to anyone's content).
 
 ## v1.7.8 - 2026-11-15
 Two live bugs after 1.7.7: a pin lost its guard after an update, and a tool's runtime file was reported as a secret.
+- The ~/.claude link for Claude Code is kept on purpose. The Claude desktop app's SSH remote uploads its server binary
+  to ~/.claude and ignores CLAUDE_CONFIG_DIR, so the old path must stay a link. The tools table gives claude-code a
+  `keep_link` reason: doctor reports the link as OK ("kept on purpose"), not as a link where a setting exists, and
+  `engine pin claude-code` refuses with that reason unless `--force` (the desktop SSH remote then fails).
 - Pins keep their guard. Adopt (`engine adopt`, `--path`, the default-place adopt that connect and watch run for a
   new tool) and the link mover refuse a pinned old path, and so does a folder that is a guard: nothing changes and the
-  message says to undo the pin first. Watch no longer takes a guard for a new AI folder. The test runs init, connect,
-  connect --watch and a watcher pass on a pinned home and checks the guards stay. The sequence of
-  the-mothership's install.py (init, connect, Frugal --global, connect) does not replace a guard here; without the
-  tool's variable, connect stops with a traceback at its first write into the guarded ~/.claude (the guard stays).
+  message says to undo the pin first. Watch no longer takes a guard for a new AI folder. A test runs init, connect,
+  connect --watch and a watcher pass on a pinned home and checks the guards stay; without the tool's variable,
+  connect stops with a traceback at its first write into the guarded ~/.claude (the guard stays).
 - A tool's runtime folder (`remote/run/`, Claude Code's Remote Control `daemon.token`) is not a vault candidate:
   doctor no longer reports it. Git and Syncthing already left it out (`engine_rule` denies it); a test checks that.
 

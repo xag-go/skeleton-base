@@ -4297,8 +4297,10 @@ class EverythingInBaseTests(ToolHome):
         self.assertFalse([x for x in rows if x.startswith("OUTSIDE") and "~/.codex" in x], r.stdout)
         self.assertTrue([x for x in rows if x.startswith("WARN") and "guard file" in x and "CODEX_HOME" in x],
                         r.stdout)
-        self.assertTrue([x for x in rows if x.startswith("WARN") and "a link where a setting exists" in x
-                         and "~/.claude" in x and "engine pin claude-code" in x], r.stdout)          # 1.6.9
+        self.assertTrue([x for x in rows if x.startswith("OK") and "kept on purpose" in x and "~/.claude" in x],
+                        r.stdout)                 # 1.7.8: the desktop SSH remote needs this link (kept, not a WARN)
+        self.assertFalse([x for x in rows if x.startswith("WARN") and "a link where a setting exists" in x
+                          and "~/.claude" in x], r.stdout)
         self.assertNotIn("not wired by connect", r.stdout)
         self.assertNotIn("engine adopt", r.stdout)
         env = {"CODEX_HOME": str(self.eng / "codex"), "CLAUDE_CONFIG_DIR": str(self.eng / "claude")}
@@ -6099,10 +6101,9 @@ class PinTests(ToolHome):
 
     def test_doctor_warns_pin_replaces_links_and_undo_restores(self):
         out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
-        self.assertRegex(out, r"WARN\s+Claude Code: ~/\.claude is a link into the base, a link where a setting "
-                              r"exists \(CLAUDE_CONFIG_DIR\) -> brain\.py engine pin claude-code")
+        self.assertRegex(out, r"OK\s+Claude Code: ~/\.claude is a link into the base, kept on purpose")
         self.assertRegex(out, r"WARN\s+Claude Code: ~/\.claude\.json is a link into the base")
-        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        r = self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         for p in (self.home / ".claude", self.home / ".claude.json"):
             self.assertFalse(p.is_symlink(), p)
@@ -6119,10 +6120,21 @@ class PinTests(ToolHome):
         self.assertEqual(os.readlink(self.home / ".claude"), str(self.cl))
         self.assertEqual(os.readlink(self.home / ".claude.json"), str(self.cl / ".claude.json"))
 
+    def test_claude_link_is_kept_on_purpose_pin_refuses_without_force(self):
+        """1.7.8: the desktop app's SSH remote needs ~/.claude as a link: doctor says so (OK) and pin refuses."""
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertRegex(out, r"OK\s+Claude Code: ~/\.claude is a link into the base, kept on purpose: .*SSH remote")
+        self.assertNotRegex(out, r"WARN\s+Claude Code: ~/\.claude is a link")
+        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("kept on purpose", r.stdout + r.stderr)
+        self.assertIn("SSH remote", r.stdout + r.stderr)
+        self.assertEqual(os.readlink(self.home / ".claude"), str(self.cl), "the link stays without --force")
+
     def test_pin_refuses_a_real_folder(self):
         os.unlink(self.home / ".claude")
         (self.home / ".claude").mkdir()
-        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        r = self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("real folder", r.stdout + r.stderr)
         self.assertTrue((self.home / ".claude.json").is_symlink(), "nothing changed")
@@ -6225,7 +6237,7 @@ class AppPinTests(ToolHome):
 
 class PinnedGuardTests(PinTests):
     def test_doctor_errors_on_a_missing_guard_a_link_or_a_folder(self):
-        self.ok("engine", "pin", "claude-code", "--base", str(self.base))
+        self.ok("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         g = self.home / ".claude"
         os.chmod(g, 0o600); g.unlink()
         out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
@@ -6565,7 +6577,7 @@ class PinFixTests(PinTests):
         self.write(vault, ".claude.json", "{}\n")
         os.unlink(self.cl / ".claude.json")
         (self.cl / ".claude.json").symlink_to(vault / ".claude.json")
-        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        r = self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue((self.home / ".claude.json").is_dir())
 
@@ -6600,7 +6612,7 @@ class FileGuardTests(ToolHome):
         self.cl = cl
 
     def test_rename_over_a_pinned_file_path_fails_and_undo_restores(self):
-        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        r = self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         g = self.home / ".claude.json"
         self.assertTrue(g.is_dir() and not g.is_symlink(), g)
@@ -6626,12 +6638,12 @@ class FileGuardTests(ToolHome):
         g.unlink()
         g.write_bytes(b"")
         os.chmod(g, 0)
-        r = self.hb("engine", "pin", "claude-code", "--base", str(self.base))
+        r = self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(g.is_dir() and not g.is_symlink(), g)
 
     def test_a_real_file_at_a_pinned_file_path_is_an_error(self):
-        self.assertEqual(self.hb("engine", "pin", "claude-code", "--base", str(self.base)).returncode, 0)
+        self.assertEqual(self.hb("engine", "pin", "claude-code", "--force", "--base", str(self.base)).returncode, 0)
         g = self.home / ".claude.json"
         os.chmod(g, 0o700)
         (g / "skeleton-base-guard").unlink()
@@ -7399,7 +7411,7 @@ class PinSurvivesTests(ToolHome):
             "tool": "claude-code", "mode": "adopted", "env": "CLAUDE_CONFIG_DIR", "from": "~/.claude",
             "moved": [".claude.json"], "since": "2026-11-13"}}}))
         self.cl = cl
-        self.ok("engine", "pin", "claude-code", "--base", str(self.base))
+        self.ok("engine", "pin", "claude-code", "--force", "--base", str(self.base))
         self.env = {"HOME": str(self.home), "PATH": self.path(), "CLAUDE_CONFIG_DIR": str(self.cl)}
 
     def assertGuards(self):

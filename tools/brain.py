@@ -4753,6 +4753,10 @@ def same_path(x, v):
 #   skills   it reads ~/.agents/skills (the base's skills are installed there once).
 #   status   "legacy" / "discontinued" (detected, never newly connected) / "app".
 #   access, mcp, memory, hooks: what connect does or why it cannot (shown by `connect --print` and the README).
+# 1.7.8: a tool whose default place must stay a link, and why. `engine pin` refuses it unless --force; doctor reports
+# the link as kept (OK), not as a link where a setting exists.
+KEEP_CLAUDE_LINK = ("the Claude desktop app's SSH remote uploads its server binary to ~/.claude and ignores "
+                    "CLAUDE_CONFIG_DIR, so ~/.claude must stay a link into the base")
 TOOLS = {t["key"]: t for t in (
     dict(key=".claude", name="Claude Code", bins=("claude",), marks=(".claude.json",),
          rules=((".claude/CLAUDE.md", "create"),),
@@ -4760,6 +4764,7 @@ TOOLS = {t["key"]: t for t in (
                 "`~/.claude/settings.json`",
          mcp="`mcpServers` in `~/.claude.json` (user scope)", memory="`~/.claude/projects/*/memory/*.md`",
          hooks="its own: SessionEnd, PreCompact (+ PostToolUse with --kick)",
+         keep_link=KEEP_CLAUDE_LINK,
          skills_note="skills: reads only `~/.claude/skills`, not `~/.agents/skills` (not copied there: other "
                      "tools read `~/.claude/skills` too and would load them twice); the base's AGENTS.md points to "
                      "its `skills/`",
@@ -10510,7 +10515,7 @@ def units_workdir(base):
     return log or ["engine pin-units --workdir: every service in ops/systemd has a WorkingDirectory= already"]
 
 
-def engine_pin(base, tool, undo=False):
+def engine_pin(base, tool, undo=False, force=False):
     """A tool adopted by its own setting whose default places are still links into the base (made by hand or by
     an older setup): the variable goes where every launcher sees it (the marked blocks in environment.d for user
     units and GUI sessions, ~/.profile, ~/.bashrc), then each link becomes the guard file (0 bytes, mode 000) that
@@ -10520,6 +10525,10 @@ def engine_pin(base, tool, undo=False):
     name = ENGINE_NAMES.get(key, tool) if key else tool
     if link_row(tool):
         name = link_row(tool)["id"]
+    keep = (TOOLS.get(key) or {}).get("keep_link") if key else None
+    if keep and not undo and not force:
+        raise SystemExit(f"engine pin {tool}: refused, the link is kept on purpose: {keep}. Pass --force to pin anyway "
+                         "(the desktop app's SSH remote then fails)")
     reg = reg_load(base, ENGINES_REG)
     e = reg.get("engines", {}).get(name)
     if isinstance(e, dict) and e.get("mode") == "adopted" and e.get("link") and not e.get("env"):
@@ -11480,6 +11489,9 @@ def adopt_guard(base, key, d, home):
             continue
         tool, env, eng = TOOLS.get(key, {}).get("name", key), e.get("env") or "its variable", base / "engines" / n
         load = "load ~/.config/environment.d/60-base-engines.conf or start a login shell"
+        if d.is_symlink() and in_dir(d, eng) and TOOLS.get(key, {}).get("keep_link"):
+            return ("OK", f"{tool}: ~/{key} is a link into engines/{n}, kept on purpose: "
+                          f"{TOOLS[key]['keep_link']}"), str(eng)
         if d.is_symlink() and in_dir(d, eng):
             return ("WARN", f"{tool}: ~/{key} is a link into engines/{n}, a link where a setting exists ({env}) "
                             f"-> brain.py engine pin {e.get('tool') or n} (the variable for every launcher, a "
@@ -11841,7 +11853,10 @@ def doctor(base, strict=False):
         tid = next((i for i, k in TOOL_IDS.items() if k == key), key)
         for lk in ([default] + [pathlib.Path(home) / f for f, k in TOOL_FILES.items() if k == key]) \
                 if var and not extra else []:
-            if lk.is_symlink() and in_dir(lk, base):
+            if lk.is_symlink() and in_dir(lk, base) and lk == default and TOOLS.get(key, {}).get("keep_link"):
+                rows.append(("OK", f"{name}: {home_rel(lk, home)} is a link into the base, kept on purpose: "
+                                   f"{TOOLS[key]['keep_link']}"))
+            elif lk.is_symlink() and in_dir(lk, base):
                 rows.append(("WARN", f"{name}: {home_rel(lk, home)} is a link into the base, a link where a setting "
                                      f"exists ({var}) -> brain.py engine pin {tid}"))
         if var and not extra and default.is_dir() and not default.is_symlink() and not in_dir(default, d):
@@ -12961,7 +12976,7 @@ def main(argv):
             elif sub == "pin":
                 if len(rest) != 2:
                     print("usage: engine pin TOOL [--undo]"); return 1
-                log = engine_pin(base, rest[1], undo)
+                log = engine_pin(base, rest[1], undo, force)
             elif sub == "pin-units":
                 log = units_workdir(base) if "--workdir" in flags else units_pin(base, undo)
             elif sub == "adopt-units":
