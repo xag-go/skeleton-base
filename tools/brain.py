@@ -175,7 +175,7 @@ import time
 import urllib.parse
 
 VERSION = "1"
-RELEASE = "1.7.5"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
+RELEASE = "1.7.6"        # product release (CHANGELOG); recorded in .kits.json so installers never downgrade
 SRC = pathlib.Path(__file__).resolve().parent.parent          # the skeleton this script came with
 START = f"<!-- base-folder:start v{VERSION} -->"
 END = "<!-- base-folder:end -->"
@@ -10208,20 +10208,33 @@ def units_pin(base, undo=False):
     ud, ops = pathlib.Path(home) / UNIT_HOME, base / UNIT_OPS
     dropin = "/" + UNITS_DROPIN
     body = f'[Service]\nEnvironment="SYSTEMD_UNIT_PATH={ops}:"\n'
+    swept = reg.get("units_swept") if isinstance(reg.get("units_swept"), dict) else {}
     if undo:
         for n in sorted(units):
             if (ops / n).exists() and not os.path.lexists(ud / n):
                 os.symlink(str(ops / n), ud / n); log.append(f"~/{UNIT_HOME}/{n}: the link is back")
+        for n, t in sorted(swept.items()):       # 1.7.6: links any installer made into ops/systemd, pin-units removed
+            if os.path.exists(t) and not os.path.lexists(ud / n):
+                os.symlink(t, ud / n); log.append(f"~/{UNIT_HOME}/{n}: the link is back")
         for n in sorted(mine):
             if (ops / n).is_file() and not os.path.lexists(ud / n):
                 os.replace(ops / n, ud / n); log.append(f"~/{UNIT_HOME}/{n}: a real file again")
-        reg.pop("units_pinned", None)
+        reg.pop("units_pinned", None); reg.pop("units_swept", None)
         reg_save(base, ENGINES_REG, reg)
         systemctl_reload(log)
         log.append(f"then, as root (one time): sudo rm {shq(dropin)} && sudo systemctl daemon-reload; the user "
                    "manager drops the path at its next start (log out of every session and back in)")
         return log
-    if not units and not mine:
+    # 1.7.6: every link in ~/.config/systemd/user whose target is in ops/systemd goes, whoever made it (an older
+    # installer's too); links elsewhere (masks to /dev/null, package units) are never touched
+    ops_real = os.path.realpath(ops)
+    foreign = {}
+    for p in sorted(ud.iterdir()) if ud.is_dir() else []:
+        if p.is_symlink() and not p.name.endswith((".wants", ".requires")):
+            t = os.path.realpath(p)
+            if in_dir(t, ops_real) and t != ops_real:
+                foreign[p.name] = t
+    if not units and not mine and not foreign:
         return ["engine pin-units: no units moved yet (engine adopt-units first)"]
     up = units_unitpath()
     if up is None or str(ops) not in up:
@@ -10234,20 +10247,25 @@ def units_pin(base, undo=False):
                 "':' keeps the default search path (systemd.unit(5), \"Unit File Load Path\").",
                 "Then run `brain.py engine pin-units` again: it checks `systemctl --user show -p UnitPath` and only "
                 "then removes the links."]
-    for n in sorted(set(units) | mine):
+    for n in sorted(set(units) | mine | set(foreign)):
         p = ud / n
-        if p.is_symlink() and os.path.realpath(p) == os.path.realpath(ops / n):
+        if p.is_symlink() and n in foreign:
             os.unlink(p); log.append(f"~/{UNIT_HOME}/{n}: link removed (found in {ops} now)")
+            swept[n] = foreign[n]
         elif n in mine and p.is_file() and not p.is_symlink():
             ops.mkdir(parents=True, exist_ok=True)
             os.replace(p, ops / n); log.append(f"~/{UNIT_HOME}/{n}: moved into {ops} (connect writes it there now)")
+    # enable links (*.wants/*.requires) of the removed links first point at the unit file in ops/systemd
     for w in sorted(ud.glob("*.wants")) + sorted(ud.glob("*.requires")):
         for x in sorted(w.iterdir()):
-            if x.is_symlink() and (x.name in units or x.name in mine):
+            if x.is_symlink() and (x.name in foreign or x.name in mine):
                 t = os.path.normpath(os.path.join(str(w), os.readlink(x)))
+                target = foreign.get(x.name) or str(ops / x.name)
                 if t == os.path.normpath(str(ud / x.name)) or not os.path.exists(x):
-                    os.unlink(x); os.symlink(str(ops / x.name), x)
-                    log.append(f"{home_rel(x, home)} -> {ops / x.name}")
+                    os.unlink(x); os.symlink(target, x)
+                    log.append(f"{home_rel(x, home)} -> {target}")
+    if swept:
+        reg["units_swept"] = swept
     reg["units_pinned"] = True
     reg_save(base, ENGINES_REG, reg)
     systemctl_reload(log)
@@ -10277,27 +10295,67 @@ def unit_workdir_rows(base, home):
     """1.7.5: the services in ops/systemd and in ~/.config/systemd/user (one row per name). A WorkingDirectory= outside
     the base is WARN; so is none at all (a user unit then starts in the home folder)."""
     base, home, seen, rows = pathlib.Path(base).resolve(), pathlib.Path(home), {}, []
+    ops_real, ud_real = os.path.realpath(base / UNIT_OPS), os.path.realpath(home / UNIT_HOME)
     for d, label in ((base / UNIT_OPS, UNIT_OPS), (home / UNIT_HOME, f"~/{UNIT_HOME}")):
         if not d.is_dir():
             continue
         for p in sorted(d.iterdir()):
             if p.is_dir() or not p.name.endswith(".service") or p.name in seen:
                 continue
-            seen[p.name] = (p, f"{label}/{p.name}")
+            real = os.path.realpath(p)              # 1.7.6: a mask (/dev/null) or a unit outside both folders: not ours
+            if real == "/dev/null" or not (in_dir(real, ops_real) or in_dir(real, ud_real)):
+                continue
+            seen[p.name] = (p, f"{label}/{p.name}", in_dir(real, ops_real))
     for n in sorted(seen):
-        p, label = seen[n]
+        p, label, in_ops = seen[n]
         wd = None
         for line in (read(p) or "").splitlines():
             k, _, v = line.strip().partition("=")
             if k == "WorkingDirectory":
                 wd = v.strip().lstrip("-") or None
-        if wd is None:
+        if wd is None and in_ops:
+            # 1.7.6: pin-units --workdir adds it; a team-* unit is rewritten by its installer, which drops it again
+            again = (" (team-* units are written by their installer, which drops the line again: set it there too)"
+                     if n.startswith("team-") else "")
+            rows.append(("WARN", f"{label}: no WorkingDirectory= (a user unit starts in the home folder) -> "
+                                 f"brain.py engine pin-units --workdir (adds WorkingDirectory={base}){again}"))
+        elif wd is None:
             rows.append(("WARN", f"{label}: no WorkingDirectory= (a user unit starts in the home folder) -> set "
                                  f"WorkingDirectory={base} (or the tool's engine folder)"))
         elif not in_dir(os.path.expanduser(wd.replace("%h", str(home))), base):
             rows.append(("WARN", f"{label}: starts outside the base (WorkingDirectory={wd}) -> set "
                                  f"WorkingDirectory={base} (or the tool's engine folder)"))
     return rows
+
+
+def units_workdir(base):
+    """1.7.6: `engine pin-units --workdir`: a service in ops/systemd with no WorkingDirectory= gets
+    WorkingDirectory=<base> under [Service]. Its file is copied to .brain/backups first. An existing
+    WorkingDirectory= is never changed."""
+    base, log, bdir, changed = pathlib.Path(base).resolve(), [], None, False
+    ops = base / UNIT_OPS
+    for p in sorted(ops.glob("*.service")) if ops.is_dir() else []:
+        if p.is_symlink() or not p.is_file():
+            continue
+        lines = (read(p) or "").splitlines(True)
+        if any(l.strip().partition("=")[0].strip() == "WorkingDirectory" for l in lines):
+            continue
+        at = next((i for i, l in enumerate(lines) if l.strip() == "[Service]"), None)
+        if at is None:
+            log.append(f"{UNIT_OPS}/{p.name}: no [Service] section: left as it is"); continue
+        if not bdir:
+            bdir = base / ".brain" / "backups" / f"units-workdir-{dt.datetime.now():%Y%m%d-%H%M%S-%f}"
+        bdir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, bdir / p.name)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.insert(at + 1, f"WorkingDirectory={base}\n")
+        atomic_write(p, "".join(lines))
+        changed = True
+        log.append(f"{UNIT_OPS}/{p.name}: WorkingDirectory={base} added (backup {rel(bdir / p.name, base)})")
+    if changed:
+        systemctl_reload(log)
+    return log or ["engine pin-units --workdir: every service in ops/systemd has a WorkingDirectory= already"]
 
 
 def engine_pin(base, tool, undo=False):
@@ -11908,7 +11966,7 @@ def main(argv):
                     print("usage: engine pin TOOL [--undo]"); return 1
                 log = engine_pin(base, rest[1], undo)
             elif sub == "pin-units":
-                log = units_pin(base, undo)
+                log = units_workdir(base) if "--workdir" in flags else units_pin(base, undo)
             elif sub == "adopt-units":
                 log = units_adopt(base, undo)
             elif sub == "release":

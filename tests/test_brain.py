@@ -6295,6 +6295,63 @@ class UnitPinTests(ToolHome):
         self.ok("engine", "pin-units", "--undo", "--base", str(self.base))
 
 
+class UnitsFinishTests(ToolHome):
+    """1.7.6: pin-units takes every link into ops/systemd (any installer's); --workdir adds a missing
+    WorkingDirectory= to ops units; doctor skips masks and units outside the two folders."""
+
+    def setUp(self):
+        super().setUp()
+        self.up = self.tmp / "unitpath"
+        p = self.bin / "systemctl"
+        p.write_text("#!/bin/sh\nif [ \"$2\" = show ]; then echo \"UnitPath=$(cat %s 2>/dev/null)\"; fi\n" %
+                     shq_(self.up))
+        p.chmod(0o755)
+        self.u = self.home / ".config/systemd/user"
+        self.write(self.u, "team-a.service", "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n")
+        self.ok("engine", "adopt-units", "--base", str(self.base))
+        self.ops = self.base / "ops/systemd"
+
+    def test_pin_takes_every_link_into_ops_and_undo_puts_them_back(self):
+        self.write(self.ops, "legacy-x.service", "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n")
+        (self.u / "legacy-x.service").symlink_to(self.ops / "legacy-x.service")
+        (self.u / "default.target.wants").mkdir(exist_ok=True)
+        (self.u / "default.target.wants/legacy-x.service").symlink_to(self.u / "legacy-x.service")
+        (self.u / "localsearch-3.service").symlink_to("/dev/null")
+        self.write(self.tmp, "pkg/pkg.service", "[Service]\nExecStart=/bin/true\n")
+        (self.u / "pkg.service").symlink_to(self.tmp / "pkg/pkg.service")
+        self.up.write_text(f"{self.ops} {self.home}/.config/systemd/user /usr/lib/systemd/user")
+        self.ok("engine", "pin-units", "--base", str(self.base))
+        self.assertFalse(os.path.lexists(self.u / "legacy-x.service"), "a foreign link into ops goes")
+        self.assertEqual(os.readlink(self.u / "default.target.wants/legacy-x.service"),
+                         str(self.ops / "legacy-x.service"), "its enable link is re-pointed first")
+        self.assertEqual(os.readlink(self.u / "localsearch-3.service"), "/dev/null", "a mask is never touched")
+        self.assertTrue((self.u / "pkg.service").is_symlink(), "a link elsewhere is never touched")
+        self.ok("engine", "pin-units", "--undo", "--base", str(self.base))
+        self.assertEqual(os.readlink(self.u / "legacy-x.service"), str(self.ops / "legacy-x.service"),
+                         "undo puts the swept link back")
+
+    def test_workdir_adds_it_only_where_missing_and_backs_up(self):
+        self.write(self.ops, "nowd.service", "[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n")
+        self.write(self.ops, "hasw.service", "[Service]\nWorkingDirectory=/elsewhere\nExecStart=/bin/true\n")
+        self.ok("engine", "pin-units", "--workdir", "--base", str(self.base))
+        text = (self.ops / "nowd.service").read_text()
+        self.assertIn(f"[Service]\nWorkingDirectory={self.base}\nExecStart=/bin/true", text)
+        self.assertEqual((self.ops / "hasw.service").read_text(),
+                         "[Service]\nWorkingDirectory=/elsewhere\nExecStart=/bin/true\n", "never changed")
+        backups = list((self.base / ".brain/backups").glob("units-workdir-*/nowd.service"))
+        self.assertEqual(len(backups), 1, "copied before it changed")
+        self.assertNotIn("WorkingDirectory", backups[0].read_text())
+
+    def test_doctor_skips_masks_and_outside_units_and_hints_pin_workdir(self):
+        (self.u / "localsearch-3.service").symlink_to("/dev/null")
+        self.write(self.tmp, "ext/outside.service", "[Service]\nExecStart=/bin/true\n")
+        (self.u / "outside.service").symlink_to(self.tmp / "ext/outside.service")
+        self.write(self.ops, "team-q.service", "[Service]\nExecStart=/bin/true\n")
+        out = self.hb("doctor", "--base", str(self.base)).stdout
+        self.assertNotRegex(out, r"localsearch-3|outside\.service")
+        self.assertRegex(out, r"WARN\s+ops/systemd/team-q\.service: no WorkingDirectory=.*pin-units --workdir.*team-\*")
+
+
 class StartInBaseTests(ToolHome):
     """1.7.5: a shell that starts in $HOME goes into the base (interactive shells only); the owner can turn it off."""
 

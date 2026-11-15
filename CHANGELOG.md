@@ -2,6 +2,17 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.6 - 2026-11-15
+- `engine pin-units` removes EVERY link in ~/.config/systemd/user whose target is in ops/systemd, whoever made it
+  (an older installer's links too: hermes, syncthing, backup, push, ci-dispatch units). Enable links (*.wants,
+  *.requires) of those units are re-pointed at the unit file first. Links elsewhere (masks to /dev/null, package
+  units) are never touched. The removed names are recorded; `pin-units --undo` puts those links back.
+- `engine pin-units --workdir`: a service in ops/systemd without WorkingDirectory= gets `WorkingDirectory=<base>`
+  under [Service]; its file is copied to .brain/backups first. An existing WorkingDirectory= is never changed.
+- Doctor's "no WorkingDirectory" WARN skips masked units (links to /dev/null) and units outside
+  ~/.config/systemd/user and ops/systemd. For a unit in ops/systemd the hint is `pin-units --workdir`; a team-* unit's
+  hint also says its installer drops the line again.
+
 ## v1.7.5 - 2026-11-14
 - Start in the base: connect writes a marked block into ~/.profile and ~/.bashrc. In an interactive shell that
   starts in $HOME it `cd`s into the base; other shells (scripts, `ssh host cmd`, a shell started elsewhere) are not
