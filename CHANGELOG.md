@@ -2,6 +2,17 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.8 - 2026-11-15
+Two live bugs after 1.7.7: a pin lost its guard after an update, and a tool's runtime file was reported as a secret.
+- Pins keep their guard. Adopt (`engine adopt`, `--path`, the default-place adopt that connect and watch run for a
+  new tool) and the link mover refuse a pinned old path, and so does a folder that is a guard: nothing changes and the
+  message says to undo the pin first. Watch no longer takes a guard for a new AI folder. The test runs init, connect,
+  connect --watch and a watcher pass on a pinned home and checks the guards stay. The sequence of
+  the-mothership's install.py (init, connect, Frugal --global, connect) does not replace a guard here; without the
+  tool's variable, connect stops with a traceback at its first write into the guarded ~/.claude (the guard stays).
+- A tool's runtime folder (`remote/run/`, Claude Code's Remote Control `daemon.token`) is not a vault candidate:
+  doctor no longer reports it. Git and Syncthing already left it out (`engine_rule` denies it); a test checks that.
+
 ## v1.7.7 - 2026-11-15
 From the general review of a live base. Doctor gained checks (each a WARN with its fix), generated pages gained two.
 - Lint (error) and doctor (WARN): a `.md` file at the base root named like a wiki page shadows it (Obsidian makes

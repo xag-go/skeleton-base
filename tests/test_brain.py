@@ -6879,8 +6879,8 @@ class Release177Tests(unittest.TestCase):
 
     # -- release
     def test_release_number_and_changelog(self):
-        self.assertEqual(B.RELEASE, "1.7.7")
-        self.assertIn("## v1.7.7", (REPO / "CHANGELOG.md").read_text())
+        self.assertEqual(B.RELEASE, "1.7.8")
+        self.assertIn("## v1.7.8", (REPO / "CHANGELOG.md").read_text())
 
     # -- action 3
     def test_lint_and_doctor_flag_a_root_page_that_shadows_a_wiki_page(self):
@@ -7381,3 +7381,77 @@ class Release177Tests(unittest.TestCase):
         r = run(self.base / "tools" / "brain.py", "doctor", env={"HOME": str(self.home)})
         self.assertIn("projects/solo: no remote", r.stdout)
         self.assertIn("notes.md: shadows wiki/notes.md", r.stdout)
+
+
+class PinSurvivesTests(ToolHome):
+    """1.7.8: a pinned old path keeps its guard through the sequence the-mothership update runs (init, connect,
+    connect --watch, the watcher's pass), and no adopt path turns it into a link. Runtime folders of a tool are no
+    vault candidates. Fake HOME, pinned claude-code."""
+
+    def setUp(self):
+        super().setUp()
+        cl = self.base / "engines/claude"
+        self.write(cl, "CLAUDE.md", "x\n")
+        self.write(cl, ".claude.json", "{}\n")
+        (self.home / ".claude").symlink_to(cl)
+        (self.home / ".claude.json").symlink_to(cl / ".claude.json")
+        (self.base / "engines.json").write_text(json.dumps({"engines": {"claude": {
+            "tool": "claude-code", "mode": "adopted", "env": "CLAUDE_CONFIG_DIR", "from": "~/.claude",
+            "moved": [".claude.json"], "since": "2026-11-13"}}}))
+        self.cl = cl
+        self.ok("engine", "pin", "claude-code", "--base", str(self.base))
+        self.env = {"HOME": str(self.home), "PATH": self.path(), "CLAUDE_CONFIG_DIR": str(self.cl)}
+
+    def assertGuards(self):
+        g, j = self.home / ".claude", self.home / ".claude.json"
+        self.assertFalse(g.is_symlink(), "~/.claude is a link again")
+        self.assertTrue(g.is_file() and g.stat().st_size == 0 and g.stat().st_mode & 0o777 == 0, "~/.claude guard")
+        self.assertFalse(j.is_symlink(), "~/.claude.json is a link again")
+        self.assertTrue(j.is_dir() and j.stat().st_mode & 0o777 == 0, "~/.claude.json guard")
+
+    def test_init_connect_and_watch_keep_the_guards(self):
+        steps = [(BRAIN, "init", str(self.base), "--frugal=no"), (self.base / "tools" / "brain.py", "connect",
+                 "--base", str(self.base), "--watch"), (self.base / "tools" / "brain.py", "connect", "--base",
+                 str(self.base)), ("-c", "import importlib.util as u,sys\n"
+                 "s=u.spec_from_file_location('b',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m)\n"
+                 "print(m.watch_once(sys.argv[2], commit=False))", str(self.base / "tools" / "brain.py"),
+                 str(self.base))]
+        for args in steps:
+            r = run(*args, env=self.env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertGuards()
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotRegex(out, r"ERROR\s+~/\.claude")
+
+    def test_connect_without_the_variable_does_not_replace_the_guard(self):
+        r = run(self.base / "tools" / "brain.py", "connect", "--base", str(self.base),
+                env={"HOME": str(self.home), "PATH": self.path()})
+        self.assertFalse((self.home / ".claude").is_symlink(), r.stdout + r.stderr)
+        self.assertGuards()
+
+    def test_adopt_refuses_a_pinned_default_place(self):
+        r = self.hb("engine", "adopt", "claude-code", "--base", str(self.base))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("pinned", r.stdout + r.stderr)
+        self.assertGuards()
+        r = run(self.base / "tools" / "brain.py", "engine", "adopt", "claude-code", "--base", str(self.base),
+                env={"HOME": str(self.home), "PATH": self.path()})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertGuards()
+
+    def test_runtime_folder_is_not_a_vault_candidate(self):
+        self.write(self.cl, "remote/run/abc123/daemon.token", "not-a-real-token\n")
+        self.write(self.cl, "remote/keep/daemon.token", "not-a-real-token\n")
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotIn("remote/run/abc123/daemon.token", out)
+        self.assertIn("secret file in the base, not in the vault: engines/claude/remote/keep/daemon.token", out)
+        r = run(self.base / "tools" / "brain.py", "engine", "vault", "claude", "--base", str(self.base),
+                env={"HOME": str(self.home), "PATH": self.path(), "CLAUDE_CONFIG_DIR": str(self.cl)})
+        self.assertTrue((self.cl / "remote/run/abc123/daemon.token").is_file(), r.stdout + r.stderr)
+        self.assertFalse((self.cl / "remote/run/abc123/daemon.token").is_symlink())
+
+    def test_runtime_folder_stays_out_of_git_and_sync(self):
+        r = run("-c", "import importlib.util as u,sys\n"
+                "s=u.spec_from_file_location('b',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m)\n"
+                "print(m.engine_rule('claude/remote/run/abc123/daemon.token'))", str(BRAIN))
+        self.assertEqual(r.stdout.strip(), "deny", r.stderr)
