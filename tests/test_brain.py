@@ -1534,7 +1534,8 @@ USER_RULES = "# My own rules for this folder\n\nAlways cite the page you used.\n
 
 
 PRODUCT_PAGE_NAMES = ("dashboard.md", "sessions.md", "memories.md", "glossary.md", "stale-pages.base",
-                      "projects-by-status.base", "decisions-newest.base")
+                      "projects-by-status.base", "decisions-newest.base",
+                      "products.md", "server.md", "how-this-base-works.md")   # 1.7.7: the guide holds a generated block
 
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
@@ -1600,8 +1601,10 @@ class UninstallKeepsDataTests(HomeBase):
                 continue
             if after.get(rel) == v:
                 continue
-            if rel in ("wiki/dashboard.md", "wiki/sessions.md", "wiki/memories.md", "wiki/glossary.md") \
-                    or rel.startswith("wiki/weekly/") or rel.endswith(".base"):
+            if rel in ("wiki/dashboard.md", "wiki/sessions.md", "wiki/memories.md", "wiki/glossary.md",
+                       "wiki/products.md", "wiki/server.md",
+                       "wiki/how-this-base-works.md") \
+                    or rel.startswith("wiki/weekly/") or rel.endswith(".base"):   # 1.7.7: the guide holds a generated block
                 self.assertNotIn(rel, after, rel)                        # 1.7.4: product-made pages go with it
                 removed.append(rel)
                 continue
@@ -6816,3 +6819,565 @@ class Release174Tests(unittest.TestCase):
         g.write_text(g.read_text() + "- **mine**: my own word.\n")
         run(BRAIN, "uninstall", d2)
         self.assertIn("**mine**", g.read_text())
+
+
+def _git_repo(d, branch="main"):
+    d = pathlib.Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    git(d, "init", "-q", "-b", branch)
+    (d / "a.txt").write_text("a\n")
+    git(d, "add", "a.txt")
+    git(d, "commit", "-q", "-m", "first")
+    return d
+
+
+def _with_origin(tmp, d, name):
+    """A bare remote for repo D (origin, with its HEAD), D's main pushed to it."""
+    bare = pathlib.Path(tmp) / f"{name}.git"
+    git(tmp, "init", "-q", "--bare", "-b", "main", str(bare))
+    git(d, "remote", "add", "origin", str(bare))
+    git(d, "push", "-q", "-u", "origin", "main")
+    git(d, "remote", "set-head", "origin", "main")
+    return bare
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class Release177Tests(unittest.TestCase):
+    """1.7.7 (general review): shadowing root pages, products and server pages, repo checks, dead links in engines/,
+    projects prune, sessions, memories, deleted memories, status, stuck tidy, tracked-but-ignored, project secrets,
+    the guide and the hot.md block. Fake HOME and fake bases only."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="skb-177-"))
+        self.base, self.home = self.tmp / "base", self.tmp / "home"
+        self.home.mkdir()
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        p = mock.patch.dict(os.environ, {"HOME": str(self.home), "BRAIN_TODAY": "2026-11-15"})
+        p.start(); self.addCleanup(p.stop)
+        for v in REAL_TOOL_VARS:
+            os.environ.pop(v, None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def w(self, rel, text, root=None):
+        p = (root or self.base) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def rows(self, fn, *a):
+        return [f"{lvl} {t}" for lvl, t in fn(*a)]
+
+    def lint_out(self):
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = B.lint(self.base)
+        return rc, err.getvalue()
+
+    # -- release
+    def test_release_number_and_changelog(self):
+        self.assertEqual(B.RELEASE, "1.7.7")
+        self.assertIn("## v1.7.7", (REPO / "CHANGELOG.md").read_text())
+
+    # -- action 3
+    def test_lint_and_doctor_flag_a_root_page_that_shadows_a_wiki_page(self):
+        (self.base / "how-this-base-works.md").write_text("")
+        self.assertEqual(B.root_shadows(self.base), [("how-this-base-works.md", "wiki/how-this-base-works.md", True)])
+        rc, out = self.lint_out()
+        self.assertEqual(rc, 2)
+        self.assertIn("how-this-base-works.md: shadows wiki/how-this-base-works.md", out)
+        self.assertIn("delete it", out)
+        rows = self.rows(B.doctor_pages, self.base)
+        self.assertTrue(any(r.startswith("WARN") and "shadows" in r and "rm " in r for r in rows), rows)
+        (self.base / "how-this-base-works.md").write_text("my own text\n")
+        self.assertIn("merge", self.lint_out()[1])
+        (self.base / "how-this-base-works.md").unlink()
+        self.assertEqual(self.lint_out()[0], 0)
+        self.assertEqual(B.root_shadows(self.base), [], "README.md, AGENTS.md and hot.md are never shadows")
+
+    # -- action 4
+    def test_products_page_lists_release_commit_and_place(self):
+        repo = _git_repo(self.base / "projects" / "skeleton-base")
+        head = git(repo, "rev-parse", "HEAD").strip()
+        self.w(".mothership.json", json.dumps({"mothership": "9.9.1", "components": {
+            "skeleton-base": {"commit": head, "version": B.RELEASE},
+            "frugal-bridge": {"commit": "a" * 40, "version": "6"}}}))
+        self.assertTrue(B.products_page(self.base))
+        page = (self.base / "wiki" / "products.md").read_text()
+        self.assertIn(f"| skeleton-base | {B.RELEASE} | `{head[:7]}` |", page)
+        self.assertIn("| frugal-bridge | 6 | `aaaaaaa` |", page)
+        self.assertIn("| the-mothership | 9.9.1 |", page)
+        self.assertIn("`projects/skeleton-base`", page)
+        self.assertIn("tools/brain.py", page)
+        self.assertFalse(B.products_page(self.base), "unchanged: not written again")
+        B.build_index(self.base, quiet=True)
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+
+    def test_server_page_lists_units_ports_and_sessions_without_secrets(self):
+        fake_key = "sk-" + "ant-" + "SECRETSECRET1234"        # built here: no key-shaped text in the repo
+        self.w("ops/systemd/claude-rc.service", "[Unit]\nDescription=Keep Claude Code Remote Control running\n"
+               f"[Service]\nEnvironment=API_TOKEN={fake_key}\n"
+               f"ExecStart=/bin/bash /x/ops/scripts/rc-keeper.sh --token {fake_key}\n")
+        self.w("ops/systemd/push.timer", "[Unit]\nDescription=Daily push\n[Timer]\nOnCalendar=daily\n")
+        self.w(".config/systemd/user/extra.service", "[Unit]\nDescription=Extra thing\n[Service]\nExecStart=/usr/bin/x\n",
+               self.home)
+
+        def fake(argv, timeout=10):
+            if argv[0] == "systemctl":
+                return ("Id=claude-rc.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\n\n"
+                        "Id=push.timer\nActiveState=inactive\nSubState=dead\nUnitFileState=disabled\n\n"
+                        "Id=extra.service\nActiveState=failed\nSubState=failed\nUnitFileState=enabled\n")
+            if argv[0] == "ss":
+                return ('LISTEN 0 128 127.0.0.1:8384 0.0.0.0:* users:(("syncthing",pid=5,fd=3))\n'
+                        "LISTEN 0 128 0.0.0.0:8095 0.0.0.0:*\nLISTEN 0 128 [::]:8095 [::]:*\n"
+                        "LISTEN 0 128 100.64.0.9%tailscale0:443 0.0.0.0:*\nLISTEN 0 5 127.0.0.1:45001 0.0.0.0:*\n")
+            if argv[0] == "tmux":
+                return "claude 1794705564 1\nclaude-home 1794705566 1\n"
+            return ""
+        with mock.patch.object(B, "cmd_out", side_effect=fake):
+            self.assertTrue(B.server_page(self.base, self.home))
+        page = (self.base / "wiki" / "server.md").read_text()
+        self.assertIn("| claude-rc.service | active (running) | enabled | Keep Claude Code Remote Control running; runs rc-keeper.sh |", page)
+        self.assertIn("| push.timer | inactive (dead) | disabled | Daily push |", page)
+        self.assertIn("| extra.service | failed", page)
+        self.assertIn("| 8095 | every network |", page)
+        self.assertIn("| 8384 | this computer only | syncthing |", page)
+        self.assertIn("| 443 | 100.64.0.9 (tailscale0) |", page)
+        self.assertNotIn("45001", page)
+        self.assertIn("Plus 1 short-lived port(s)", page)
+        self.assertIn("- `claude`", page)
+        self.assertIn("- `claude-home`", page)
+        self.assertNotIn("SECRET", page)
+        B.build_index(self.base, quiet=True)
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+
+    def test_daily_pages_write_products_and_link_new_pages_in_the_index(self):
+        B.daily_pages(self.base)
+        self.assertTrue((self.base / "wiki" / "products.md").is_file())
+        self.assertIn("[[products]]", (self.base / "wiki" / "index.md").read_text())
+        self.assertIn("wiki/products.md", B.GENERATED_PAGES)
+        self.assertIn("wiki/server.md", B.GENERATED_PAGES)
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+
+    # -- actions 5, 6
+    def test_doctor_warns_on_checkouts_off_main_behind_local_only_no_remote_no_git(self):
+        pj = self.base / "projects"
+        a = _git_repo(pj / "alpha")
+        _with_origin(self.tmp, a, "alpha")
+        other = self.tmp / "alpha-other"
+        git(self.tmp, "clone", "-q", str(self.tmp / "alpha.git"), str(other))
+        (other / "b.txt").write_text("b\n"); git(other, "add", "b.txt"); git(other, "commit", "-q", "-m", "second")
+        git(other, "push", "-q", "origin", "main")
+        git(a, "fetch", "-q", "origin")
+        git(a, "switch", "-q", "-c", "old-branch")
+        (a / "c.txt").write_text("c\n"); git(a, "add", "c.txt"); git(a, "commit", "-q", "-m", "local only")
+        _git_repo(pj / "solo")
+        (pj / "loose").mkdir(); (pj / "loose" / "x.py").write_text("x\n")
+        (pj / "stub").mkdir()
+        (pj / "note.md").write_text("x\n")
+        good = _git_repo(pj / "good"); _with_origin(self.tmp, good, "good")
+        rows = self.rows(B.doctor_repos, self.base)
+        txt = "\n".join(rows)
+        self.assertIn("WARN projects/alpha: checked out on old-branch, not on its default branch main", txt)
+        self.assertIn("git -C projects/alpha switch main", txt)
+        self.assertIn("projects/alpha: main is 1 commit(s) behind origin/main", txt)
+        self.assertIn("projects/alpha: 1 commit(s) on 1 branch(es) exist only on this disk (old-branch)", txt)
+        self.assertIn("WARN projects/solo: no remote", txt)
+        self.assertIn("WARN projects/loose: a folder with no git", txt)
+        self.assertIn("projects/stub: an empty folder", txt)
+        self.assertIn("projects/note.md: a loose file", txt)
+        self.assertFalse(any("projects/good" in r for r in rows), rows)
+        self.assertFalse(any("README.md" in r or "projects.json" in r for r in rows), rows)
+
+    # -- action 7
+    def test_engine_relink_repoints_links_into_a_guarded_old_home_and_doctor_finds_dangling_links(self):
+        old = self.home / ".hermes"
+        eng = self.base / "engines" / "hermes"
+        (eng / "lsp" / "node").mkdir(parents=True)
+        (eng / "lsp" / "bin").mkdir()
+        (eng / "lsp" / "node" / "server.js").write_text("x\n")
+        os.symlink(str(old / "lsp" / "node" / "server.js"), eng / "lsp" / "bin" / "server")
+        os.symlink("/nonexistent/place", eng / "lsp" / "bin" / "gone")
+        os.symlink("../node/server.js", eng / "lsp" / "bin" / "fine")
+        os.symlink("/run/user/0/gone.sock", eng / "lsp" / "bin" / "daemon")   # a run-time target: dead on purpose
+        old.write_text(""); old.chmod(0)                     # the guard file adopt left
+        self.w("engines.json", json.dumps({"engines": {"hermes": {"tool": "hermes", "mode": "adopted",
+                                                                 "env": "HERMES_HOME", "from": "~/.hermes"}}}))
+        rows = self.rows(B.dangling_rows, self.base, self.home)
+        self.assertTrue(any("engines/hermes/lsp/bin/server" in r and "brain.py engine relink hermes" in r
+                            for r in rows), rows)
+        self.assertTrue(any("engines/hermes/lsp/bin/gone" in r and "/nonexistent/place" in r for r in rows), rows)
+        self.assertFalse(any("bin/fine" in r or "bin/daemon" in r for r in rows), rows)
+        self.assertTrue(all(r.startswith("WARN") for r in rows), rows)
+        log = B.engine_relink(self.base, "hermes", dry=True)
+        self.assertTrue(os.readlink(eng / "lsp" / "bin" / "server").startswith(str(old)), "dry run changes nothing")
+        log = B.engine_relink(self.base, "hermes")
+        self.assertEqual(os.readlink(eng / "lsp" / "bin" / "server"), str(eng / "lsp" / "node" / "server.js"))
+        self.assertTrue((eng / "lsp" / "bin" / "server").exists())
+        self.assertEqual(os.readlink(eng / "lsp" / "bin" / "gone"), "/nonexistent/place", "not ours: only reported")
+        self.assertTrue(any("lsp/bin/server" in l for l in log), log)
+        rows = self.rows(B.dangling_rows, self.base, self.home)
+        self.assertFalse(any("bin/server" in r for r in rows), rows)
+
+    def test_engine_adopt_repoints_links_that_named_the_old_home(self):
+        old = self.home / ".codex"
+        (old / "real").mkdir(parents=True); (old / "bin").mkdir()
+        (old / "real" / "tool").write_text("x\n")
+        (old / "config.toml").write_text("")
+        os.symlink(str(old / "real" / "tool"), old / "bin" / "tool")
+        r = run(self.base / "tools" / "brain.py", "engine", "adopt", "codex", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        link = self.base / "engines" / "codex" / "bin" / "tool"
+        self.assertEqual(os.readlink(link), str(self.base / "engines" / "codex" / "real" / "tool"), r.stdout)
+        self.assertTrue(link.exists())
+
+    # -- action 8
+    def test_doctor_lists_gone_entries_and_merged_worktrees_and_prune_removes_only_safe_ones(self):
+        pj = self.base / "projects"
+        a = _git_repo(pj / "alpha"); _with_origin(self.tmp, a, "alpha")
+        wt = pj / ".worktrees" / "alpha"
+        for name in ("merged-one", "claimed", "dirty", "open-work", "just-made"):
+            git(a, "worktree", "add", "-q", "-b", name, str(wt / name), "main")
+        git(a, "worktree", "add", "-q", "-b", "elsewhere", str(pj / "alpha-wt-9"), "main")   # not in .worktrees/
+        for name in ("merged-one", "claimed", "dirty", "open-work", "elsewhere"):
+            d = wt / name if name != "elsewhere" else pj / "alpha-wt-9"
+            (d / f"{name}.txt").write_text("n\n")
+            git(d, "add", f"{name}.txt"); git(d, "commit", "-q", "-m", f"work on {name}")
+            if name != "open-work":
+                git(a, "merge", "-q", "--no-edit", name)
+        git(a, "push", "-q", "origin", "main")
+        (wt / "dirty" / "u.txt").write_text("uncommitted\n")
+        self.w("progress/claims.md", "# Active claims\n2026-11-15 | someone | alpha | claimed | "
+               "projects/.worktrees/<repo>/claimed | files\n")
+        B.projects_scan(self.base)
+        reg = json.loads((self.base / "projects.json").read_text())
+        reg["projects"]["ghost"] = {"remote": None, "branch": "main", "worktrees": []}
+        (self.base / "projects.json").write_text(json.dumps(reg))
+        rows = "\n".join(self.rows(B.doctor_projects, self.base))
+        self.assertIn("WARN projects.json lists projects/ghost, which is gone", rows)
+        self.assertIn("projects prune --gone", rows)
+        self.assertIn("WARN projects/alpha: 2 merged worktree(s) (dirty, merged-one)", rows)
+        self.assertIn("projects prune --merged", rows)
+        for no in ("open-work", "just-made", "alpha-wt-9", "elsewhere"):
+            self.assertNotIn(no, rows)
+        self.assertFalse(any("alpha-wt-9" in r for r in self.rows(B.doctor_repos, self.base)),
+                         "a linked worktree in projects/ is not a repo row")
+        log = "\n".join(B.projects_prune(self.base, merged=True, dry_run=True))
+        self.assertTrue((wt / "merged-one").is_dir(), "dry run")
+        self.assertIn("would remove", log)
+        log = "\n".join(B.projects_prune(self.base, merged=True, gone=True))
+        self.assertFalse((wt / "merged-one").exists(), log)
+        self.assertTrue((wt / "claimed").is_dir(), "listed in progress/claims.md: kept")
+        self.assertTrue((wt / "dirty" / "u.txt").is_file(), "uncommitted changes: kept")
+        self.assertTrue((wt / "open-work").is_dir(), "not merged: kept")
+        self.assertTrue((wt / "just-made").is_dir(), "nothing committed on it yet: work that has not started")
+        self.assertTrue((pj / "alpha-wt-9").is_dir(), "a worktree outside projects/.worktrees/ is not ours to remove")
+        self.assertIn("claimed", log); self.assertIn("uncommitted", log)
+        self.assertNotIn("merged-one", git(a, "branch", "--list"))
+        self.assertIn("open-work", git(a, "branch", "--list"))
+        reg = json.loads((self.base / "projects.json").read_text())
+        self.assertNotIn("ghost", reg["projects"])
+        self.assertEqual(sorted(w["name"] for w in reg["projects"]["alpha"]["worktrees"]),
+                         ["alpha-wt-9", "claimed", "dirty", "just-made", "open-work"])
+        r = run(self.base / "tools" / "brain.py", "projects", "prune", "--merged", "--dry-run",
+                env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # -- actions 10-12
+    def test_sessions_page_takes_codex_dates_and_real_first_message_and_lists_hermes(self):
+        f = self.home / ".codex" / "sessions" / "2026" / "11" / "05" / "rollout-2026-11-05T10-20-30-01a1-uuid.jsonl"
+        f.parent.mkdir(parents=True)
+        msg = lambda *parts: json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": p} for p in parts]}})
+        f.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(self.home / "code"), "id": "x"}}),
+            msg("# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>",
+                "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>"),
+            msg("fix the login bug please TODO: see [[x]]")]) + "\n")
+        os.utime(f, (time.time(),) * 2)                      # the file time lies (a copy, a migration)
+        import sqlite3
+        (self.home / ".hermes").mkdir()
+        con = sqlite3.connect(self.home / ".hermes" / "state.db")
+        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, title TEXT, cwd TEXT, "
+                    "message_count INTEGER)")
+        con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
+                    "timestamp REAL)")
+        t0 = dt.datetime(2026, 11, 7, 9, 0).timestamp()
+        con.execute("INSERT INTO sessions VALUES ('s1', 'cron', ?, 'Weekly check', NULL, 4)", (t0,))
+        con.execute("INSERT INTO sessions VALUES ('s2', 'desktop', ?, NULL, ?, 2)", (t0 + 60, str(self.home / "w")))
+        con.execute("INSERT INTO messages VALUES (1, 's2', 'system', 'you are', ?)", (t0,))
+        con.execute("INSERT INTO messages VALUES (2, 's2', 'user', 'plan my week', ?)", (t0 + 1,))
+        con.commit(); con.close()
+        n = B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertEqual(n, 3)
+        self.assertIn("- 2026-11-05 10:20 | codex | fix the login bug please To-do: see [ [x] ] | ~/code |", page)
+        self.assertNotIn("AGENTS.md instructions", page)
+        self.assertIn("- 2026-11-07 09:00 | hermes | Weekly check | cron | 4 messages", page)
+        self.assertIn("- 2026-11-07 09:01 | hermes | plan my week | ~/w | 2 messages", page)
+        lines = [l for l in page.splitlines() if l.startswith("- 2026")]
+        self.assertEqual(lines, sorted(lines, reverse=True), "newest first")
+        B.build_index(self.base, quiet=True)
+        self.assertEqual(self.lint_out()[0], 0, "a title never brings a link or a to-do marker into the page")
+
+    # -- action 13
+    def test_memories_page_lists_a_memory_kept_in_two_claude_folders_once(self):
+        B.memories_page(self.base, {"claude-code": [
+            ("home/tea.md", "Likes tea", "h1"), ("the-base/tea.md", "Likes tea", "h1"),
+            ("home/only-here.md", "Home only", "h2"), ("the-base/tea-notes.md", "Other", "h3")]})
+        page = (self.base / "wiki" / "memories.md").read_text()
+        self.assertIn("## claude-code: 3 memories", page)
+        self.assertEqual(page.count("Likes tea"), 1)
+        self.assertIn("- `tea.md` (in home, the-base): Likes tea", page)
+        self.assertIn("- `home/only-here.md`: Home only", page)
+
+    def test_collect_page_merges_the_same_claude_memory_of_two_project_folders(self):
+        enc = "".join(c if c.isalnum() else "-" for c in str(self.home))
+        for proj in (enc, enc + "-the-base"):
+            self.w(f".claude/projects/{proj}/memory/tea.md", "---\nname: tea\ndescription: Likes green tea\n---\nx\n",
+                   self.home)
+        r = run(self.base / "tools" / "brain.py", "collect", "--no-file", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        page = (self.base / "wiki" / "memories.md").read_text()
+        self.assertEqual(page.count("Likes green tea"), 1, page)
+        self.assertIn("(in home, the-base)", page)
+
+    # -- action 11
+    def test_a_deleted_memory_takes_its_filed_line_away(self):
+        enc = "".join(c if c.isalnum() else "-" for c in str(self.home))
+        mem = self.home / ".claude" / "projects" / enc / "memory"
+        self.w("a-name.md", "The engineer role is named Zorglub by the owner\n", mem)
+        self.w("b-stays.md", "The owner drinks green tea every morning\n", mem)
+        hb = lambda *a: run(self.base / "tools" / "brain.py", *a, env={"HOME": str(self.home)})
+        self.assertEqual(hb("collect").returncode, 0)
+        wiki = lambda: "".join(p.read_text() for p in sorted((self.base / "wiki").rglob("*.md"))
+                               if p.name != "memories.md")
+        self.assertIn("Zorglub", wiki())
+        (mem / "a-name.md").unlink()                          # the owner took the memory back
+        r = hb("collect")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = wiki()
+        self.assertNotIn("Zorglub", text)
+        self.assertIn("green tea", text)
+        filed = json.loads((self.base / B.FILED).read_text())
+        gone = [k for k, v in filed["raws"].items() if v.get("deleted")]
+        self.assertEqual(len(gone), 1, filed["raws"])
+        self.assertEqual(hb("lint").returncode, 0)
+        (mem / "b-stays.md").unlink()                         # an empty store proves nothing: the line stays
+        self.assertEqual(hb("collect").returncode, 0)
+        self.assertIn("green tea", wiki())
+
+    def test_a_memory_that_only_moved_keeps_its_line(self):
+        raw = collected_item(self.base, "claude-code", "old-project/tea.md", "The owner drinks green tea daily\n")
+        B.file_items(self.base, quiet=True)
+        un = self.base / "wiki" / "unsorted.md"
+        self.assertIn("green tea", un.read_text())
+        h = hashlib.sha256("The owner drinks green tea daily\n".encode()).hexdigest()
+        self.assertEqual(B.forget_deleted(self.base, {("claude-code", "new-project/tea.md")}, {h}, {"claude-code"}), [])
+        self.assertEqual(B.forget_deleted(self.base, {("claude-code", "x/y.md")}, set(), {"codex"}), [],
+                         "its store was not read in this run")
+        self.assertEqual(B.forget_deleted(self.base, {("claude-code", "x/y.md")}, set(), {"claude-code"}), [raw])
+        self.assertNotIn("green tea", un.read_text())
+
+    # -- action 14
+    def test_status_values_and_dashboard_sections(self):
+        for v in ("active", "waiting", "paused", "superseded", "done"):
+            self.assertIn(v, B.PAGE_STATUS)
+        self.w("wiki/projects/alpha.md", "---\ntitle: Alpha\nstatus: waiting\nsources: [x]\nupdated: 2026-11-14\n"
+               "scope: private\n---\n\n# Alpha\n")
+        self.w("wiki/projects/beta.md", "---\ntitle: Beta\nsources: [x]\nupdated: 2026-11-14\nscope: private\n---\n\n# Beta\n")
+        self.w("wiki/decisions/2026-11-14-pick.md", "---\ntitle: Pick\nstatus: active\nsources: [x]\n"
+               "updated: 2026-11-14\nscope: private\n---\n\n# Pick\n")
+        card = ("---\ntitle: {t}\nstatus: {s}\nowner: {o}\nproject: none\nupdated: 2026-11-14\nscope: private\n---\n\n"
+                "# {t}\n")
+        self.w("board/2026-11-14-approve-budget.md", card.format(t="Approve the budget", s="waiting", o="assistant"))
+        self.w("board/2026-11-14-sign-form.md", card.format(t="Sign the form", s="todo", o="me"))
+        self.w("board/2026-11-14-agent-job.md", card.format(t="Agent job", s="doing", o="assistant"))
+        self.w("board/2026-11-14-old.md", card.format(t="Old", s="done", o="me"))
+        B.build_index(self.base, quiet=True)
+        rc, out = self.lint_out()
+        self.assertEqual(rc, 0, out)                     # lint accepts each value, and a page without one
+        self.assertEqual(B.dashboard_main(self.base), 0)
+        d = (self.base / "wiki" / "dashboard.md").read_text()
+        wait = d.split("## Waiting on the owner")[1].split("\n## ")[0]
+        self.assertIn("[[2026-11-14-approve-budget]]", wait)
+        self.assertIn("[[2026-11-14-sign-form]]", wait)
+        self.assertNotIn("agent-job", wait); self.assertNotIn("2026-11-14-old", wait)
+        st = d.split("## Projects by status")[1].split("\n## ")[0]
+        self.assertIn("- waiting: [[alpha]]", st)
+        self.assertIn("- no status: [[beta]]", st)
+        B.build_index(self.base, quiet=True)
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+
+    # -- action 16
+    def test_upgrade_clears_a_stuck_tidy_state(self):
+        st = self.base / ".brain" / "tidy.json"
+        st.parent.mkdir(exist_ok=True)
+        st.write_text(json.dumps({"harness": "claude", "stuck": {"k1": "wiki/projects/a.md"}}))
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(json.loads(st.read_text())["stuck"], {"k1": "wiki/projects/a.md"}, "same release: kept")
+        k = json.loads((self.base / ".kits.json").read_text())
+        k["kits"]["base-folder"]["release"] = "1.7.3"
+        (self.base / ".kits.json").write_text(json.dumps(k))
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        now = json.loads(st.read_text())
+        self.assertEqual(now.get("stuck"), {})
+        self.assertEqual(now["harness"], "claude")
+        self.assertIn("tidy: 1 page(s) marked stuck", r.stdout)
+
+    # -- action 18
+    def test_doctor_reports_files_tracked_although_ignored(self):
+        git(self.base, "init", "-q")
+        with open(self.base / ".gitignore", "a") as f:
+            f.write("\nnotes-tmp/\n")
+        self.w("notes-tmp/a.md", "x\n"); self.w("notes-tmp/b.md", "y\n")
+        git(self.base, "add", "-f", "notes-tmp/a.md", "notes-tmp/b.md")
+        rows = self.rows(B.doctor_git, self.base)
+        hit = [r for r in rows if "tracked in git although .gitignore ignores" in r]
+        self.assertEqual(len(hit), 1, rows)
+        self.assertTrue(hit[0].startswith("WARN 2 file(s)"), hit)
+        self.assertIn("notes-tmp/a.md", hit[0]); self.assertIn("git rm --cached", hit[0])
+        git(self.base, "rm", "-q", "--cached", "notes-tmp/a.md", "notes-tmp/b.md")
+        self.assertFalse(any("although .gitignore" in r for r in self.rows(B.doctor_git, self.base)))
+
+    # -- action 20
+    def test_doctor_finds_env_files_and_config_backups_of_projects_and_vault_add_takes_them(self):
+        app = _git_repo(self.base / "projects" / "app")
+        (app / ".gitignore").write_text(".env\n.env.local\n")
+        (app / ".env").write_text("API_TOKEN=abc\n"); (app / ".env").chmod(0o664)
+        (app / "web").mkdir(); (app / "web" / ".env.local").write_text("X=1\n")
+        (app / ".env.example").write_text("API_TOKEN=\n")
+        (app / ".env.test").write_text("PUBLIC=1\n"); git(app, "add", ".env.test", ".gitignore")
+        git(app, "commit", "-q", "-m", "tracked env")
+        (app / "node_modules" / "pkg").mkdir(parents=True); (app / "node_modules" / "pkg" / ".env").write_text("x\n")
+        self.w("backups/tool/config.yaml.pre-change-20261025", "api" + "_key: " + "sk-" + "ant-abcdefghij1234567890XYZ\n")
+        self.w("backups/tool/config.yaml.bak-plain", "theme: dark\n")
+        rows = self.rows(B.project_secret_rows, self.base)
+        txt = "\n".join(rows)
+        self.assertIn("WARN secret file in the base, not in the vault: projects/app/.env -> "
+                      "brain.py vault add projects/app/.env", txt)
+        self.assertIn("projects/app/web/.env.local", txt)
+        self.assertIn("backups/tool/config.yaml.pre-change-20261025", txt)
+        for no in (".env.example", ".env.test", "node_modules", "bak-plain"):
+            self.assertNotIn(no, txt)
+        r = run(self.base / "tools" / "brain.py", "vault", "add", "projects/app/.env", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((app / ".env").is_symlink())
+        self.assertEqual((app / ".env").read_text(), "API_TOKEN=abc\n")
+        self.assertEqual(stat.S_IMODE(os.stat(os.readlink(app / ".env")).st_mode), 0o600)
+        self.assertNotIn("projects/app/.env ", "\n".join(self.rows(B.project_secret_rows, self.base)))
+        r = run(self.base / "tools" / "brain.py", "vault", "add", "projects/app/.env.test",
+                env={"HOME": str(self.home)})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("tracked", r.stdout + r.stderr)
+        r = run(self.base / "tools" / "brain.py", "vault", "add", "projects/app/.env", "--undo",
+                env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(stat.S_IMODE(os.lstat(app / ".env").st_mode), 0o664, "undo gives the old mode back")
+
+    def test_doctor_warns_on_vault_files_others_can_read(self):
+        f = self.w("engines/w/api_token.txt", "SECRET\n")
+        r = run(self.base / "tools" / "brain.py", "engine", "vault", "w", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(any("chmod" in x for x in self.rows(B.vault_rows, self.base)))
+        os.chmod(os.readlink(f), 0o664)
+        rows = self.rows(B.vault_rows, self.base)
+        self.assertTrue(any(x.startswith("WARN 1 file(s) in the vault") and "chmod -R go-rwx" in x for x in rows), rows)
+
+    # -- actions 22-24
+    def test_guide_names_only_what_exists_and_links_the_pages(self):
+        guide = self.base / "wiki" / "how-this-base-works.md"
+        text = guide.read_text()
+        for name in re.findall(r"\*\*([A-Za-z0-9_./-]+)\*\*", text):
+            self.assertTrue((self.base / name).exists(), f"the guide names {name}, which a new base does not have")
+        for gone in ("plans/", "sources/", "research/"):
+            self.assertNotIn(gone, text)
+        (self.base / "plans").mkdir(); (self.base / "plans" / "p.md").write_text("x\n")
+        B.dashboard_main(self.base); B.sessions_index(self.base, self.home)
+        self.assertTrue(B.guide_block(self.base))
+        text = guide.read_text()
+        block = text[text.index(B.GUIDE_START):text.index(B.GUIDE_END)]
+        self.assertIn("[[dashboard]]", block); self.assertIn("[[sessions]]", block)
+        self.assertIn("`plans/`", block)
+        self.assertNotIn("[[products]]", block); self.assertNotIn("research/", block)
+        self.assertFalse(B.guide_block(self.base), "a second run changes nothing")
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+
+    def test_hot_template_links_dashboard_weekly_sessions_once_they_exist(self):
+        hot = self.base / "hot.md"
+        self.assertIn(B.HOT_START, hot.read_text())
+        self.assertNotIn("[[dashboard]]", hot.read_text(), "no link to a page that is not there yet")
+        self.assertEqual(self.lint_out()[0], 0)
+        B.dashboard_main(self.base); B.sessions_index(self.base, self.home)
+        B.weekly_main(self.base, now=dt.datetime(2026, 11, 15, 8, 0), notify=False)
+        self.assertTrue(B.hot_block(self.base))
+        t = hot.read_text()
+        for link in ("[[dashboard]]", "[[sessions]]", "[[2026-W46]]"):
+            self.assertIn(link, t)
+        self.assertEqual(self.lint_out()[0], 0, self.lint_out()[1])
+        hot.write_text("# my own hot file\n")
+        self.assertFalse(B.hot_block(self.base), "no markers: the owner's file is never touched")
+        self.assertEqual(hot.read_text(), "# my own hot file\n")
+
+    def test_upgrade_keeps_the_guide_current_and_uninstall_removes_it_with_its_block(self):
+        guide = self.base / "wiki" / "how-this-base-works.md"
+        B.dashboard_main(self.base); B.guide_block(self.base); B.hot_block(self.base)
+        k = json.loads((self.base / ".kits.json").read_text())
+        old = "---\ntitle: How this base works\nsources: [product guide, old]\nupdated: 2026-11-01\nscope: private\n---\n\nold guide\n"
+        guide.write_text(old + f"\n{B.GUIDE_START}\n- [[dashboard]]\n{B.GUIDE_END}\n")     # shipped once with an empty block
+        k["kits"]["base-folder"]["created"]["wiki/how-this-base-works.md"] = hashlib.sha256(
+            (old + f"\n{B.GUIDE_START}\n{B.GUIDE_END}\n").encode()).hexdigest()
+        (self.base / ".kits.json").write_text(json.dumps(k))
+        r = run(BRAIN, "init", self.base, "--frugal=no", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("old guide", guide.read_text(), "an untouched guide is upgraded, its filled block or not")
+        self.assertTrue(B.guide_block(self.base))
+        self.assertIn("[[dashboard]]", guide.read_text(), "the daily run fills the block again")
+        r = run(BRAIN, "uninstall", self.base, "--no-backup", env={"HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(guide.exists(), "the guide with only its generated block is the product's page")
+        self.assertFalse((self.base / "hot.md").exists(), "hot.md with only its generated block too")
+
+    def test_installed_readmes_link_only_files_that_exist(self):
+        for name in ("README.md", "projects/README.md", "engines/README.md", "board/README.md", "maps/README.md"):
+            t = (self.base / name).read_text()
+            for target in re.findall(r"\]\(([^)#]+)\)", t):
+                if "://" in target:
+                    continue
+                self.assertTrue((self.base / name).parent.joinpath(target).exists(), f"{name} links {target}")
+        self.assertIn("projects prune", (self.base / "projects" / "README.md").read_text())
+
+    def test_doctor_reports_stale_outside_entries_and_empty_layout_folders(self):
+        (self.home / "kept-thing").mkdir()
+        self.w(".brain/outside.json", json.dumps({"allow": [
+            "~/gone-thing", {"path": "~/kept-thing", "reason": "app-config"}, "/etc"]}))
+        self.w("apps/README.md", "apps\n")
+        (self.base / "wiki" / "daily").mkdir()
+        self.w("data/x.bin", "x")
+        rows = self.rows(B.doctor_layout, self.base, self.home)
+        txt = "\n".join(rows)
+        self.assertIn("WARN .brain/outside.json allows ~/gone-thing, which does not exist", txt)
+        self.assertNotIn("kept-thing", txt); self.assertNotIn("/etc", txt)
+        self.assertIn("INFO empty layout folder: apps/", txt)
+        self.assertIn("INFO empty layout folder: wiki/daily/", txt)
+        self.assertNotIn("data/", txt)
+
+    def test_agents_block_holds_the_parallel_sessions_rule(self):
+        t = (self.base / "AGENTS.md").read_text()
+        self.assertIn("## Parallel sessions", t)
+        self.assertIn("Before working on any repo in `projects/`: read `progress/claims.md`, add your claim (not a "
+                      "lock: same files are allowed), own worktree, rebase often, resolve conflicts keeping both "
+                      "sides; full steps in `wiki/sops/parallel-sessions.md`.", " ".join(t.split()))
+        self.assertLess(t.index("## Parallel sessions"), t.index("<!-- base-folder:end -->"))
+
+    def test_doctor_runs_with_the_new_rows(self):
+        _git_repo(self.base / "projects" / "solo")
+        (self.base / "notes.md").write_text("")
+        self.w("wiki/notes.md", "---\ntitle: Notes\nsources: [x]\nupdated: 2026-11-14\nscope: private\n---\n\n# N\n")
+        r = run(self.base / "tools" / "brain.py", "doctor", env={"HOME": str(self.home)})
+        self.assertIn("projects/solo: no remote", r.stdout)
+        self.assertIn("notes.md: shadows wiki/notes.md", r.stdout)

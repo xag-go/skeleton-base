@@ -1,6 +1,6 @@
 ---
 title: Decision in a few words
-status: active
+status: active  # active | superseded | done
 supersedes:
 sources: [raw/...]
 updated: YYYY-MM-DD

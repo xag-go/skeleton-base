@@ -11,3 +11,9 @@ Sync (1.7.4): with the default **notes** scope (`engine sync-scope notes`) nothi
 With **sync all** (`engine sync-all on`) the code repositories are shared to other computers, minus heavy folders
 (`node_modules`, `.git`, `.venv`, databases, archives) and secret files. A repo is only registered when this folder
 is its own git repo (`projects move`, `projects scan`); `doctor` flags any other entry in `projects.json`.
+
+Keeping it clean (1.7.7): `doctor` warns, with the fix, about a repo that is not on its default branch or is behind
+origin, commits that exist only on this disk, a repo with no remote, a folder with no git, and worktrees whose branch
+is merged. `python3 tools/brain.py projects prune --merged` removes those merged worktrees (never one listed in
+`progress/claims.md`, with uncommitted changes, or in use); `projects prune --gone` drops the `projects.json` entries
+whose folder is gone. Add `--dry-run` to see first.

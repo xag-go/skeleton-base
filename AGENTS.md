@@ -52,6 +52,11 @@ Durable knowledge (facts, decisions, people, clients, project status) is saved i
 - Card frontmatter: `title`, `status` (todo | doing | waiting | done), `owner` (`me` or a role from `agents/`), `project` (`none` or a page in `wiki/projects/`), `due` (optional), `updated`, `scope`.
 - Change a card by editing its frontmatter. Done cards stay. `hot.md` lists only the 3-5 cards that matter now.
 
+## Parallel sessions
+- Before working on any repo in `projects/`: read `progress/claims.md`, add your claim (not a lock: same files are
+  allowed), own worktree, rebase often, resolve conflicts keeping both sides; full steps in
+  `wiki/sops/parallel-sessions.md`.
+
 ## After a job
 - Append one line to `progress/agents.log`: `YYYY-MM-DD HH:MM | role | what you did | files touched`.
 - Run `python3 tools/brain.py lint` after editing the wiki; fix what it reports.

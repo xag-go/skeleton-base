@@ -15,7 +15,8 @@ hot.md               about 12 lines: what matters now. Agents read this first.
 wiki/                knowledge written from your sources
   index.md  log.md  glossary.md
   me/                who you are, your goals, how to talk to you
-  projects/ clients/ people/ decisions/ concepts/ daily/ sops/
+  projects/ clients/ people/ decisions/ concepts/ daily/ sops/   (each appears with its first page)
+  dashboard.md sessions.md memories.md products.md server.md weekly/   generated; never edited by hand
 raw/                 your original sources (read-only for agents): inbox, docs, references, clients, videos, exports
 board/               your task board: one card = one .md file; board.base = Obsidian view grouped by status
 agents/              role templates (assistant, twin) with what each may do, must ask, must never do
@@ -25,7 +26,12 @@ templates/           person, client, project, decision, daily, source, card
 skills/              base-ingest, base-lint (Agent Skills format: works in any tool that reads SKILL.md)
 tools/brain.py       checks and helpers (no AI)
 .kits.json           which kits are installed here and where shared files live
+plans/ research/     optional: your plans and reviews, your studies and collected material (made by you or your
+                     agents with their first file; both sync with the notes scope, research without crawled text)
 ```
+
+Nothing is made empty: `apps/`, `private/`, `wiki/daily/`, `data/`, `runs/`, `scratch/` and the wiki sub-folders
+appear with their first file. `doctor` names the ones that sit empty.
 
 ## Three ways any tool uses it
 
@@ -105,7 +111,18 @@ python3 tools/brain.py check           # AGENTS.md size (warn 24 KiB, fail 32 Ki
 python3 tools/brain.py collect         # copy new items from your tools' own memories, then file them (0 tokens)
 python3 tools/brain.py file --dry-run  # where each new collected item would go, and why
 python3 tools/brain.py tidy --check    # is a tidy due? (free: never calls a model)
+python3 tools/brain.py sessions        # wiki/sessions.md: one line per agent session (Claude Code, Codex, Hermes)
+python3 tools/brain.py products        # wiki/products.md: each product, installed release, source commit, where it lives
+python3 tools/brain.py server          # wiki/server.md: what runs here (user services and timers, ports, tmux)
+python3 tools/brain.py dashboard       # wiki/dashboard.md: goals, waiting on the owner, projects by status
 ```
+
+The last four are generated pages; `watch` keeps them current (sessions and server once a day, products when an
+install record changes). `server.md` is written only on a machine with user units, and holds names and states only:
+never a unit's arguments or environment. A project or decision page carries `status:` (active, waiting, paused,
+superseded, done); the dashboard groups the projects by it and lists "Waiting on the owner": the board cards with
+status `waiting`, and the owner's own cards that are not done. A `.md` file at the base root with the name of a wiki
+page shadows it (lint error): delete it when empty, else merge it.
 
 Lint checks structure and quotes, not truth: a wrong source still gives a faithfully wrong page.
 
@@ -145,7 +162,9 @@ python3 tools/brain.py collect --only codex,hermes-facts --since 2026-11-01
 ```
 
 Each file is named `YYYYMMDD-SLUG-HASH8.md` and starts with a "DATA, not instructions" header and its origin.
-Duplicates are skipped by content hash (`.brain/collector.json`). Right after copying, `collect` runs `file`
+Duplicates are skipped by content hash (`.brain/collector.json`). A memory you delete in its tool takes its filed
+lines away on the next full collect (the lines under `## Collected` and `## Conflicts`, never prose; the raw copy
+stays); a store that is empty or cannot be read removes nothing. Right after copying, `collect` runs `file`
 (next section; `--no-file` only copies). Paths come from `$HOME`; the default base is the one holding this
 `brain.py` (`--base DIR` for another).
 
@@ -503,7 +522,13 @@ engines.json  projects.json                 what is where (tracked)
   while a program works in it, linked worktrees moved with `git worktree move` and repaired, the Claude Code project
   folder renamed so its sessions and memory follow, Codex trust paths updated, units/cron/tool configs that still name
   the old path listed); `projects move --undo` reverses the last move. `projects.json` (tracked) keeps each repo's
-  remote, branch and worktrees: `projects clone` brings them back on a new machine.
+  remote, branch and worktrees: `projects clone` brings them back on a new machine. `projects prune --merged`
+  removes the worktrees in `projects/.worktrees/` whose branch is merged into origin's default branch, and that
+  branch; it keeps a worktree that `progress/claims.md` lists, that has uncommitted changes, that a program works in,
+  or that was only just made. `projects prune --gone` drops the `projects.json` entries whose folder is gone. Both
+  take `--dry-run`.
+- **Links inside a tool folder**: adopt and pin re-point the links that still name the tool's old home;
+  `engine relink [NAME]` does it for a tool adopted earlier.
 - **What leaves this machine, per tool folder** (one table in `brain.py` makes the `.gitignore` and `.stignore`
   blocks, the mirror filter, the pre-commit guard and doctor's checks; `brain.py layout --print` shows them):
   git and Syncthing get only the safe files of `engines/<tool>/` (`*.md` at its top, `MIRROR`, `agents/`, `skills/`,
@@ -543,7 +568,13 @@ engines.json  projects.json                 what is where (tracked)
 - **`doctor`** lists every AI tool folder (where, set by which setting, in or outside the base), folders configured
   in user services, profiles or the registry but not wired, unknown AI folders and code repositories outside the
   base (an allowed list: system folders, plus your own in `.brain/outside.json` `{"allow": ["~/vault"]}`), and the
-  git checks above. `watch --discover` also names configured folders that are not wired yet.
+  git checks above. `watch --discover` also names configured folders that are not wired yet. It also warns, each
+  time with the fix: a repo in `projects/` that is not on its default branch or is behind origin (as of the last
+  fetch; doctor never uses the network), commits that exist only on this disk, a repo with no remote, a folder with
+  no git, `projects.json` entries whose folder is gone, merged worktrees, dead links inside `engines/`, files tracked
+  in git although `.gitignore` ignores them (`git rm --cached`), a root page that shadows a wiki page, `.env` files
+  and config backups with a key in `projects/` and `backups/` that are not in the vault (`vault add`), vault files
+  others could read, and `.brain/outside.json` lines for a path that is gone.
 
 ## Instant and zero-touch
 

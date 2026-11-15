@@ -1,6 +1,6 @@
 ---
 title: Project Name
-status: active
+status: active  # active | waiting | paused | done
 sources: [raw/...]
 updated: YYYY-MM-DD
 scope: private

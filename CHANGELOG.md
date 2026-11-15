@@ -2,6 +2,47 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.7 - 2026-11-15
+From the general review of a live base. Doctor gained checks (each a WARN with its fix), generated pages gained two.
+- Lint (error) and doctor (WARN): a `.md` file at the base root named like a wiki page shadows it (Obsidian makes
+  such an empty note when a link is clicked before its page exists). Empty: delete it; else merge it.
+- `brain.py products` writes `wiki/products.md`: each product, the release installed here, its source commit and
+  where it lives (from `.kits.json`, the installer's record and the repos in `projects/`). `brain.py server` writes
+  `wiki/server.md`, "what runs here": user services and timers (state, enabled, what each does), listening ports,
+  tmux sessions. Names and states only, never arguments or values; only on a machine with user units. Watch keeps
+  both current; a page made by the daily run is added to the index at once.
+- Doctor, for each folder in `projects/`: not on its default branch, behind origin (as of the last fetch, no
+  network), commits that exist only on this disk, no remote, no git, an empty folder, a loose file.
+- Doctor: `projects.json` entries whose folder is gone, and worktrees whose branch is merged into origin's default
+  branch. New `projects prune --merged` removes those worktrees and their branches, never one that
+  `progress/claims.md` lists, that has uncommitted changes or that a program works in; `projects prune --gone` drops
+  the gone entries. Both take `--dry-run`.
+- Adopt and pin re-point the links inside the tool folder that still name its old home (`engine relink [NAME]` does
+  it for a base adopted earlier). Doctor lists dead links inside `engines/` (4 levels down, lock links left out).
+- `wiki/sessions.md`: a Codex session takes its date from the start time in its file name (not the file time, which
+  a copy changes) and its title from the first thing the user wrote (the rules block and the environment block a tool
+  puts in front are skipped). Hermes sessions are listed from its `state.db` (read-only).
+- `wiki/memories.md`: a Claude Code memory kept in two project folders is one line that names both.
+- A memory deleted in its tool takes its filed lines away (`## Collected` and `## Conflicts` only, never prose): its
+  origin is gone from a store that was read in this run and no memory with the same text exists elsewhere. The raw
+  copy stays. An empty or unreadable store removes nothing.
+- `status:` on project and decision pages: `waiting` and `paused` join `active`, `superseded`, `done` (lint accepts
+  them). The dashboard lists "Waiting on the owner" (cards with status `waiting`, and
+  the owner's own cards that are not done) and the projects by status as plain text, and links products and server.
+- An upgrade clears the `stuck` marks of tidy: a page that failed its checks is tried again.
+- Doctor: files tracked in git although `.gitignore` ignores them, with the `git rm --cached` line.
+- Doctor: `.env` files of a project that its own git does not track, and config backups whose text holds a key, in
+  `projects/` and `backups/`. `vault add` takes them like any other file (it refuses a file the project's git
+  tracks). A file moved into the vault gets an owner-only mode there (undo gives the old mode back); doctor warns
+  about vault files others could read.
+- The owner guide names only what a new base has; a generated block lists the generated pages and extra folders
+  that exist, as links. The `hot.md` template holds two markers: once they exist, the dashboard, the sessions list
+  and the newest weekly review are linked there. A `hot.md` without the markers is never touched. An untouched guide
+  or `hot.md` is still upgraded by init and removed by uninstall.
+- The installed README links only files an installed base has. Doctor: a `.brain/outside.json` line that allows a
+  path that is gone; an INFO for an empty `apps/`, `private/`, `wiki/daily/`, `data/`, `runs/`, `scratch/`.
+- AGENTS.md block: a "Parallel sessions" section (claims file, own worktree, rebase, keep both sides).
+
 ## v1.7.6 - 2026-11-15
 - `engine pin-units` removes EVERY link in ~/.config/systemd/user whose target is in ops/systemd, whoever made it
   (an older installer's links too: hermes, syncthing, backup, push, ci-dispatch units). Enable links (*.wants,
