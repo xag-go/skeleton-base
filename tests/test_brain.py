@@ -7156,6 +7156,20 @@ class Release177Tests(unittest.TestCase):
         self.assertNotIn("run by the harness", page)
         self.assertNotIn("Role: engineer", page)
 
+    def test_codex_reviewer_prompt_with_role_line_and_task_line_gets_role_and_task_title(self):
+        msg = lambda text: json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+        text = ("Role: independent reviewer, run by the harness (executors/run-codex.sh)\n"
+                "Task: #7 Add the sample export check\n\n## Issue body\n## What\nSome body text here.")
+        f = self.home / ".codex" / "sessions" / "2026" / "11" / "06" / "rollout-2026-11-06-review.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(self.home / "code")}}), msg(text)]) + "\n")
+        B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertIn("| codex | independent reviewer · task #7 Add the sample export check | ~/code |", page)
+        self.assertNotIn("run by the harness", page)
+
     # -- action 13
     def test_memories_page_lists_a_memory_kept_in_two_claude_folders_once(self):
         B.memories_page(self.base, {"claude-code": [

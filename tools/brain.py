@@ -7186,12 +7186,17 @@ def _task_title(txt):
     lines = [l.strip() for l in (txt or "").splitlines() if l.strip()]
     if not any(HARNESS_LINE.search(l) for l in lines):
         return txt
-    task = [l for l in lines if not HARNESS_LINE.search(l)]
-    if task:
-        return " ".join(task)
-    role, card = re.search(r"\bRole:\s*(\S+)", txt), re.search(r"\bcard\s*#?\s*(\d+)", txt, re.I)
+    role = re.search(r"\bRole:\s*(.+?)\s*(?:,|\(|\brun by the harness\b|$)", txt, re.M)
+    role = role.group(1).strip(" .;:") if role else ""
+    task = re.search(r"^\s*Task:\s*(.+)$", txt, re.M)
+    if role and task:                       # real reviewer prompts: "Role: X, run by the harness" + "Task: #N title"
+        return f"{role} · task {task.group(1).strip()}"
+    rest = [l for l in lines if not HARNESS_LINE.search(l)]
+    if rest:
+        return " ".join(rest)
+    card = re.search(r"\bcard\s*#?\s*(\d+)", txt, re.I)
     if role and card:
-        return f"{role.group(1).strip('.,;:')} card #{card.group(1)}"
+        return f"{role} card #{card.group(1)}"
     return txt
 
 
