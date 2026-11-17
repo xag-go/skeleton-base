@@ -7135,6 +7135,27 @@ class Release177Tests(unittest.TestCase):
         B.build_index(self.base, quiet=True)
         self.assertEqual(self.lint_out()[0], 0, "a title never brings a link or a to-do marker into the page")
 
+    def test_codex_harness_boilerplate_gives_the_task_or_the_role_card_as_title(self):
+        msg = lambda text: json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+        boiler = ("Role: engineer\nThis session is run by the harness for card #12.\n"
+                  "Fix the login redirect loop in the settings page")
+        only = "Role: engineer run by the harness for card #12"
+        normal = "check the harness config before the release"
+        for name, text in (("task", boiler), ("card", only), ("plain", normal)):
+            f = self.home / ".codex" / "sessions" / "2026" / "11" / "06" / f"rollout-2026-11-06-{name}.jsonl"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("\n".join([
+                json.dumps({"type": "session_meta", "payload": {"cwd": str(self.home / "code")}}), msg(text)]) + "\n")
+        n = B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertEqual(n, 3)
+        self.assertIn("| codex | Fix the login redirect loop in the settings page | ~/code |", page)
+        self.assertIn("| codex | engineer card #12 | ~/code |", page)
+        self.assertIn("| codex | check the harness config before the release | ~/code |", page)
+        self.assertNotIn("run by the harness", page)
+        self.assertNotIn("Role: engineer", page)
+
     # -- action 13
     def test_memories_page_lists_a_memory_kept_in_two_claude_folders_once(self):
         B.memories_page(self.base, {"claude-code": [

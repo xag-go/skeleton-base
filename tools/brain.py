@@ -7177,6 +7177,24 @@ def _session_text(content):
     return next((x for x in parts if x and x.strip() and not SESSION_NOISE.match(x)), "")
 
 
+HARNESS_LINE = re.compile(r"\A\s*Role:|\brun by the harness\b")   # Codex: the harness's own prompt lines (1.7.8)
+
+
+def _task_title(txt):
+    """The task text of a user message that a harness prompt wrapped: the first line that is not harness boilerplate,
+    else "<role> card #N" when the prompt names both. Any other text is returned unchanged (1.7.8)."""
+    lines = [l.strip() for l in (txt or "").splitlines() if l.strip()]
+    if not any(HARNESS_LINE.search(l) for l in lines):
+        return txt
+    task = [l for l in lines if not HARNESS_LINE.search(l)]
+    if task:
+        return " ".join(task)
+    role, card = re.search(r"\bRole:\s*(\S+)", txt), re.search(r"\bcard\s*#?\s*(\d+)", txt, re.I)
+    if role and card:
+        return f"{role.group(1).strip('.,;:')} card #{card.group(1)}"
+    return txt
+
+
 def session_line(f, tool, home):
     """(title, cwd) of one transcript from its first lines only: a custom title, else the first user message. The
     transcript itself is never copied into the page (1.7.4)."""
@@ -7206,7 +7224,7 @@ def session_line(f, tool, home):
                     first = pl["message"]                 # Codex: the user's own words as an event
     except OSError:
         pass
-    text = title or first or "(no first message)"
+    text = title or _task_title(first) or "(no first message)"
     text = " ".join(redact(text).split())[:80]
     return text, (home_rel(pathlib.Path(cwd), home) if cwd else "")
 
