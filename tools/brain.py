@@ -8939,7 +8939,14 @@ VAULT_SAFE_TOP = tuple(g.rstrip("/") for g in ENGINE_SAFE["*"] if g.endswith("/"
 VAULT_RUNTIME = ("remote/run",)             # 1.7.8: a tool's runtime folder, rewritten by its program on each run (Claude
                                             # Code's Remote Control daemon.token): never a vault candidate. Git and
                                             # Syncthing leave it out already (engine_rule denies it)
+VAULT_INSTALLED = ("team/release",)         # an installed, read-only release copy of the engineering team (its test
+                                            # fixtures hold fake keys): installed code like vendor/, never a vault candidate
 VAULT_SCAN = ("engines", "data")            # doctor: a real secret file here is an ERROR (it belongs in the vault)
+
+
+def vault_installed(rel):
+    """REL (a path below a tool folder, '/'-separated) is an installed team release copy (team/release/<sha>...)."""
+    return any(rel.startswith(g + "/") for g in VAULT_INSTALLED)   # only the <sha> folders below it
 
 
 def vault_runtime(rel):
@@ -9000,7 +9007,8 @@ def vault_secrets(d):
                         and not os.path.lexists(os.path.join(dp, x, ".git"))      # code checkouts are not logins
                         and not (dp == str(d) and (x in VAULT_SAFE_TOP or x in heavy))
                         and not (chrom and x in CHROMIUM_HEAVY)                   # a profile's caches, any depth
-                        and not vault_runtime(os.path.relpath(os.path.join(dp, x), d)))   # 1.7.8: runtime files
+                        and not vault_runtime(os.path.relpath(os.path.join(dp, x), d))   # 1.7.8: runtime files
+                        and not vault_installed(os.path.relpath(os.path.join(dp, x), d)))   # team release copies
         rel_parts = pathlib.Path(dp).relative_to(d).parts
         if vault_runtime("/".join(rel_parts)):
             continue

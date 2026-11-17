@@ -7462,6 +7462,23 @@ class PinSurvivesTests(ToolHome):
         self.assertTrue((self.cl / "remote/run/abc123/daemon.token").is_file(), r.stdout + r.stderr)
         self.assertFalse((self.cl / "remote/run/abc123/daemon.token").is_symlink())
 
+    def test_installed_team_release_copies_are_not_vault_candidates(self):
+        w = self.base / "engines/claude-worker"
+        self.write(w, "CLAUDE.md", "x\n")
+        self.write(w, "team/release/abc123/stack-packs/fixtures/app/.env.local", "KEY=fake\n")
+        self.write(w, "team/release/abc123/.env.production", "KEY=fake\n")
+        self.write(w, "team/release/abc123.json", "{}\n")
+        self.write(w, ".env", "KEY=real\n")
+        self.write(w, "team/release/.env", "KEY=real\n")
+        self.write(w, "team/release-notes/.env", "KEY=real\n")
+        self.write(w, "team/config/.env", "KEY=real\n")
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotIn("team/release/abc123", out)
+        self.assertIn("not in the vault: engines/claude-worker/team/release/.env", out)
+        self.assertIn("not in the vault: engines/claude-worker/team/release-notes/.env", out)
+        self.assertIn("secret file in the base, not in the vault: engines/claude-worker/.env", out)
+        self.assertIn("secret file in the base, not in the vault: engines/claude-worker/team/config/.env", out)
+
     def test_runtime_folder_stays_out_of_git_and_sync(self):
         r = run("-c", "import importlib.util as u,sys\n"
                 "s=u.spec_from_file_location('b',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m)\n"

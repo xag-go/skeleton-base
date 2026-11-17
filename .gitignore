@@ -210,3 +210,4 @@ graphify-out/
 /engines/hermes-desktop/**/ShaderCache/
 /engines/hermes-desktop/**/GraphiteDawnCache/
 # base-folder:end
+.brain/doctor-sizes.json
