@@ -2,6 +2,12 @@
 
 Changes to the skeleton structure and tools (not to anyone's content).
 
+## v1.7.9 - 2026-11-17
+Three small fixes from live use.
+- Doctor's vault scan skips installed team release copies (`team/release`), so they are not reported as vault candidates.
+- Sessions: a Codex session whose prompt is the harness boilerplate gets the task text as its title.
+- Sessions: a reviewer prompt gets the title "role · task #N title".
+
 ## v1.7.8 - 2026-11-15
 Two live bugs after 1.7.7: a pin lost its guard after an update, and a tool's runtime file was reported as a secret.
 - The ~/.claude link for Claude Code is kept on purpose. The Claude desktop app's SSH remote uploads its server binary

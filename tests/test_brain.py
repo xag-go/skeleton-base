@@ -6891,8 +6891,8 @@ class Release177Tests(unittest.TestCase):
 
     # -- release
     def test_release_number_and_changelog(self):
-        self.assertEqual(B.RELEASE, "1.7.8")
-        self.assertIn("## v1.7.8", (REPO / "CHANGELOG.md").read_text())
+        self.assertEqual(B.RELEASE, "1.7.9")
+        self.assertIn("## v1.7.9", (REPO / "CHANGELOG.md").read_text())
 
     # -- action 3
     def test_lint_and_doctor_flag_a_root_page_that_shadows_a_wiki_page(self):
