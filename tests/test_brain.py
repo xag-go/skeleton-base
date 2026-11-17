@@ -6891,8 +6891,8 @@ class Release177Tests(unittest.TestCase):
 
     # -- release
     def test_release_number_and_changelog(self):
-        self.assertEqual(B.RELEASE, "1.7.8")
-        self.assertIn("## v1.7.8", (REPO / "CHANGELOG.md").read_text())
+        self.assertEqual(B.RELEASE, "1.7.9")
+        self.assertIn("## v1.7.9", (REPO / "CHANGELOG.md").read_text())
 
     # -- action 3
     def test_lint_and_doctor_flag_a_root_page_that_shadows_a_wiki_page(self):
@@ -7134,6 +7134,41 @@ class Release177Tests(unittest.TestCase):
         self.assertEqual(lines, sorted(lines, reverse=True), "newest first")
         B.build_index(self.base, quiet=True)
         self.assertEqual(self.lint_out()[0], 0, "a title never brings a link or a to-do marker into the page")
+
+    def test_codex_harness_boilerplate_gives_the_task_or_the_role_card_as_title(self):
+        msg = lambda text: json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+        boiler = ("Role: engineer\nThis session is run by the harness for card #12.\n"
+                  "Fix the login redirect loop in the settings page")
+        only = "Role: engineer run by the harness for card #12"
+        normal = "check the harness config before the release"
+        for name, text in (("task", boiler), ("card", only), ("plain", normal)):
+            f = self.home / ".codex" / "sessions" / "2026" / "11" / "06" / f"rollout-2026-11-06-{name}.jsonl"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("\n".join([
+                json.dumps({"type": "session_meta", "payload": {"cwd": str(self.home / "code")}}), msg(text)]) + "\n")
+        n = B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertEqual(n, 3)
+        self.assertIn("| codex | Fix the login redirect loop in the settings page | ~/code |", page)
+        self.assertIn("| codex | engineer card #12 | ~/code |", page)
+        self.assertIn("| codex | check the harness config before the release | ~/code |", page)
+        self.assertNotIn("run by the harness", page)
+        self.assertNotIn("Role: engineer", page)
+
+    def test_codex_reviewer_prompt_with_role_line_and_task_line_gets_role_and_task_title(self):
+        msg = lambda text: json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+        text = ("Role: independent reviewer, run by the harness (executors/run-codex.sh)\n"
+                "Task: #7 Add the sample export check\n\n## Issue body\n## What\nSome body text here.")
+        f = self.home / ".codex" / "sessions" / "2026" / "11" / "06" / "rollout-2026-11-06-review.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(self.home / "code")}}), msg(text)]) + "\n")
+        B.sessions_index(self.base, self.home)
+        page = (self.base / B.SESSIONS_PAGE).read_text()
+        self.assertIn("| codex | independent reviewer · task #7 Add the sample export check | ~/code |", page)
+        self.assertNotIn("run by the harness", page)
 
     # -- action 13
     def test_memories_page_lists_a_memory_kept_in_two_claude_folders_once(self):
@@ -7461,6 +7496,23 @@ class PinSurvivesTests(ToolHome):
                 env={"HOME": str(self.home), "PATH": self.path(), "CLAUDE_CONFIG_DIR": str(self.cl)})
         self.assertTrue((self.cl / "remote/run/abc123/daemon.token").is_file(), r.stdout + r.stderr)
         self.assertFalse((self.cl / "remote/run/abc123/daemon.token").is_symlink())
+
+    def test_installed_team_release_copies_are_not_vault_candidates(self):
+        w = self.base / "engines/claude-worker"
+        self.write(w, "CLAUDE.md", "x\n")
+        self.write(w, "team/release/abc123/stack-packs/fixtures/app/.env.local", "KEY=fake\n")
+        self.write(w, "team/release/abc123/.env.production", "KEY=fake\n")
+        self.write(w, "team/release/abc123.json", "{}\n")
+        self.write(w, ".env", "KEY=real\n")
+        self.write(w, "team/release/.env", "KEY=real\n")
+        self.write(w, "team/release-notes/.env", "KEY=real\n")
+        self.write(w, "team/config/.env", "KEY=real\n")
+        out = self.hb("doctor", "--base", str(self.base), env={"CLAUDE_CONFIG_DIR": str(self.cl)}).stdout
+        self.assertNotIn("team/release/abc123", out)
+        self.assertIn("not in the vault: engines/claude-worker/team/release/.env", out)
+        self.assertIn("not in the vault: engines/claude-worker/team/release-notes/.env", out)
+        self.assertIn("secret file in the base, not in the vault: engines/claude-worker/.env", out)
+        self.assertIn("secret file in the base, not in the vault: engines/claude-worker/team/config/.env", out)
 
     def test_runtime_folder_stays_out_of_git_and_sync(self):
         r = run("-c", "import importlib.util as u,sys\n"
