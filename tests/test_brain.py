@@ -6105,6 +6105,50 @@ class SkillsPerToolTests(ToolHome):
         self.assertTrue((sk / "SKILL.md").is_file())
 
 
+class HermesExternalDirsTests(ToolHome):
+    """skills.external_dirs in Hermes's config.yaml lists the base's skills/: Hermes reads them there, so connect
+    installs only base-home in its skills folder and archives the copies it installed earlier."""
+
+    def hermes(self, cfg):
+        self.bins("hermes")
+        self.write(self.home, ".hermes/config.yaml", cfg)
+
+    def hermes_skills(self):
+        return sorted(p.name for p in (self.home / ".hermes/skills/skeleton-base").glob("*") if p.is_dir())
+
+    def test_external_dirs_lists_the_base_skills_only_base_home_is_installed(self):
+        self.hermes("model: x\n")
+        self.ok("connect")
+        self.assertIn("base-lint", self.hermes_skills(), "an earlier copy, as today")
+        self.hermes(f"model: x\nskills:\n  external_dirs:\n    - {self.base / 'skills'}  # the base\n")
+        r = self.ok("connect")
+        self.assertEqual(self.hermes_skills(), ["base-home"], r.stdout)
+        self.assertTrue((self.home / ".hermes/skills/skeleton-base/base-home/SKILL.md").is_file())
+        self.assertTrue((self.base / "skills/base-lint/SKILL.md").is_file(), "the base's own files stay")
+        self.assertTrue(list((self.base / ".brain/backups").rglob("base-lint/SKILL.md")), "archived first")
+
+    def test_not_listed_means_every_skill_is_installed_as_today(self):
+        self.hermes(f"model: x\nskills:\n  external_dirs:\n    - /somewhere/else\n")
+        self.ok("connect")
+        self.assertIn("base-lint", self.hermes_skills())
+        self.assertIn("base-home", self.hermes_skills())
+
+    def test_commented_out_external_dirs_is_not_listed(self):
+        self.hermes(f"model: x\nskills:\n  # external_dirs:\n  #   - {self.base / 'skills'}\n")
+        self.ok("connect")
+        self.assertIn("base-lint", self.hermes_skills())
+        self.assertIn("base-home", self.hermes_skills())
+
+    def test_yaml_block_list_reads_items_comments_and_quotes(self):
+        text = "model: x\nskills:\n  external_dirs:\n    - '~/a b'  # c\n    - \"/q\"\n  other: 1\n"
+        self.assertEqual(B.yaml_block_list(text, "skills", "external_dirs"), ["~/a b", "/q"])
+        self.assertEqual(B.yaml_block_list("skills:\n  external_dirs: [/a, '/b']\n", "skills", "external_dirs"),
+                         ["/a", "/b"])
+        self.assertEqual(B.yaml_block_list("skills:\n  external_dirs:\n", "skills", "external_dirs"), [])
+        self.assertIsNone(B.yaml_block_list("model: x\n", "skills", "external_dirs"))
+        self.assertIsNone(B.yaml_block_list("skills:\n  # external_dirs:\n  #   - /x\n", "skills", "external_dirs"))
+
+
 class PinTests(ToolHome):
     """H1/H2: a link where a setting exists is a WARN; `engine pin` puts the variable where every launcher sees
     it and guard files in place of the links, with undo (fake HOME)."""
