@@ -5903,16 +5903,28 @@ class Connector:
                                   + b + ". ")
         return r.endswith("/SKILL.md") and f"> Installed by Skeleton Base `connect` for the base at `{b}`" in cur
 
+    def linked_skill(self, r):
+        """True when a folder on the way to HOME/r is a link into the base's own skills/ (one shared copy, linked into
+        each tool): connect never writes, records or removes through it; the base's file IS the skill there."""
+        shared, p = self.base / "skills", (self.home / r).parent
+        while p != self.home and p != p.parent:
+            if p.is_symlink() and in_dir(p, shared):
+                return True
+            p = p.parent
+        return False
+
     def install_skills(self, rec, roots):
         if SKILLS_DIR in roots:
             self.link_skills(rec)
         store = rec.setdefault("skills", {})
         texts = {r: t for root in roots for r, t in self.skill_texts(root).items()}
-        for r in [r for r in store if r not in texts]:     # a place no tool needs now: our copy goes (archived)
+        for r in [r for r in store if r not in texts or self.linked_skill(r)]:   # gone, or now a shared link
             self.drop_skill(store, r)
         if SKILLS_DIR not in roots:
             self.retire_skills_link(rec)
         for r, text in texts.items():
+            if self.linked_skill(r):
+                continue                                     # a link to the base's own copy: nothing to install
             cur, t = read(self.home / r), store.get(r)
             ours = cur is not None and self.skill_ours(r, cur, text, t)
             if t is None and cur is not None and not ours:
@@ -5933,6 +5945,8 @@ class Connector:
     def drop_skill(self, store, r):
         """Our copy at R goes (archived first; the file it replaced comes back); a copy you changed stays."""
         t, p = store.pop(r), self.home / r
+        if self.linked_skill(r):
+            return                                           # never delete through a link into the base's skills/
         cur = read(p) if p.is_file() and not p.is_symlink() else None
         if cur is None:
             return
