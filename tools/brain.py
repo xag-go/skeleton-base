@@ -4626,6 +4626,62 @@ def toml_table_undo(text, e):
 YAML_TOP = r"^{}[ \t]*:"
 
 
+def yaml_scalar(s):
+    """One YAML scalar: surrounding quotes removed, a trailing `# comment` dropped."""
+    s = s.strip()
+    if s[:1] in ("'", '"'):
+        end = s.find(s[0], 1)
+        return s[1:end] if end > 0 else s[1:]
+    m = re.search(r"\s#", s)
+    return (s[:m.start()] if m else s).strip()
+
+
+def yaml_block_list(text, parent, key):
+    """The items of `key:` under the top-level `parent:` in a YAML text: a block list (`- item`), a flow list
+    (`[a, b]`) or one scalar. Trailing comments and quotes removed. None when the key is absent or commented out,
+    [] when it is empty. A small line reader for this one lookup (no PyYAML)."""
+    lines = (text or "").split("\n")
+
+    def live(l):
+        return bool(l.strip()) and not l.strip().startswith("#")
+
+    def ind(l):
+        return len(l) - len(l.lstrip(" "))
+
+    top = next((n for n, l in enumerate(lines) if re.match(r"%s:[ \t]*(#.*)?$" % re.escape(parent), l)), None)
+    if top is None:
+        return None
+    body = []
+    for l in lines[top + 1:]:
+        if live(l) and ind(l) == 0:
+            break
+        body.append(l)
+    kids = [l for l in body if live(l)]
+    if not kids:
+        return None
+    ci = min(ind(l) for l in kids)
+    k = next((n for n, l in enumerate(body)
+              if live(l) and ind(l) == ci and re.match(r"%s:" % re.escape(key), l.strip())), None)
+    if k is None:
+        return None
+    rest = yaml_scalar(body[k].strip()[len(key) + 1:])
+    if rest.startswith("["):
+        return [v for v in (yaml_scalar(x) for x in rest.strip("[]").split(",")) if v]
+    if rest:
+        return [rest]
+    items = []
+    for l in body[k + 1:]:
+        if not live(l):
+            continue
+        s = l.strip()
+        if not (s.startswith("-") and ind(l) >= ci):
+            break
+        v = yaml_scalar(s[1:])
+        if v:
+            items.append(v)
+    return items
+
+
 def yaml_apply(text, key, line):
     """Minimal-safe YAML edit: one line (`name: {flow map}` or `- item`) added as the first child of the
     top-level block `key:` (created at the end when missing). Refused (note) for anything else: a flow value
@@ -4838,7 +4894,9 @@ TOOLS = {t["key"]: t for t in (
          mcp="`mcp_servers` in `~/.hermes/config.yaml`",
          memory="`memories/*.md`, `memory_store.db` facts, the same in every profile",
          skills_note="reads `~/.agents/skills` only when it is in `skills.external_dirs`; the base's skills go "
-                     "to `$HERMES_HOME/skills/skeleton-base/` (its own skills folder, by category)",
+                     "to `$HERMES_HOME/skills/skeleton-base/` (its own skills folder, by category), unless "
+                     "`skills.external_dirs` lists the base's `skills/` folder: then Hermes reads them there and only "
+                     "`base-home` is installed in its folder",
          skills_home=".hermes/skills/skeleton-base",
          src="hermes-agent source (agent/prompt_builder.py, hermes_cli/config_defaults.py)"),
     dict(key=".config/crush", name="Crush", bins=("crush",),
@@ -5147,7 +5205,10 @@ class Connector:
                     files.setdefault(r, []).append(e)
         for r, edits in files.items():
             self.apply_edits(rec, r, edits)
-        self.install_skills(rec, [r for r in self.skill_roots(found) if not skip(r)])
+        roots = [r for r in self.skill_roots(found) if not skip(r)]
+        shared = {self.L(TOOLS[".hermes"]["skills_home"])} if ".hermes" in found and self.hermes_reads_base_skills() \
+            else set()
+        self.install_skills(rec, roots, shared)
         for key in found:
             self.tools[key] = self.tool_state(key, wrote, via, rec)
         if unknown:                                       # zero-touch: a dir that looks like an AI tool
@@ -5725,12 +5786,29 @@ class Connector:
                 roots.append(self.L(h))
         return list(dict.fromkeys(roots))
 
-    def skill_texts(self, root=SKILLS_DIR):
+    def hermes_reads_base_skills(self):
+        """True when Hermes's config.yaml lists the base's skills/ folder under skills.external_dirs (`~` is the home;
+        a relative entry is read from the config's folder). Hermes then reads the base's skills there, so connect
+        puts no copy in its skills folder; base-home is not in skills/ and is still installed."""
+        cfg = self.home / self.L(".hermes/config.yaml")
+        mine = os.path.realpath(self.base / "skills")
+        for v in yaml_block_list(read(cfg), "skills", "external_dirs") or []:
+            if v == "~" or v.startswith("~/"):
+                v = str(self.home) + v[1:]
+            if not os.path.isabs(v):
+                v = os.path.join(os.path.dirname(str(cfg)), v)
+            if os.path.realpath(v) == mine:
+                return True
+        return False
+
+    def skill_texts(self, root=SKILLS_DIR, base=True):
+        """The files for one skills folder: the base's skills (each SKILL.md with a connect note) and base-home.
+        base=False gives base-home only (the tool reads the base's skills/ itself)."""
         out = {}
         b = str(self.base)
         note = (f"\n> Installed by Skeleton Base `connect` for the base at `{b}`: run its commands there "
                 f"(`cd {shq(b)}` first, or use `python3 {shq(b + '/tools/brain.py')}`).\n")
-        for sk in sorted((self.base / "skills").glob("*/SKILL.md")):
+        for sk in sorted((self.base / "skills").glob("*/SKILL.md")) if base else []:
             for f in sorted(sk.parent.rglob("*")):
                 if not f.is_file():
                     continue
@@ -5913,11 +5991,16 @@ class Connector:
             p = p.parent
         return False
 
-    def install_skills(self, rec, roots):
+    def install_skills(self, rec, roots, shared=()):
+        """shared: skills folders whose tool reads the base's skills/ itself (external_dirs): base-home only there.
+        A copy connect put there before is archived by the 'gone' step below."""
         if SKILLS_DIR in roots:
             self.link_skills(rec)
         store = rec.setdefault("skills", {})
-        texts = {r: t for root in roots for r, t in self.skill_texts(root).items()}
+        texts = {r: t for root in roots for r, t in self.skill_texts(root, base=root not in shared).items()}
+        if any(root in shared for root in roots):
+            self.log.append("Hermes reads the base's skills from its skills.external_dirs: only base-home is "
+                            "installed in its skills folder")
         for r in [r for r in store if r not in texts or self.linked_skill(r)]:   # gone, or now a shared link
             self.drop_skill(store, r)
         if SKILLS_DIR not in roots:
