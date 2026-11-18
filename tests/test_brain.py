@@ -6082,6 +6082,28 @@ class SkillsPerToolTests(ToolHome):
         self.assertTrue((self.home / ".hermes/skills/skeleton-base/base-home/SKILL.md").is_file())
         self.assertFalse(os.path.lexists(self.home / ".agents/skills"))
 
+    def test_a_skill_linked_to_the_base_copy_is_never_written_or_removed(self):
+        """All skills in BASE/skills, each tool gets a link per skill: connect leaves the link and the base's files."""
+        self.bins("hermes")
+        self.write(self.home, ".hermes/config.yaml", "model: x\n")
+        sk = self.base / "skills/shared-one"
+        self.write(sk, "SKILL.md", "---\nname: shared-one\ndescription: x\n---\nbody\n")
+        self.write(sk, "references/a.md", "ref\n")
+        self.ok("connect")
+        dst = self.home / ".hermes/skills/skeleton-base/shared-one"
+        self.assertTrue((dst / "SKILL.md").is_file(), "a real copy first, as today")
+        shutil.rmtree(dst); dst.symlink_to(sk)                       # the owner links it to the one copy
+        r = self.ok("connect")
+        self.assertTrue(dst.is_symlink(), r.stdout)
+        self.assertEqual((sk / "SKILL.md").read_text(), "---\nname: shared-one\ndescription: x\n---\nbody\n")
+        self.assertNotIn("changed since connect", r.stdout)
+        k = json.loads((self.base / ".kits.json").read_text())["kits"]["base-folder"]["connect"]["skills"]
+        self.assertFalse([x for x in k if "/shared-one/" in x], "no record through a link")
+        os.unlink(self.bin / "hermes")                               # no tool needs the folder now
+        self.ok("connect")
+        self.assertTrue((sk / "references/a.md").is_file(), "never deleted through the link")
+        self.assertTrue((sk / "SKILL.md").is_file())
+
 
 class PinTests(ToolHome):
     """H1/H2: a link where a setting exists is a WARN; `engine pin` puts the variable where every launcher sees
