@@ -7585,3 +7585,99 @@ class PinSurvivesTests(ToolHome):
                 "s=u.spec_from_file_location('b',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m)\n"
                 "print(m.engine_rule('claude/remote/run/abc123/daemon.token'))", str(BRAIN))
         self.assertEqual(r.stdout.strip(), "deny", r.stderr)
+
+
+class SearchReadOnlyTests(unittest.TestCase):
+    """search on a read-only base or .brain: answers from memory, writes nothing to .brain."""
+
+    def setUp(self):
+        work = pathlib.Path.home() / ".cache" / "work-tmp"
+        work.mkdir(parents=True, exist_ok=True)
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="sb5-", dir=str(work)))
+        self.dirs = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for d in self.dirs:                       # restore permissions first so the tree can be removed
+            try:
+                d.chmod(0o700)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _base(self):
+        d = self.tmp / "base"
+        r = run(BRAIN, "init", d, "--frugal=no")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.write(d, "wiki/projects/project-a.md", PAGE.format(t="Project A", s="interview",
+                                                                  b="The north-star metric is weekly-active-readers."))
+        return d
+
+    def write(self, d, rel, text):
+        p = pathlib.Path(d) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def snapshot(self, d):
+        out = {}
+        for root, dirs, files in os.walk(d):
+            for name in dirs + files:
+                p = pathlib.Path(root) / name
+                st = p.stat()
+                digest = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "dir"
+                out[p.relative_to(d).as_posix()] = (st.st_mtime_ns, digest)
+        return out
+
+    def search(self, d, q="weekly-active-readers"):
+        return run(d / "tools" / "brain.py", "search", q)
+
+    def lock(self, p):
+        p.chmod(0o500)
+        self.dirs.append(p)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores chmod read-only")
+    def test_readonly_brain_with_existing_db_searches_and_writes_nothing(self):
+        d = self._base()
+        self.assertEqual(self.search(d).returncode, 0)          # writable run builds .brain/search.db
+        self.assertTrue((d / ".brain/search.db").is_file())
+        before = self.snapshot(d / ".brain")
+        self.lock(d / ".brain")
+        r = self.search(d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("wiki/projects/project-a.md", r.stdout)
+        self.assertEqual(self.snapshot(d / ".brain"), before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores chmod read-only")
+    def test_readonly_brain_without_db_searches_in_memory(self):
+        d = self._base()
+        (d / ".brain").mkdir(exist_ok=True)
+        self.assertFalse((d / ".brain/search.db").exists())
+        before = self.snapshot(d / ".brain")
+        self.lock(d / ".brain")
+        r = self.search(d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("wiki/projects/project-a.md", r.stdout)
+        self.assertFalse((d / ".brain/search.db").exists())
+        self.assertEqual(self.snapshot(d / ".brain"), before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores chmod read-only")
+    def test_readonly_base_without_brain_creates_nothing(self):
+        d = self._base()
+        shutil.rmtree(d / ".brain", ignore_errors=True)
+        self.lock(d)
+        r = self.search(d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("wiki/projects/project-a.md", r.stdout)
+        self.assertFalse((d / ".brain").exists())
+
+    def test_writable_search_still_writes_db_and_returns_hits(self):
+        d = self._base()
+        r = self.search(d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("wiki/projects/project-a.md", r.stdout)
+        self.assertTrue((d / ".brain/search.db").is_file())
+        self.assertEqual(self.search(d, "zzzunfindable").returncode, 1)

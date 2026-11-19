@@ -1640,12 +1640,26 @@ def brief(root, full=True):
     return 0
 
 
+def search_db_writable(root):
+    """True when .brain/search.db can be created or updated (a missing .brain is created in the base)."""
+    brain = root / ".brain"
+    if not brain.exists():
+        return os.access(root, os.W_OK | os.X_OK)
+    if not os.access(brain, os.W_OK | os.X_OK):
+        return False
+    db = brain / "search.db"
+    return not db.exists() or os.access(db, os.W_OK)
+
+
 def search(root, query):
     if not query.strip():
         print("usage: search QUERY"); return 1
     db = root / ".brain" / "search.db"
-    db.parent.mkdir(exist_ok=True)
-    rows, n = search_rows(root, query, 20, db)
+    if search_db_writable(root):
+        db.parent.mkdir(exist_ok=True)
+        rows, n = search_rows(root, query, 20, db)
+    else:                                   # read-only base or .brain: search in memory, write nothing
+        rows, n = search_rows(root, query, 20, None)
     for path, snip in rows:
         print(f"{path}: {snip}")
     print(f"search: {len(rows)} hit(s) in {n} files", file=sys.stderr)
